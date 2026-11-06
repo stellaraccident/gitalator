@@ -13,6 +13,7 @@ use std::{
 pub struct Store {
     pub root: PathBuf,
     pub cache: Cache,
+    pub fetched: Cache,
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
@@ -20,6 +21,7 @@ impl Store {
         let root = std::fs::canonicalize(root)?;
         let s = Self {
             cache: Cache::new(root.join("content"))?,
+            fetched: Cache::new(root.join("fetched"))?,
             root,
         };
         let _l = Lock::take(&s.root.join("schema.lock"))?;
@@ -36,6 +38,8 @@ impl Store {
  CREATE TABLE IF NOT EXISTS activations(id TEXT PRIMARY KEY,workspace TEXT NOT NULL,source INTEGER NOT NULL,proposal TEXT NOT NULL,candidate TEXT NOT NULL,conflicts TEXT NOT NULL,state TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS exports(id INTEGER PRIMARY KEY,workspace TEXT NOT NULL,revision INTEGER NOT NULL,path TEXT NOT NULL,manifest TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS objects(repo TEXT NOT NULL,oid TEXT NOT NULL,content TEXT NOT NULL,size INTEGER NOT NULL,accessed INTEGER NOT NULL DEFAULT(unixepoch()),PRIMARY KEY(repo,oid));
+ CREATE TABLE IF NOT EXISTS tree_cache(repo TEXT NOT NULL,tree_key TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(repo,tree_key));
+ CREATE TABLE IF NOT EXISTS attributes(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,stamp INTEGER NOT NULL);
  PRAGMA user_version=1;COMMIT;")?;
         Ok(s)
     }
@@ -215,5 +219,19 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+}
+impl Store {
+    pub fn attribute_time(&self, path: &str, fingerprint: &str) -> Result<std::time::SystemTime> {
+        let c = self.conn()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos() as i64;
+        c.execute("INSERT INTO attributes(path,fingerprint,stamp) VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET fingerprint=excluded.fingerprint,stamp=excluded.stamp WHERE attributes.fingerprint!=excluded.fingerprint",params![path,fingerprint,now])?;
+        let stamp: i64 =
+            c.query_row("SELECT stamp FROM attributes WHERE path=?1", [path], |r| {
+                r.get(0)
+            })?;
+        Ok(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(stamp as u64))
     }
 }

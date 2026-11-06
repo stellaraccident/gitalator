@@ -5,7 +5,7 @@ use crate::{
     model::*,
     Result,
 };
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use std::{
     collections::BTreeMap,
     io::Write,
@@ -17,7 +17,9 @@ pub fn git(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
 }
 pub fn run(path: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C")
+    cmd.arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-C")
         .arg(path)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -170,6 +172,24 @@ impl Store {
         } else {
             format!("{commit}:{}", m.subtree)
         };
+        let key = hash(spec.as_bytes());
+        if let Some(data) = self
+            .conn()?
+            .query_row(
+                "SELECT data FROM tree_cache WHERE repo=?1 AND tree_key=?2",
+                params![m.repo, key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            return Ok(serde_json::from_str(&data)?);
+        }
+        let _lock = Lock::take(
+            &self
+                .root
+                .join("locks")
+                .join(format!("tree-{}-{key}", m.repo)),
+        )?;
         let out = git(
             &self.repo_path(&m.repo),
             &["ls-tree", "-r", "-t", "-z", &spec],
@@ -201,6 +221,10 @@ impl Store {
                 },
             );
         }
+        self.conn()?.execute(
+            "INSERT OR REPLACE INTO tree_cache(repo,tree_key,data) VALUES(?1,?2,?3)",
+            params![m.repo, key, serde_json::to_string(&entries)?],
+        )?;
         Ok(entries)
     }
     pub fn bytes(&self, e: &Entry) -> Result<Vec<u8>> {
@@ -215,7 +239,7 @@ impl Store {
                     .join(format!("blob-{}", hash(s.as_bytes()))),
             )?;
             if let Some(id) = self.cached(repo, oid)? {
-                if let Ok(b) = self.cache.get(&id) {
+                if let Ok(b) = self.fetched.get(&id) {
                     self.conn()?.execute(
                         "UPDATE objects SET accessed=unixepoch() WHERE repo=?1 AND oid=?2",
                         params![repo, oid],
@@ -224,12 +248,46 @@ impl Store {
                 }
             }
             let span = Span::new(&self.root, &format!("hydrate:{repo}:{oid}"));
-            let b = git(&self.repo_path(repo), &["cat-file", "blob", oid])
+            let _repo_lock = Lock::take(&self.root.join("locks").join(format!("repo-{repo}")))?;
+            let mut b = git(&self.repo_path(repo), &["cat-file", "blob", oid])
                 .inspect_err(|_| span.event("failed", Some("object hydration failed")))?;
             if b.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
-                return Err(error("LFS payload requires materialized export; direct LFS hydration not implemented yet"));
+                let pointer = String::from_utf8(b.clone())?;
+                let expected = pointer
+                    .lines()
+                    .find_map(|l| l.strip_prefix("oid sha256:"))
+                    .ok_or_else(|| error("invalid LFS pointer"))?;
+                let size: u64 = pointer
+                    .lines()
+                    .find_map(|l| l.strip_prefix("size "))
+                    .ok_or_else(|| error("invalid LFS size"))?
+                    .parse()?;
+                let mut cmd = Command::new("git");
+                let mut child = cmd
+                    .arg("-C")
+                    .arg(self.repo_path(repo))
+                    .args(["lfs", "smudge"])
+                    .env_remove("GIT_LFS_SKIP_SMUDGE")
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+                child.stdin.take().unwrap().write_all(&b)?;
+                let output = child.wait_with_output()?;
+                if !output.status.success() {
+                    return Err(error(format!(
+                        "LFS retrieval failed for {repo}:{oid}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
+                }
+                b = output.stdout;
+                if hash(&b) != expected || b.len() as u64 != size {
+                    return Err(error("LFS integrity mismatch"));
+                }
             }
-            let id = self.cache.put(&b)?;
+            let id = self.fetched.put(&b)?;
             self.conn()?.execute(
                 "INSERT OR REPLACE INTO objects(repo,oid,content,size) VALUES(?1,?2,?3,?4)",
                 params![repo, oid, id, b.len()],

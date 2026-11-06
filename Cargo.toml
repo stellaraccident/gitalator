@@ -1,0 +1,23 @@
+[package]
+name = "gitalator"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Persistent federated Git workspaces"
+
+[[bin]]
+name = "gtl"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+fuser = { version = "0.14", default-features = false }
+libc = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

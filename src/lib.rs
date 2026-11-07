@@ -27,3 +27,7 @@ pub mod activity;
 pub mod ergonomics;
 
 pub mod namespace;
+
+pub mod config;
+pub mod daemon;
+pub mod logging;

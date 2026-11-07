@@ -58,7 +58,7 @@ pub(crate) fn run_git(
     let timeout = std::env::var("GTL_BACKEND_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(300);
+        .unwrap_or(crate::config::BACKEND_SECONDS.load(std::sync::atomic::Ordering::Acquire));
     let out = execute_command_progress(
         &mut cmd,
         input,
@@ -477,7 +477,7 @@ impl Store {
             &format!("requested {}", oids.join(" ")),
         );
         let result = (|| -> Result<Vec<u64>> {
-            let gate = self.runtime.fetch_gate(repo);
+            let gate = self.runtime.fetch_gate(&self.repo_storage(repo)?);
             activity.phase(if speculative {
                 "waiting for lookahead fetch slot"
             } else {

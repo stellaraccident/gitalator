@@ -114,3 +114,106 @@ fn superrepo_creation_includes_root_and_immediate_submodules() {
         .is_err());
     assert!(!s.names().unwrap().contains(&"broken".to_string()));
 }
+
+// Add gitlinks directly: fixtures do not need checked-out submodules.
+fn superrepo(parent: &std::path::Path, name: &str, child: &std::path::Path) -> std::path::PathBuf {
+    let repo = parent.join(name);
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]).unwrap();
+    git(&repo, &["config", "user.name", "Test"]).unwrap();
+    git(&repo, &["config", "user.email", "test@localhost"]).unwrap();
+    let oid = String::from_utf8(git(child, &["rev-parse", "HEAD"]).unwrap()).unwrap();
+    std::fs::write(
+        repo.join(".gitmodules"),
+        format!(
+            "[submodule \"child\"]\npath = child\nurl = ../{}\n",
+            child.file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    git(
+        &repo,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{},child", oid.trim()),
+        ],
+    )
+    .unwrap();
+    git(&repo, &["add", ".gitmodules"]).unwrap();
+    git(&repo, &["commit", "-m", "superrepo"]).unwrap();
+    repo
+}
+#[test]
+fn nested_expansion_is_pinned_idempotent_and_rejects_staged_changes() {
+    let f = Fixture::new();
+    let middle = superrepo(f.temp.path(), "middle", &f.repo);
+    let top = superrepo(f.temp.path(), "top", &middle);
+    let s = &f.store;
+    s.new_workspace(
+        "dev",
+        Some(top.to_str().unwrap()),
+        None,
+        None,
+        Some("project"),
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(s.state(s.head("dev").unwrap()).unwrap().0.mount.len(), 2);
+    // Changing the origin after creation must not refresh the superrepo's active pin.
+    std::fs::write(top.join("new"), b"not pinned").unwrap();
+    git(&top, &["add", "new"]).unwrap();
+    git(&top, &["commit", "-m", "new"]).unwrap();
+    assert_eq!(s.expand_submodules("dev", &[], false).unwrap(), 1);
+    assert_eq!(
+        s.read(&View::Live("dev".into()), "project/child/child/file")
+            .unwrap(),
+        b"base\n"
+    );
+    assert!(s.read(&View::Live("dev".into()), "project/new").is_err());
+    let head = s.head("dev").unwrap();
+    assert_eq!(s.expand_submodules("dev", &[], true).unwrap(), 0);
+    assert_eq!(s.head("dev").unwrap(), head);
+    s.set_draft("dev", "invalid draft").unwrap();
+    assert!(s.expand_submodules("dev", &[], true).is_err());
+    assert_eq!(s.head("dev").unwrap(), head);
+    s.new_workspace(
+        "recursive",
+        Some(top.to_str().unwrap()),
+        None,
+        None,
+        Some("project"),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(
+        s.expand_submodules("recursive", &["project".into()], true)
+            .unwrap(),
+        2
+    );
+    // User edits in a not-yet-mounted submodule cone cannot be silently hidden.
+    s.new_workspace(
+        "edited",
+        Some(top.to_str().unwrap()),
+        None,
+        None,
+        Some("project"),
+        None,
+        true,
+    )
+    .unwrap();
+    s.write_file(
+        &View::Live("edited".into()),
+        "project/child/local",
+        b"precious",
+        0o644,
+        Kind::File,
+    )
+    .unwrap();
+    let head = s.head("edited").unwrap();
+    assert!(s.expand_submodules("edited", &[], false).is_err());
+    assert_eq!(s.head("edited").unwrap(), head);
+}

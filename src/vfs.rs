@@ -541,7 +541,7 @@ fn errno(e: &(dyn std::error::Error + Send + Sync)) -> i32 {
     } else if s.contains("invalid") {
         libc::EINVAL
     } else {
-        eprintln!("gtl FUSE error: {e}");
+        crate::logging::message(&format!("gtl FUSE error: {e}"));
         libc::EIO
     }
 }
@@ -556,6 +556,7 @@ impl Filesystem for Fs {
         let _ = config.add_capabilities(fuser::consts::FUSE_DO_READDIRPLUS);
         let _ = config.add_capabilities(fuser::consts::FUSE_READDIRPLUS_AUTO);
         self.ttl.store(1, Ordering::Release);
+        self.store.runtime.ready.store(true, Ordering::Release);
         Ok(())
     }
     fn forget(&mut self, _: &Request<'_>, ino: u64, nlookup: u64) {
@@ -1463,7 +1464,9 @@ pub fn mount(store: Store, path: &Path) -> Result<()> {
         Err(e) => return Err(mount_path_error(path, "inspect", e)),
     }
     let path = std::fs::canonicalize(path).map_err(|e| mount_path_error(path, "resolve", e))?;
-    if path.starts_with(&store.root) || store.root.starts_with(&path) {
+    if (path.starts_with(&store.root) && path != store.root.join("mount"))
+        || store.root.starts_with(&path)
+    {
         return Err(error("mount and state directories must not overlap"));
     }
     // Cached root attributes can outlive a dead daemon. Opening/enumerating the
@@ -1478,6 +1481,7 @@ pub fn mount(store: Store, path: &Path) -> Result<()> {
     let runtime = store.runtime.clone();
     let fs = Fs::new(store);
     let inodes = fs.inodes.clone();
+    let workers = fs.workers.clone();
     let mut session = fuser::Session::new(
         fs,
         &path,
@@ -1495,10 +1499,10 @@ pub fn mount(store: Store, path: &Path) -> Result<()> {
         while !flag.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(1));
             if let Err(e) = auto.auto_snapshots() {
-                eprintln!("automatic snapshot failed: {e}");
+                crate::logging::message(&format!("automatic snapshot failed: {e}"));
             }
             if let Err(e) = auto.runtime.flush() {
-                eprintln!("metadata publication failed: {e}");
+                crate::logging::message(&format!("metadata publication failed: {e}"));
             }
             ticks += 1;
             if ticks % 10 == 0 {
@@ -1506,7 +1510,7 @@ pub fn mount(store: Store, path: &Path) -> Result<()> {
                     .setting("cache_bytes", 1073741824)
                     .and_then(|max| auto.gc(false, max as u64))
                 {
-                    eprintln!("cache maintenance failed: {e}");
+                    crate::logging::message(&format!("cache maintenance failed: {e}"));
                 }
             }
         }
@@ -1575,10 +1579,13 @@ pub fn mount(store: Store, path: &Path) -> Result<()> {
     }));
     runtime.pending.store(false, Ordering::Release);
     let result = session.run();
-    runtime.invalidator.lock().unwrap().take();
-    let _ = notification_thread.join();
+    runtime.ready.store(false, Ordering::Release);
+    runtime.draining.store(true, Ordering::Release);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = thread.join();
+    workers.drain();
+    runtime.invalidator.lock().unwrap().take();
+    let _ = notification_thread.join();
     result.map_err(|e| error(format!("serve FUSE mount {}: {e}", path.display())))?;
     Ok(())
 }

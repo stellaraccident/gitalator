@@ -418,9 +418,9 @@ fn lazy_fetch_has_default_console_activity_and_detailed_log() {
     let file = mount.path.join("workspaces/a/file");
     assert_eq!(std::fs::metadata(&file).unwrap().len(), 5);
     let console = std::fs::read_to_string(f.temp.path().join("fuse.log")).unwrap();
-    assert!(console.contains("detailed log:"), "{console}");
+    assert!(console.contains("logs "), "{console}");
     assert!(console.contains("gtl: backend:"), "{console}");
-    let logpath = f.store.root.join("operations.jsonl");
+    let logpath = f.store.root.join("logs/operations.jsonl");
     let before = std::fs::read_to_string(&logpath).unwrap();
     assert!(before
         .lines()
@@ -484,7 +484,7 @@ fn recursive_du_batches_sizes_without_fetching_for_name_listings() {
     );
     assert_eq!(command(&f, &["metrics"])["metadata_fetches"], 300);
     let count_fetches = || {
-        std::fs::read_to_string(f.store.root.join("operations.jsonl"))
+        std::fs::read_to_string(f.store.root.join("logs/operations.jsonl"))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -602,7 +602,7 @@ fn recursive_du_combines_small_sibling_directories() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(command(&f, &["metrics"])["metadata_fetches"], 160);
-    let log = std::fs::read_to_string(f.store.root.join("operations.jsonl")).unwrap();
+    let log = std::fs::read_to_string(f.store.root.join("logs/operations.jsonl")).unwrap();
     let fetches = log
         .lines()
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())

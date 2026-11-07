@@ -5,6 +5,7 @@ type Job = Box<dyn FnOnce() + Send>;
 pub struct Workers {
     sender: mpsc::SyncSender<Job>,
     runtime: Arc<Runtime>,
+    pending: Arc<(Mutex<usize>, std::sync::Condvar)>,
 }
 impl Workers {
     pub fn new(runtime: Arc<Runtime>) -> Self {
@@ -20,10 +21,34 @@ impl Workers {
                 }
             });
         }
-        Self { sender, runtime }
+        Self {
+            sender,
+            runtime,
+            pending: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
+        }
+    }
+    pub fn drain(&self) {
+        let mut pending = self.pending.0.lock().unwrap();
+        while *pending > 0 {
+            pending = self.pending.1.wait(pending).unwrap();
+        }
     }
     pub fn submit(&self, job: Job) -> std::result::Result<(), Job> {
-        match self.sender.try_send(job) {
+        let pending = self.pending.clone();
+        *pending.0.lock().unwrap() += 1;
+        struct Done(Arc<(Mutex<usize>, std::sync::Condvar)>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() -= 1;
+                self.0 .1.notify_all();
+            }
+        }
+        let done = Done(pending);
+        let wrapped: Job = Box::new(move || {
+            let _done = done;
+            job();
+        });
+        match self.sender.try_send(wrapped) {
             Ok(()) => {
                 self.runtime
                     .metrics

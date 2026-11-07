@@ -90,14 +90,14 @@ impl Activity {
             })
             .collect::<Vec<_>>()
             .join("; ");
-        eprintln!(
+        crate::logging::message(&format!(
             "gtl: backend: {} active, {} completed, {} failed{}{}",
             s.active.len(),
             s.completed,
             s.failed,
             if active.is_empty() { "" } else { "; " },
             active
-        );
+        ));
         s.completed = 0;
         s.failed = 0;
         s.last = Some(Instant::now());
@@ -130,10 +130,10 @@ impl Guard {
                 let error = crate::backend::redact(&e.to_string());
                 self.span.event("failed", Some(&error));
                 if self.activity.enabled.load(Ordering::Relaxed) {
-                    eprintln!(
-                        "gtl: {}: {error} (details: operations.jsonl)",
+                    crate::logging::message(&format!(
+                        "gtl: {}: {error} (details: logs/operations.jsonl)",
                         self.span.operation()
-                    );
+                    ));
                 }
             }
         }

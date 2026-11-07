@@ -142,7 +142,7 @@ fn repository_locks_serialize_shared_work_without_blocking_other_repos() {
         drop(held);
         assert_eq!(recv.recv_timeout(Duration::from_secs(10)).unwrap(), "same");
     });
-    let log = std::fs::read_to_string(f.store.root.join("operations.jsonl")).unwrap();
+    let log = std::fs::read_to_string(f.store.root.join("logs/operations.jsonl")).unwrap();
     assert!(log
         .lines()
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
@@ -304,7 +304,7 @@ fn metadata_fetch_repairs_missing_promised_blobs_and_coalesces_with_reads() {
     });
     assert_eq!(s.known_size(&entries["file"]).unwrap(), Some(5));
     assert_eq!(s.known_size(&entries["nested/hidden"]).unwrap(), Some(7));
-    let log = std::fs::read_to_string(s.root.join("operations.jsonl")).unwrap();
+    let log = std::fs::read_to_string(s.root.join("logs/operations.jsonl")).unwrap();
     let records: Vec<serde_json::Value> = log
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())

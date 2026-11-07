@@ -29,6 +29,9 @@ pub fn canonical_remote(remote: &str) -> Result<String> {
         if remote.contains('?')
             || remote.contains('#')
             || (scheme != "ssh" && authority.contains('@'))
+            || authority
+                .rsplit_once('@')
+                .is_some_and(|(user, _)| user.contains(':'))
         {
             return Err(error("use Git credential helpers, not credentials or query parameters in repository URLs"));
         }
@@ -106,6 +109,11 @@ impl Store {
             .ok_or_else(|| error("remote has no default branch; specify --revision"))
     }
     fn submodule_mounts(&self, parent: &Mount) -> Result<Vec<Mount>> {
+        if !parent.subtree.is_empty() {
+            return Err(error(
+                "submodule expansion requires a whole-repository mount",
+            ));
+        }
         let commit = parent
             .commit
             .as_deref()
@@ -116,6 +124,18 @@ impl Store {
         if tree.is_empty() {
             return Ok(vec![]);
         }
+        let record = std::str::from_utf8(&tree)?;
+        let fields: Vec<_> = record
+            .split_once('\t')
+            .ok_or_else(|| error("invalid .gitmodules tree record"))?
+            .0
+            .split_whitespace()
+            .collect();
+        if fields.len() != 3 || !matches!(fields[0], "100644" | "100755") || fields[1] != "blob" {
+            return Err(error(".gitmodules must be a regular file"));
+        }
+        // Use our bounded, serialized promisor fetch instead of Git's implicit lazy fetch.
+        self.ensure_blobs(&parent.repo, &[fields[2].to_string()])?;
         let modules = git(&repo, &["config", "-z", "--blob", &spec, "--list"])?;
         let mut paths = std::collections::BTreeMap::new();
         for record in modules.split(|b| *b == 0).filter(|r| !r.is_empty()) {
@@ -197,6 +217,8 @@ impl Store {
         tx.commit()?;
         self.observe_committed()
     }
+    // Mirrors the mutually exclusive creation modes and options exposed by the CLI.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_workspace(
         &self,
         name: &str,
@@ -349,10 +371,21 @@ impl Store {
                     }
                     continue;
                 }
+                if map
+                    .mount
+                    .iter()
+                    .any(|m| m.path.starts_with(&(child.path.clone() + "/")))
+                {
+                    return Err(error(
+                        "new submodule mount overlaps an existing nested mount",
+                    ));
+                }
                 if overlay.iter().any(|((id, p), _)| {
                     map.mount.iter().find(|m| &m.id == id).is_some_and(|m| {
                         let p = join(&m.path, p);
-                        p == child.path || p.starts_with(&(child.path.clone() + "/"))
+                        p == child.path
+                            || p.starts_with(&(child.path.clone() + "/"))
+                            || child.path.starts_with(&(p + "/"))
                     })
                 }) {
                     return Err(error("source edits overlap a new submodule mount"));

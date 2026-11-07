@@ -1,81 +1,99 @@
 use clap::Parser;
 use gitalator::{
-    cli::{Cli, Cmd},
+    cli::{Cli, Cmd, DaemonCmd, SubmoduleCmd},
     db::Store,
     Result,
 };
 fn execute() -> Result<()> {
     let mut cli = Cli::parse();
+    if cli.state_dir.is_relative() {
+        cli.state_dir = std::env::current_dir()?.join(&cli.state_dir);
+    }
     cli.command.absolutize()?;
-    if let Cmd::Unmount { path } = cli.command {
-        let status = std::process::Command::new("fusermount3")
-            .arg("-u")
-            .arg(path)
-            .status()?;
-        if !status.success() {
-            return Err("unmount failed".into());
+    match &cli.command {
+        Cmd::Daemon {
+            command: DaemonCmd::Start { detached },
+        } => {
+            let info = gitalator::daemon::start(&cli.state_dir, *detached)?;
+            return if cli.json {
+                print_result(info, true, false)
+            } else {
+                Ok(())
+            };
         }
-        return Ok(());
+        Cmd::Daemon {
+            command: DaemonCmd::Run { mode },
+        } => return gitalator::daemon::run(&cli.state_dir, None, mode, true),
+        Cmd::Mount { path } => {
+            return gitalator::daemon::run(&cli.state_dir, Some(path), "foreground", false)
+        }
+        Cmd::Unmount { path } => {
+            let status = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg(path)
+                .status()?;
+            return if status.success() {
+                Ok(())
+            } else {
+                Err("unmount failed".into())
+            };
+        }
+        _ => {}
     }
-    // A mounted client must not open/migrate a database owned by another binary.
-    if !matches!(cli.command, Cmd::Mount { .. }) {
+    if let Cmd::Submodules {
+        command: SubmoduleCmd::Expand { workspace, .. },
+    } = &mut cli.command
+    {
+        if workspace.is_none() {
+            let mount = if cli.offline {
+                gitalator::config::Config::load(&cli.state_dir)?.mount_path(&cli.state_dir)
+            } else {
+                let info = gitalator::cli::request(
+                    &cli.state_dir,
+                    &Cmd::Daemon {
+                        command: DaemonCmd::Status,
+                    },
+                )?
+                .ok_or("daemon is not running; run gtl daemon start")?;
+                std::path::PathBuf::from(info["mount"].as_str().ok_or("daemon omitted mount path")?)
+            };
+            *workspace = Some(gitalator::namespace::context(&mount, &std::env::current_dir()?)?.0);
+        }
+    }
+    let path_only = matches!(cli.command, Cmd::NewWorkspace { .. } | Cmd::Dir { .. });
+    if !cli.offline {
         if let Some(value) = gitalator::cli::request(&cli.state_dir, &cli.command)? {
-            return print_result(value, cli.json);
+            return print_result(value, cli.json, path_only);
         }
+        if matches!(
+            cli.command,
+            Cmd::Daemon {
+                command: DaemonCmd::Status | DaemonCmd::Stop { .. }
+            }
+        ) {
+            return print_result(serde_json::json!({"running":false}), cli.json, false);
+        }
+        return Err("daemon is not running; run `gtl daemon start` (or use --offline for explicit offline administration)".into());
     }
+    if matches!(cli.command, Cmd::Daemon { .. }) {
+        return Err("daemon commands cannot run --offline".into());
+    }
+    Store::check_schema(&cli.state_dir)?;
     std::fs::create_dir_all(&cli.state_dir)?;
     let _ownership = gitalator::cache::Lock::try_take(&cli.state_dir.join("daemon.lock"))?;
-    // Recheck after taking the ownership lock to close the mount/start race.
-    if matches!(cli.command, Cmd::Mount { .. }) && cli.state_dir.join("control.sock").exists() {
-        std::fs::remove_file(cli.state_dir.join("control.sock"))?;
-    }
-    if cli.state_dir.join("control.sock").exists() {
-        return Err(
-            "stale control socket: restart the owning daemon before using this state".into(),
-        );
-    }
     let mut store = Store::open(&cli.state_dir)?;
+    gitalator::config::Config::load(&store.root)?.apply(&store)?;
     store.progress = std::sync::Arc::new(|line| eprintln!("gtl: {line}"));
-    if let Cmd::Mount { path } = cli.command {
-        store
-            .runtime
-            .activity
-            .enabled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        eprintln!(
-            "gtl: mounting {}; detailed log: {} (8 MiB × 4 files)",
-            path.display(),
-            store.root.join("operations.jsonl").display()
-        );
-        let lifecycle = gitalator::cache::Span::new(&store.root, "mount");
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let server = gitalator::cli::server(store.clone(), stop.clone())?;
-        let activity = store.runtime.activity.clone();
-        let report_stop = stop.clone();
-        let reporter = std::thread::spawn(move || {
-            while !report_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                activity.report();
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        });
-        let result = gitalator::vfs::mount(store, &path);
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = server.join();
-        let _ = reporter.join();
-        lifecycle.event(
-            if result.is_ok() { "stopped" } else { "failed" },
-            result.as_ref().err().map(|e| e.to_string()).as_deref(),
-        );
-        if result.is_ok() {
-            eprintln!("gtl: mount stopped");
-        }
-        return result;
-    }
-    let value = gitalator::cli::dispatch(&store, cli.command)?;
-    print_result(value, cli.json)
+    print_result(
+        gitalator::cli::dispatch(&store, cli.command)?,
+        cli.json,
+        path_only,
+    )
 }
-fn print_result(value: serde_json::Value, json: bool) -> Result<()> {
-    if json {
+fn print_result(value: serde_json::Value, json: bool, path_only: bool) -> Result<()> {
+    if !json && path_only {
+        println!("{}", value["path"].as_str().ok_or("missing result path")?);
+    } else if json {
         println!("{}", serde_json::to_string(&value)?);
     } else {
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -91,7 +109,7 @@ fn print_result(value: serde_json::Value, json: bool) -> Result<()> {
 }
 fn main() {
     if let Err(e) = execute() {
-        eprintln!("gtl: {e}");
+        gitalator::logging::message(&format!("gtl: {e}"));
         std::process::exit(1)
     }
 }

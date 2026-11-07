@@ -264,7 +264,7 @@ fn unreadable_speculative_size_does_not_fail_requested_file() {
     let bad = s.entry(&view, "bad-pointer").unwrap();
     assert_eq!(s.known_size(&bad).unwrap(), None);
     assert!(s.traversal_size(&view, "bad-pointer", &bad).is_err());
-    let log = std::fs::read_to_string(s.root.join("operations.jsonl")).unwrap();
+    let log = std::fs::read_to_string(s.root.join("logs/operations.jsonl")).unwrap();
     assert!(log.contains("falling back to requested file"));
 }
 

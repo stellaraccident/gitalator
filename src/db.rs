@@ -15,7 +15,7 @@ pub struct Store {
     pub runtime: std::sync::Arc<crate::metadata::Runtime>,
 }
 impl Store {
-    pub fn open(root: &Path) -> Result<Self> {
+    pub fn check_schema(root: &Path) -> Result<()> {
         if root.join("state.sqlite3").exists() {
             let probe = rusqlite::Connection::open_with_flags(
                 root.join("state.sqlite3"),
@@ -26,6 +26,10 @@ impl Store {
                 return Err(error(format!("unsupported store schema {version}; use a fresh --state-dir (this binary requires schema 3)")));
             }
         }
+        Ok(())
+    }
+    pub fn open(root: &Path) -> Result<Self> {
+        Self::check_schema(root)?;
         std::fs::create_dir_all(root)?;
         let root = std::fs::canonicalize(root)?;
         use std::os::unix::fs::PermissionsExt;

@@ -67,7 +67,7 @@ fn offline_cli_reports_repository_fetch_failure() {
     let output = Command::new(env!("CARGO_BIN_EXE_gtl"))
         .arg("--state-dir")
         .arg(&f.store.root)
-        .args(["--json", "activate", "a", "--plan"])
+        .args(["--offline", "--json", "activate", "a", "--plan"])
         .output()
         .unwrap();
     assert!(!output.status.success());

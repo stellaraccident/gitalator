@@ -167,16 +167,21 @@ impl Drop for Span {
 // and rotation so readers never see interleaved or partially rotated events.
 static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn append_log(root: &Path, line: &str) -> std::io::Result<()> {
+    append_named_log(root, "operations.jsonl", line)
+}
+pub fn append_named_log(root: &Path, name: &str, line: &str) -> std::io::Result<()> {
     let _guard = LOG_LOCK.lock().unwrap();
-    let path = root.join("operations.jsonl");
+    let root = root.join("logs");
+    std::fs::create_dir_all(&root)?;
+    let path = root.join(name);
     if std::fs::metadata(&path).is_ok_and(|m| m.len() >= 8 * 1024 * 1024) {
         for n in (1..=2).rev() {
-            let from = root.join(format!("operations.jsonl.{n}"));
+            let from = root.join(format!("{name}.{n}"));
             if from.exists() {
-                std::fs::rename(from, root.join(format!("operations.jsonl.{}", n + 1)))?;
+                std::fs::rename(from, root.join(format!("{name}.{}", n + 1)))?;
             }
         }
-        std::fs::rename(&path, root.join("operations.jsonl.1"))?;
+        std::fs::rename(&path, root.join(format!("{name}.1")))?;
     }
     OpenOptions::new()
         .create(true)
@@ -191,7 +196,8 @@ mod log_tests {
     #[test]
     fn logs_rotate_and_preserve_complete_redacted_records() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("operations.jsonl");
+        std::fs::create_dir(root.path().join("logs")).unwrap();
+        let path = root.path().join("logs/operations.jsonl");
         for _ in 0..5 {
             File::create(&path)
                 .unwrap()
@@ -203,8 +209,8 @@ mod log_tests {
                 Some("remote https://user:secret@example.com/path?token=secret connection reset"),
             );
         }
-        assert!(root.path().join("operations.jsonl.3").exists());
-        assert!(!root.path().join("operations.jsonl.4").exists());
+        assert!(root.path().join("logs/operations.jsonl.3").exists());
+        assert!(!root.path().join("logs/operations.jsonl.4").exists());
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 let root = root.path();

@@ -25,6 +25,18 @@ pub struct Cli {
 #[derive(Subcommand, Serialize, Deserialize, Debug)]
 pub enum Cmd {
     Init,
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCmd,
+    },
+    Dir {
+        #[arg(value_enum)]
+        target: DirTarget,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(skip)]
+        cwd: PathBuf,
+    },
     NewWorkspace {
         name: String,
         #[arg(long, group="source", required_unless_present_any=["like", "clone"])]
@@ -152,6 +164,28 @@ pub enum Cmd {
     },
 }
 #[derive(Subcommand, Serialize, Deserialize, Debug)]
+pub enum DaemonCmd {
+    Start {
+        #[arg(long)]
+        detached: bool,
+    },
+    Run {
+        #[arg(long, hide=true, default_value="foreground", value_parser=["foreground","detached","systemd"])]
+        mode: String,
+    },
+    Status,
+    Stop {
+        #[arg(long)]
+        lazy: bool,
+    },
+    Reload,
+}
+#[derive(clap::ValueEnum, Clone, Copy, Serialize, Deserialize, Debug)]
+pub enum DirTarget {
+    Top,
+    Parent,
+}
+#[derive(Subcommand, Serialize, Deserialize, Debug)]
 pub enum SubmoduleCmd {
     Expand {
         paths: Vec<String>,
@@ -238,6 +272,12 @@ impl Cmd {
 }
 fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
     match cmd {
+        Cmd::Daemon { command } => crate::daemon::handle(s, command),
+        Cmd::Dir {
+            target,
+            workspace,
+            cwd,
+        } => crate::daemon::directory(s, target, workspace, &cwd),
         Cmd::Init => Ok(json!({"state_dir": s.root, "schema": 3})),
         Cmd::NewWorkspace {
             name,
@@ -258,7 +298,7 @@ fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
                 no_submodules,
             )?;
             Ok(
-                json!({"workspace":name,"path":s.root.join("mount/workspaces").join(&name),"map":s.state(s.head(&name)?)?.0}),
+                json!({"workspace":name,"path":crate::daemon::mount_path(s)?.join("workspaces").join(&name),"map":s.state(s.head(&name)?)?.0}),
             )
         }
         Cmd::Submodules {
@@ -281,38 +321,23 @@ fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
             cache_bytes,
             metadata_cache_bytes,
         } => {
-            let idle = idle_seconds.unwrap_or(s.setting("snapshot_idle_seconds", 2)? as u64);
-            let max = max_seconds.unwrap_or(s.setting("snapshot_max_seconds", 30)? as u64);
-            let cache = cache_bytes.unwrap_or(s.setting("cache_bytes", 1073741824)? as u64);
-            let metadata_cache = metadata_cache_bytes
-                .unwrap_or(s.setting("metadata_cache_bytes", 512 * 1024 * 1024)? as u64);
-            if metadata_cache == 0 || metadata_cache > i64::MAX as u64 {
-                return Err(error("metadata cache must be positive and fit i64"));
-            }
-            if idle == 0 || max < idle || max > i64::MAX as u64 || cache > i64::MAX as u64 {
-                return Err(error(
-                    "require 0 < idle <= max <= i64::MAX; cache must fit i64",
-                ));
-            }
-            let mut conn = s.conn()?;
-            let tx = conn.transaction()?;
-            for (key, value) in [
-                ("snapshot_idle_seconds", idle),
-                ("snapshot_max_seconds", max),
-                ("cache_bytes", cache),
-                ("metadata_cache_bytes", metadata_cache),
-            ] {
-                tx.execute(
-                    "INSERT OR REPLACE INTO settings(key,value) VALUES(?1,?2)",
-                    rusqlite::params![key, value],
-                )?;
-            }
-            tx.commit()?;
-            s.runtime.limit(metadata_cache as usize);
-            Ok(
-                json!({"idle_seconds": idle, "max_seconds": max, "cache_bytes": cache, "metadata_cache_bytes": metadata_cache}),
-            )
+            let config = crate::config::Config::update(s, |c| {
+                if let Some(v) = idle_seconds {
+                    c.snapshot_idle_seconds = v;
+                }
+                if let Some(v) = max_seconds {
+                    c.snapshot_max_seconds = v;
+                }
+                if let Some(v) = cache_bytes {
+                    c.cache_bytes = v;
+                }
+                if let Some(v) = metadata_cache_bytes {
+                    c.metadata_cache_bytes = v;
+                }
+            })?;
+            Ok(serde_json::to_value(config)?)
         }
+
         Cmd::Metrics => Ok(s.metrics()),
         Cmd::Warmup {
             workspace,
@@ -362,12 +387,17 @@ fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
                 snapshot,
             } => {
                 if let Some(source) = from {
+                    if source == name {
+                        return Err(error("source and destination workspace are identical"));
+                    }
+                    let source_lock = s.workspace_lock(&source)?;
                     let (revision, draft) = if let Some(number) = snapshot {
                         s.snapshot_revision(&source, number)?
                     } else {
                         (s.head(&source)?, s.draft(&source)?)
                     };
                     let (map, overlay) = s.state(revision)?;
+                    drop(source_lock);
                     s.create_resolved(&name, &map, &overlay, &draft)?;
                 } else {
                     let draft = if let Some(path) = map {
@@ -388,7 +418,12 @@ fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
             }
             let valid = draft.is_ok();
             let differs = draft
-                .map(|m| serde_json::to_string(&m).ok() != serde_json::to_string(&map).ok())
+                .map(|mut m| {
+                    for mount in &mut m.mount {
+                        mount.commit = None;
+                    }
+                    serde_json::to_string(&m).ok() != serde_json::to_string(&map).ok()
+                })
                 .unwrap_or(true);
             Ok(
                 json!({"workspace": workspace, "head": s.head(&workspace)?, "frozen": s.frozen(&workspace)?, "overlay_entries": overlay.len(), "draft_valid": valid, "draft_differs": differs}),
@@ -690,13 +725,36 @@ pub fn request(root: &Path, cmd: &Cmd) -> Result<Option<Value>> {
     if !socket.exists() {
         return Ok(None);
     }
-    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    let mut stream = match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(s) => s,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(e) => return Err(e.into()),
+    };
+    check_peer(&stream)?;
+    if matches!(
+        cmd,
+        Cmd::Daemon {
+            command: DaemonCmd::Status
+        }
+    ) {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    }
     stream.write_all(&serde_json::to_vec(
-        &json!({"command": cmd, "progress": true}),
+        &json!({"protocol": crate::daemon::PROTOCOL, "command": cmd, "progress": true}),
     )?)?;
     stream.shutdown(std::net::Shutdown::Write)?;
     for line in std::io::BufReader::new(stream).lines() {
         let value: Value = serde_json::from_str(&line?)?;
+        if value["protocol"] != crate::daemon::PROTOCOL {
+            return Err(error("incompatible daemon protocol; stop the old daemon with its binary before restarting"));
+        }
         if let Some(progress) = value.get("progress").and_then(Value::as_str) {
             eprintln!("gtl: {progress}");
             continue;
@@ -730,16 +788,26 @@ pub fn server(
             match listener.accept() {
                 Ok((mut stream, _)) => {
                     if jobs.len() >= 16 {
-                        let _ = stream.write_all(b"{\"error\":\"control queue busy; retry\"}");
+                        let _ = stream.write_all(json!({"protocol":crate::daemon::PROTOCOL,"error":"control queue busy; retry"}).to_string().as_bytes());
                         continue;
                     }
                     let mut s = store.clone();
                     jobs.push(std::thread::spawn(move || {
                         let result = (|| -> Result<Value> {
+                            check_peer(&stream)?;
                             let mut data = vec![];
                             stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
                             (&mut stream).take(1024 * 1024).read_to_end(&mut data)?;
                             let request: Value = serde_json::from_slice(&data)?;
+                            if request["protocol"] != crate::daemon::PROTOCOL {return Err(error("incompatible client protocol"));}
+                            let command:Cmd=serde_json::from_value(request["command"].clone())?;
+                            let _command_guard = if matches!(command,Cmd::Daemon{..}) {None} else {
+                                s.runtime.commands.fetch_add(1,std::sync::atomic::Ordering::AcqRel);
+                                let guard=CommandGuard(s.runtime.clone());
+                                if s.runtime.draining.load(std::sync::atomic::Ordering::Acquire) {return Err(error("daemon is stopping"));}
+                                if s.runtime.daemon.lock().unwrap().is_some() && !s.runtime.ready.load(std::sync::atomic::Ordering::Acquire) {return Err(error("daemon is not ready"));}
+                                Some(guard)
+                            };
                             if request.get("progress").and_then(Value::as_bool) == Some(true) {
                                 // A disconnected or stalled progress consumer must not hold up
                                 // Git pipe drainage or defeat the backend deadline.
@@ -749,7 +817,7 @@ pub fn server(
                                 s.progress = std::sync::Arc::new(move |line| {
                                     if let Ok(mut writer) = writer.lock() {
                                         if let Some(socket) = writer.as_mut() {
-                                            if writeln!(socket, "{}", json!({"progress":line}))
+                                            if writeln!(socket, "{}", json!({"protocol":crate::daemon::PROTOCOL,"progress":line}))
                                                 .is_err()
                                             {
                                                 *writer = None;
@@ -757,14 +825,12 @@ pub fn server(
                                         }
                                     }
                                 });
-                                dispatch(&s, serde_json::from_value(request["command"].clone())?)
-                            } else {
-                                dispatch(&s, serde_json::from_value(request)?)
                             }
+                            dispatch(&s, command)
                         })();
                         let output = match result {
-                            Ok(v) => json!({"result":v}),
-                            Err(e) => json!({"error":e.to_string()}),
+                            Ok(v) => json!({"protocol":crate::daemon::PROTOCOL,"result":v}),
+                            Err(e) => json!({"protocol":crate::daemon::PROTOCOL,"error":e.to_string()}),
                         };
                         let _ = stream.write_all(output.to_string().as_bytes());
                     }));
@@ -795,6 +861,7 @@ impl Cmd {
             }
         };
         match self {
+            Self::Dir { cwd: path, .. } => *path = cwd,
             Self::NewWorkspace {
                 from: Some(origin), ..
             } if !origin.contains("://") && (!origin.contains(':') || origin.starts_with('/')) => {
@@ -837,4 +904,34 @@ impl Cmd {
         }
         Ok(())
     }
+}
+
+struct CommandGuard(std::sync::Arc<crate::metadata::Runtime>);
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        self.0
+            .commands
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+fn check_peer(stream: &std::os::unix::net::UnixStream) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if cred.uid != unsafe { libc::geteuid() } {
+        return Err(error("control peer has a different uid"));
+    }
+    Ok(())
 }

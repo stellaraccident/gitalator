@@ -1,3 +1,4 @@
+use crate::namespace::{Control, Node};
 use crate::{
     db::Store,
     error, metadata,
@@ -16,23 +17,6 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-#[derive(Clone, PartialEq, Eq)]
-enum Node {
-    Dir,
-    Control(String, Control),
-    Source(View, String),
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Control {
-    Draft,
-    Active,
-    Status,
-    SnapshotDraft(i64),
-    SnapshotActive(i64),
-    TxStatus,
-    TxMap,
-    TxConflicts,
-}
 #[derive(Clone)]
 struct Handle {
     node: Node,
@@ -179,7 +163,7 @@ impl Fs {
             .ok_or_else(|| error("not found"))
     }
     fn ttl(&self, p: &str) -> Duration {
-        if p.starts_with("workspaces/") && !p.contains("/depot") && !p.contains("/READONLY") {
+        if p.starts_with("control/") {
             Duration::ZERO
         } else {
             Duration::from_secs(self.ttl.load(Ordering::Acquire))
@@ -204,72 +188,8 @@ impl Fs {
             }
         }
     }
-    fn node(&self, p: &str) -> Result<Node> {
-        let parts: Vec<_> = p.split('/').filter(|x| !x.is_empty()).collect();
-        match parts.as_slice() {
-            [] | ["workspaces"] | ["snapshots"] | ["transactions"] => Ok(Node::Dir),
-            ["workspaces", n] => {
-                self.store.head(n)?;
-                Ok(Node::Dir)
-            }
-            ["snapshots", n] => {
-                self.store.head(n)?;
-                Ok(Node::Dir)
-            }
-            ["snapshots", n, num] => {
-                self.store.snapshot_revision(n, num.parse()?)?;
-                Ok(Node::Dir)
-            }
-            ["transactions", id] => {
-                self.store.conflict_list(id)?;
-                Ok(Node::Dir)
-            }
-            ["workspaces", n, "VERSION_MAP"] => Ok(Node::Control((*n).into(), Control::Draft)),
-            ["workspaces", n, "ACTIVE_VERSION_MAP"] => {
-                Ok(Node::Control((*n).into(), Control::Active))
-            }
-            ["workspaces", n, "STATUS"] => Ok(Node::Control((*n).into(), Control::Status)),
-            ["workspaces", n, surface, rest @ ..]
-                if *surface == "depot" || *surface == "READONLY" =>
-            {
-                Ok(Node::Source(
-                    if *surface == "depot" {
-                        View::Live((*n).into())
-                    } else {
-                        View::Base((*n).into())
-                    },
-                    rest.join("/"),
-                ))
-            }
-            ["snapshots", n, num, "VERSION_MAP"] => Ok(Node::Control(
-                (*n).into(),
-                Control::SnapshotDraft(num.parse()?),
-            )),
-            ["snapshots", n, num, "ACTIVE_VERSION_MAP"] => Ok(Node::Control(
-                (*n).into(),
-                Control::SnapshotActive(num.parse()?),
-            )),
-            ["snapshots", n, num, surface, rest @ ..]
-                if *surface == "depot" || *surface == "READONLY" =>
-            {
-                Ok(Node::Source(
-                    View::Snapshot((*n).into(), num.parse()?, *surface == "READONLY"),
-                    rest.join("/"),
-                ))
-            }
-            ["transactions", id, "depot", rest @ ..] => Ok(Node::Source(
-                View::Transaction((*id).into()),
-                rest.join("/"),
-            )),
-            ["transactions", id, "STATUS"] => Ok(Node::Control((*id).into(), Control::TxStatus)),
-            ["transactions", id, "PROPOSED_VERSION_MAP"] => {
-                Ok(Node::Control((*id).into(), Control::TxMap))
-            }
-            ["transactions", id, "conflicts.json"] => {
-                Ok(Node::Control((*id).into(), Control::TxConflicts))
-            }
-            _ => Err(error("not found")),
-        }
+    fn node(&self, path: &str) -> Result<Node> {
+        crate::namespace::node(&self.store, path)
     }
     fn control(&self, n: &str, c: &Control) -> Result<Vec<u8>> {
         let key = format!("control:{n}:{c:?}");
@@ -350,54 +270,12 @@ impl Fs {
         make_attr(ino, e, time)
     }
     fn children(&self, p: &str) -> Result<Vec<String>> {
-        let parts: Vec<_> = p.split('/').filter(|x| !x.is_empty()).collect();
-        let mut result = match parts.as_slice() {
-            [] => vec![
-                "workspaces".into(),
-                "snapshots".into(),
-                "transactions".into(),
-            ],
-            ["workspaces"] | ["snapshots"] => self.store.names()?,
-            ["workspaces", _] => vec![
-                "VERSION_MAP".into(),
-                "ACTIVE_VERSION_MAP".into(),
-                "STATUS".into(),
-                "READONLY".into(),
-                "depot".into(),
-            ],
-            ["snapshots", n] => self
-                .store
-                .snapshots(n)?
-                .iter()
-                .map(|i| i.to_string())
-                .collect(),
-            ["snapshots", _, _] => vec![
-                "VERSION_MAP".into(),
-                "ACTIVE_VERSION_MAP".into(),
-                "READONLY".into(),
-                "depot".into(),
-            ],
-            ["transactions"] => {
-                let c = self.store.conn()?;
-                let mut q = c.prepare("SELECT id FROM activations ORDER BY id")?;
-                let r = q
-                    .query_map([], |r| r.get(0))?
-                    .collect::<std::result::Result<Vec<String>, _>>()?;
-                r
-            }
-            ["transactions", _] => vec![
-                "STATUS".into(),
-                "PROPOSED_VERSION_MAP".into(),
-                "conflicts.json".into(),
-                "depot".into(),
-            ],
-            _ => {
-                if let Node::Source(v, path) = self.node(p)? {
-                    self.store.children(&v, &path)?.into_keys().collect()
-                } else {
-                    return Err(error("not a directory"));
-                }
-            }
+        let mut result = if let Some(names) = crate::namespace::children(&self.store, p)? {
+            names
+        } else if let Node::Source(v, path) = self.node(p)? {
+            self.store.children(&v, &path)?.into_keys().collect()
+        } else {
+            return Err(error("not a directory"));
         };
         for temp in self.temps.keys() {
             if Path::new(temp)
@@ -1119,7 +997,7 @@ impl Filesystem for Fs {
             if self.stat(&p).is_ok() {
                 return Err(error("already exists"));
             }
-            if p.split('/').count() == 3 && p.starts_with("workspaces/") {
+            if p.split('/').count() == 4 && p.starts_with("control/workspaces/") {
                 self.temps.insert(p.clone(), vec![]);
                 return Ok((
                     p.clone(),

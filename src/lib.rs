@@ -25,3 +25,5 @@ pub mod persistent;
 pub mod activity;
 
 pub mod ergonomics;
+
+pub mod namespace;

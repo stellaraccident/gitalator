@@ -961,7 +961,9 @@ impl Store {
         };
         for p in &pending {
             if !path_ok(p) {
-                return Err(error("warmup paths must be depot-relative without . or .."));
+                return Err(error(
+                    "warmup paths must be workspace-relative without . or ..",
+                ));
             }
         }
         let mut seen = BTreeSet::new();

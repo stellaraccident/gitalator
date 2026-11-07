@@ -223,9 +223,9 @@ INSERT OR IGNORE INTO metadata_sizes SELECT 'git:'||repo||':'||oid,size FROM obj
                 for d in deltas {
                     if let Some(m) = map.mount.iter().find(|m| m.id == d.mount) {
                         let p = join(&m.path, &d.path);
-                        changed.insert(format!("workspaces/{name}/depot/{p}"));
+                        changed.insert(format!("workspaces/{name}/{p}"));
                         changed.insert(
-                            format!("workspaces/{name}/depot/{}", crate::metadata::split(&p).0)
+                            format!("workspaces/{name}/{}", crate::metadata::split(&p).0)
                                 .trim_end_matches('/')
                                 .to_string(),
                         );

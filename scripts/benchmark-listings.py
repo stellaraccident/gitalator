@@ -39,7 +39,7 @@ results = {}
 with (root / 'daemon.log').open('w') as log:
     daemon = subprocess.Popen([str(binary), '--state-dir', str(state), 'mount', str(mount)], stdout=log, stderr=log)
     try:
-        depot = mount / 'workspaces/bench/depot'
+        depot = mount / 'workspaces/bench'
         for _ in range(200):
             if depot.is_dir():
                 break

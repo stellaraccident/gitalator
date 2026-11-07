@@ -42,7 +42,7 @@ fn mounted_workspace_roundtrip() {
         child,
         path: p.clone(),
     };
-    let file = p.join("workspaces/a/depot/file");
+    let file = p.join("workspaces/a/file");
     for _ in 0..100 {
         if file.exists() {
             break;
@@ -57,7 +57,7 @@ fn mounted_workspace_roundtrip() {
     assert_eq!(std::fs::read(&file).unwrap(), b"base\n");
     // Backing Git directories must be searchable, not mode 000 from tree mode.
     assert_eq!(
-        std::fs::read(p.join("workspaces/a/depot/nested/hidden")).unwrap(),
+        std::fs::read(p.join("workspaces/a/nested/hidden")).unwrap(),
         b"hidden\n"
     );
     let before = std::fs::metadata(&file).unwrap().modified().unwrap();
@@ -71,15 +71,12 @@ fn mounted_workspace_roundtrip() {
     std::fs::write(&file, b"edited\n").unwrap();
     assert_eq!(std::fs::read(&file).unwrap(), b"edited\n");
     assert_eq!(
-        std::fs::read(p.join(format!("snapshots/a/{num}/depot/file"))).unwrap(),
+        std::fs::read(p.join(format!("snapshots/a/{num}/file"))).unwrap(),
         b"base\n"
     );
-    assert_eq!(
-        std::fs::read(p.join("workspaces/a/READONLY/file")).unwrap(),
-        b"base\n"
-    );
-    assert!(std::fs::write(p.join("workspaces/a/READONLY/file"), b"bad").is_err());
-    let depot = p.join("workspaces/a/depot");
+    assert_eq!(std::fs::read(p.join("readonly/a/file")).unwrap(), b"base\n");
+    assert!(std::fs::write(p.join("readonly/a/file"), b"bad").is_err());
+    let depot = p.join("workspaces/a");
     std::fs::create_dir(depot.join("newdir")).unwrap();
     std::fs::write(depot.join("newdir/new"), b"hello").unwrap();
     std::fs::rename(depot.join("newdir/new"), depot.join("newdir/renamed")).unwrap();
@@ -102,11 +99,11 @@ fn mounted_workspace_roundtrip() {
     let mut data = vec![];
     open.read_to_end(&mut data).unwrap();
     assert_eq!(data, b"EDITED\n");
-    let tmp = p.join("workspaces/a/.map-save");
+    let tmp = p.join("control/workspaces/a/.map-save");
     std::fs::write(&tmp, b"invalid draft").unwrap();
-    std::fs::rename(&tmp, p.join("workspaces/a/VERSION_MAP")).unwrap();
+    std::fs::rename(&tmp, p.join("control/workspaces/a/VERSION_MAP")).unwrap();
     assert_eq!(f.store.draft("a").unwrap(), "invalid draft");
-    assert!(p.join("workspaces/a/READONLY/file").exists());
+    assert!(p.join("readonly/a/file").exists());
     let cpath = std::ffi::CString::new(depot.join("newdir/renamed").to_str().unwrap()).unwrap();
     let cname = std::ffi::CString::new("user.ws.digest.sha256").unwrap();
     let mut digest = [0u8; 32];
@@ -141,7 +138,7 @@ fn activation_preserves_open_read_generation() {
         child,
         path: p.clone(),
     };
-    let file = p.join("workspaces/a/depot/file");
+    let file = p.join("workspaces/a/file");
     for _ in 0..100 {
         if file.exists() {
             break;
@@ -171,9 +168,13 @@ fn activation_preserves_open_read_generation() {
     assert!(output.status.success());
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["frozen"], false);
-    let temporary = p.join("workspaces/a/.save");
+    let temporary = p.join("control/workspaces/a/.save");
     std::fs::write(&temporary, b"bad").unwrap();
-    assert!(std::fs::rename(&temporary, p.join("workspaces/a/ACTIVE_VERSION_MAP")).is_err());
+    assert!(std::fs::rename(
+        &temporary,
+        p.join("control/workspaces/a/ACTIVE_VERSION_MAP")
+    )
+    .is_err());
 }
 
 #[test]
@@ -198,7 +199,7 @@ fn workspace_listing_does_not_load_repository_trees() {
         child,
         path: p.clone(),
     };
-    let workspace = p.join("workspaces/a");
+    let workspace = p.join("control/workspaces/a");
     for _ in 0..100 {
         if workspace.is_dir() {
             break;
@@ -217,10 +218,10 @@ fn workspace_listing_does_not_load_repository_trees() {
             String::from_utf8_lossy(&result.stderr)
         );
         let listing = String::from_utf8(result.stdout).unwrap();
-        assert!(listing.contains("depot"));
-        assert!(listing.contains("READONLY"));
-        assert!(workspace.join("depot").is_dir());
-        assert!(workspace.join("READONLY").is_dir());
+        assert!(listing.contains("VERSION_MAP"));
+        assert!(listing.contains("ACTIVE_VERSION_MAP"));
+        assert!(p.join("workspaces/a").is_dir());
+        assert!(p.join("readonly/a").is_dir());
     }
 }
 
@@ -255,7 +256,7 @@ fn start_mount(f: &Fixture) -> Mount {
         .unwrap();
     let mount = Mount { child, path };
     for _ in 0..100 {
-        if mount.path.join("workspaces/a/depot").is_dir() {
+        if mount.path.join("workspaces/a").is_dir() {
             return mount;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -282,7 +283,7 @@ fn directory_cookies_rewind_and_rename_unlink_identity() {
     let tx = f.store.activate("a").unwrap();
     f.store.finish_activation(&tx, false).unwrap();
     let mount = start_mount(&f);
-    let depot = mount.path.join("workspaces/a/depot");
+    let depot = mount.path.join("workspaces/a");
     let large = depot.join("large");
     let path = CString::new(large.to_str().unwrap()).unwrap();
     unsafe {
@@ -359,7 +360,7 @@ fn directory_cookies_rewind_and_rename_unlink_identity() {
 fn restore_same_map_invalidates_immediately_and_rejects_stale_writers() {
     let f = Fixture::new();
     let mount = start_mount(&f);
-    let path = mount.path.join("workspaces/a/depot/file");
+    let path = mount.path.join("workspaces/a/file");
     let snapshot = command(&f, &["snapshot", "create", "a"])["number"]
         .as_i64()
         .unwrap()
@@ -414,7 +415,7 @@ fn lazy_fetch_has_default_console_activity_and_detailed_log() {
     let tx = f.store.activate("a").unwrap();
     f.store.finish_activation(&tx, false).unwrap();
     let mount = start_mount(&f);
-    let file = mount.path.join("workspaces/a/depot/file");
+    let file = mount.path.join("workspaces/a/file");
     assert_eq!(std::fs::metadata(&file).unwrap().len(), 5);
     let console = std::fs::read_to_string(f.temp.path().join("fuse.log")).unwrap();
     assert!(console.contains("detailed log:"), "{console}");
@@ -468,7 +469,7 @@ fn recursive_du_batches_sizes_without_fetching_for_name_listings() {
     let tx = f.store.activate("a").unwrap();
     f.store.finish_activation(&tx, false).unwrap();
     let mount = start_mount(&f);
-    let directory = mount.path.join("workspaces/a/depot/walk");
+    let directory = mount.path.join("workspaces/a/walk");
     assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 300);
     assert_eq!(command(&f, &["metrics"])["metadata_fetches"], 0);
     let du = Command::new("du")
@@ -542,7 +543,7 @@ fn disconnected_mount_reports_recovery_and_restarts_without_delay() {
         .spawn()
         .unwrap();
     for _ in 0..100 {
-        if mount.path.join("workspaces/a/depot").is_dir() {
+        if mount.path.join("workspaces/a").is_dir() {
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -585,7 +586,7 @@ fn recursive_du_combines_small_sibling_directories() {
     let tx = f.store.activate("a").unwrap();
     f.store.finish_activation(&tx, false).unwrap();
     let mount = start_mount(&f);
-    let directory = mount.path.join("workspaces/a/depot/walk");
+    let directory = mount.path.join("workspaces/a/walk");
     for dir in std::fs::read_dir(&directory).unwrap() {
         assert_eq!(std::fs::read_dir(dir.unwrap().path()).unwrap().count(), 4);
     }

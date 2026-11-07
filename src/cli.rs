@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     path::{Path, PathBuf},
 };
 #[derive(Parser)]
@@ -30,8 +30,17 @@ pub enum Cmd {
         max_seconds: Option<u64>,
         #[arg(long)]
         cache_bytes: Option<u64>,
+        #[arg(long)]
+        metadata_cache_bytes: Option<u64>,
     },
     Doctor,
+    Metrics,
+    Warmup {
+        workspace: String,
+        paths: Vec<String>,
+        #[arg(long)]
+        recursive: bool,
+    },
     Repo {
         #[command(subcommand)]
         command: RepoCmd,
@@ -172,6 +181,7 @@ pub enum LayoutCmd {
 pub fn dispatch(s: &Store, cmd: Cmd) -> Result<Value> {
     let span = Span::new(&s.root, cmd.label());
     let result = execute(s, cmd);
+    s.runtime.flush()?;
     span.event(
         if result.is_ok() {
             "succeeded"
@@ -197,15 +207,21 @@ impl Cmd {
 }
 fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
     match cmd {
-        Cmd::Init => Ok(json!({"state_dir": s.root, "schema": 1})),
+        Cmd::Init => Ok(json!({"state_dir": s.root, "schema": 2})),
         Cmd::Config {
             idle_seconds,
             max_seconds,
             cache_bytes,
+            metadata_cache_bytes,
         } => {
             let idle = idle_seconds.unwrap_or(s.setting("snapshot_idle_seconds", 2)? as u64);
             let max = max_seconds.unwrap_or(s.setting("snapshot_max_seconds", 30)? as u64);
             let cache = cache_bytes.unwrap_or(s.setting("cache_bytes", 1073741824)? as u64);
+            let metadata_cache = metadata_cache_bytes
+                .unwrap_or(s.setting("metadata_cache_bytes", 512 * 1024 * 1024)? as u64);
+            if metadata_cache == 0 || metadata_cache > i64::MAX as u64 {
+                return Err(error("metadata cache must be positive and fit i64"));
+            }
             if idle == 0 || max < idle || max > i64::MAX as u64 || cache > i64::MAX as u64 {
                 return Err(error(
                     "require 0 < idle <= max <= i64::MAX; cache must fit i64",
@@ -217,6 +233,7 @@ fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
                 ("snapshot_idle_seconds", idle),
                 ("snapshot_max_seconds", max),
                 ("cache_bytes", cache),
+                ("metadata_cache_bytes", metadata_cache),
             ] {
                 tx.execute(
                     "INSERT OR REPLACE INTO settings(key,value) VALUES(?1,?2)",
@@ -224,8 +241,17 @@ fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
                 )?;
             }
             tx.commit()?;
-            Ok(json!({"idle_seconds": idle, "max_seconds": max, "cache_bytes": cache}))
+            s.runtime.limit(metadata_cache as usize);
+            Ok(
+                json!({"idle_seconds": idle, "max_seconds": max, "cache_bytes": cache, "metadata_cache_bytes": metadata_cache}),
+            )
         }
+        Cmd::Metrics => Ok(s.metrics()),
+        Cmd::Warmup {
+            workspace,
+            paths,
+            recursive,
+        } => s.warmup(&workspace, &paths, recursive),
         Cmd::Doctor => {
             let integrity: String = s
                 .conn()?
@@ -601,21 +627,32 @@ pub fn request(root: &Path, cmd: &Cmd) -> Result<Option<Value>> {
         return Ok(None);
     }
     let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
-    stream.write_all(&serde_json::to_vec(cmd)?)?;
+    stream.write_all(&serde_json::to_vec(
+        &json!({"command": cmd, "progress": true}),
+    )?)?;
     stream.shutdown(std::net::Shutdown::Write)?;
-    let mut data = vec![];
-    stream.read_to_end(&mut data)?;
-    let value: Value = serde_json::from_slice(&data)?;
-    if let Some(e) = value.get("error") {
-        return Err(error(e.as_str().unwrap_or("daemon error")));
+    for line in std::io::BufReader::new(stream).lines() {
+        let value: Value = serde_json::from_str(&line?)?;
+        if let Some(progress) = value.get("progress").and_then(Value::as_str) {
+            eprintln!("gtl: {progress}");
+            continue;
+        }
+        if let Some(e) = value.get("error") {
+            return Err(error(e.as_str().unwrap_or("daemon error")));
+        }
+        return Ok(Some(value["result"].clone()));
     }
-    Ok(Some(value["result"].clone()))
+    Err(error("daemon disconnected before returning a result"))
 }
 pub fn server(
     store: Store,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<std::thread::JoinHandle<()>> {
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+    store
+        .runtime
+        .managed
+        .store(true, std::sync::atomic::Ordering::Release);
     let p = store.root.join("control.sock");
     if p.exists() {
         std::fs::remove_file(&p)?;
@@ -632,13 +669,34 @@ pub fn server(
                         let _ = stream.write_all(b"{\"error\":\"control queue busy; retry\"}");
                         continue;
                     }
-                    let s = store.clone();
+                    let mut s = store.clone();
                     jobs.push(std::thread::spawn(move || {
                         let result = (|| -> Result<Value> {
                             let mut data = vec![];
                             stream.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
                             (&mut stream).take(1024 * 1024).read_to_end(&mut data)?;
-                            dispatch(&s, serde_json::from_slice(&data)?)
+                            let request: Value = serde_json::from_slice(&data)?;
+                            if request.get("progress").and_then(Value::as_bool) == Some(true) {
+                                // A disconnected or stalled progress consumer must not hold up
+                                // Git pipe drainage or defeat the backend deadline.
+                                stream
+                                    .set_write_timeout(Some(std::time::Duration::from_secs(1)))?;
+                                let writer = std::sync::Mutex::new(Some(stream.try_clone()?));
+                                s.progress = std::sync::Arc::new(move |line| {
+                                    if let Ok(mut writer) = writer.lock() {
+                                        if let Some(socket) = writer.as_mut() {
+                                            if writeln!(socket, "{}", json!({"progress":line}))
+                                                .is_err()
+                                            {
+                                                *writer = None;
+                                            }
+                                        }
+                                    }
+                                });
+                                dispatch(&s, serde_json::from_value(request["command"].clone())?)
+                            } else {
+                                dispatch(&s, serde_json::from_value(request)?)
+                            }
                         })();
                         let output = match result {
                             Ok(v) => json!({"result":v}),

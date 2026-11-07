@@ -4,16 +4,15 @@ use crate::{
     model::*,
     Result,
 };
-use rusqlite::{params, Connection, OptionalExtension};
-use std::{
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use rusqlite::{params, OptionalExtension};
+use std::path::{Path, PathBuf};
 #[derive(Clone)]
 pub struct Store {
     pub root: PathBuf,
     pub cache: Cache,
     pub fetched: Cache,
+    pub progress: crate::backend::Progress,
+    pub runtime: std::sync::Arc<crate::metadata::Runtime>,
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
@@ -25,12 +24,31 @@ impl Store {
             cache: Cache::new(root.join("content"))?,
             fetched: Cache::new(root.join("fetched"))?,
             root,
+            progress: std::sync::Arc::new(|_| {}),
+            runtime: Default::default(),
         };
         let _l = Lock::take(&s.root.join("schema.lock"))?;
         let c = s.conn()?;
         let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 1 {
+        if version > 2 {
             return Err(error("database is newer than this binary"));
+        }
+        if version == 2 {
+            let (epoch, stamp) =
+                c.query_row("SELECT epoch,stamp FROM metadata_epoch", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+            s.runtime.observe(epoch, stamp);
+            drop(c);
+            s.runtime
+                .limit(s.setting("metadata_cache_bytes", 512 * 1024 * 1024)? as usize);
+            return Ok(s);
+        }
+        if version == 1 {
+            let backup = s.root.join("schema-v1-backup.sqlite3");
+            if !backup.exists() {
+                c.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
+            }
         }
         c.execute_batch("BEGIN IMMEDIATE;
  CREATE TABLE IF NOT EXISTS repos(id TEXT PRIMARY KEY,origin TEXT NOT NULL);
@@ -45,13 +63,33 @@ impl Store {
  CREATE TABLE IF NOT EXISTS tree_cache(repo TEXT NOT NULL,tree_key TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(repo,tree_key));
  CREATE TABLE IF NOT EXISTS attributes(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,stamp INTEGER NOT NULL);
  PRAGMA user_version=1;COMMIT;")?;
+        c.execute_batch("BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS metadata_epoch(epoch INTEGER NOT NULL,stamp INTEGER NOT NULL);
+INSERT INTO metadata_epoch SELECT 0,0 WHERE NOT EXISTS(SELECT 1 FROM metadata_epoch);
+CREATE TABLE IF NOT EXISTS revision_stamps(revision INTEGER PRIMARY KEY,stamp INTEGER NOT NULL);
+INSERT OR IGNORE INTO revision_stamps SELECT id,created*1000000000 FROM revisions;
+CREATE TABLE IF NOT EXISTS metadata_checkpoints(revision INTEGER PRIMARY KEY,data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS metadata_trees(repo TEXT NOT NULL,tree_key TEXT NOT NULL,PRIMARY KEY(repo,tree_key));
+CREATE TABLE IF NOT EXISTS metadata_entries(repo TEXT NOT NULL,tree_key TEXT NOT NULL,parent TEXT NOT NULL,name TEXT NOT NULL,entry TEXT NOT NULL,PRIMARY KEY(repo,tree_key,parent,name)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS metadata_sizes(content TEXT PRIMARY KEY,size INTEGER NOT NULL);
+INSERT OR IGNORE INTO metadata_sizes SELECT 'git:'||repo||':'||oid,size FROM objects;
+")?;
+        for table in ["workspaces", "revisions", "snapshots", "activations"] {
+            for op in ["INSERT", "UPDATE", "DELETE"] {
+                c.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS metadata_{table}_{op} AFTER {op} ON {table} BEGIN UPDATE metadata_epoch SET epoch=epoch+1,stamp=max(stamp+1,CAST(unixepoch('subsec')*1000000000 AS INTEGER)); END;"))?;
+            }
+        }
+        c.execute_batch("CREATE TRIGGER IF NOT EXISTS metadata_revision_stamp AFTER INSERT ON revisions BEGIN INSERT OR REPLACE INTO revision_stamps VALUES(NEW.id,max((SELECT stamp+1 FROM metadata_epoch),CAST(unixepoch('subsec')*1000000000 AS INTEGER))); END;")?;
+        c.execute_batch("PRAGMA user_version=2;COMMIT;")?;
+        let (epoch, stamp) = c.query_row("SELECT epoch,stamp FROM metadata_epoch", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        s.runtime.observe(epoch, stamp);
+        drop(c);
         Ok(s)
     }
-    pub fn conn(&self) -> Result<Connection> {
-        let c = Connection::open(self.root.join("state.sqlite3"))?;
-        c.busy_timeout(Duration::from_secs(30))?;
-        c.execute_batch("PRAGMA foreign_keys=ON;PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;")?;
-        Ok(c)
+    pub fn conn(&self) -> Result<crate::metadata::Connection> {
+        crate::metadata::Connection::open(&self.root, self.runtime.clone())
     }
     pub fn workspace_lock(&self, name: &str) -> Result<Lock> {
         if !name_ok(name) {
@@ -72,29 +110,42 @@ impl Store {
             params![name, t.last_insert_rowid(), draft],
         )?;
         t.commit()?;
+        self.observe_committed()?;
         Ok(())
     }
     pub fn names(&self) -> Result<Vec<String>> {
-        let c = self.conn()?;
-        let mut q = c.prepare("SELECT name FROM workspaces ORDER BY name")?;
-        let r = q
-            .query_map([], |r| r.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(r)
+        Ok(self
+            .cached_value("names", || {
+                let c = self.conn()?;
+                let mut q = c.prepare_cached("SELECT name FROM workspaces ORDER BY name")?;
+                let rows = q
+                    .query_map([], |r| r.get(0))?
+                    .collect::<std::result::Result<Vec<String>, _>>()?;
+                Ok(rows)
+            })?
+            .as_ref()
+            .clone())
     }
     pub fn head(&self, name: &str) -> Result<i64> {
-        Ok(self
-            .conn()?
-            .query_row("SELECT head FROM workspaces WHERE name=?1", [name], |r| {
-                r.get(0)
-            })?)
+        Ok(*self.cached_value(&format!("head:{name}"), || {
+            Ok(self.conn()?.query_row(
+                "SELECT head FROM workspaces WHERE name=?1",
+                [name],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })?)
     }
     pub fn draft(&self, name: &str) -> Result<String> {
         Ok(self
-            .conn()?
-            .query_row("SELECT draft FROM workspaces WHERE name=?1", [name], |r| {
-                r.get(0)
-            })?)
+            .cached_value(&format!("draft:{name}"), || {
+                Ok(self.conn()?.query_row(
+                    "SELECT draft FROM workspaces WHERE name=?1",
+                    [name],
+                    |r| r.get::<_, String>(0),
+                )?)
+            })?
+            .as_ref()
+            .clone())
     }
     pub fn set_draft(&self, name: &str, data: &str) -> Result<()> {
         let count = self.conn()?.execute(
@@ -107,35 +158,24 @@ impl Store {
         Ok(())
     }
     pub fn state(&self, id: i64) -> Result<(Map, Overlay)> {
-        let c = self.conn()?;
-        let mut cursor = Some(id);
-        let mut overlay = Overlay::new();
-        let mut map = None;
-        while let Some(i) = cursor {
-            let (parent, m, d): (Option<i64>, String, String) = c.query_row(
-                "SELECT parent,map,delta FROM revisions WHERE id=?1",
-                [i],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )?;
-            if map.is_none() {
-                map = Some(serde_json::from_str(&m)?);
-            }
-            for delta in serde_json::from_str::<Vec<Delta>>(&d)? {
-                overlay
-                    .entry((delta.mount, delta.path))
-                    .or_insert(delta.entry);
-            }
-            cursor = parent;
-        }
-        Ok((map.ok_or_else(|| error("missing revision"))?, overlay))
+        let state = self.revision_snapshot(id)?;
+        Ok((
+            state.map.clone(),
+            state
+                .overlay
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ))
     }
     pub fn frozen(&self, name: &str) -> Result<bool> {
-        let a: Option<String> = self.conn()?.query_row(
-            "SELECT activation FROM workspaces WHERE name=?1",
-            [name],
-            |r| r.get(0),
-        )?;
-        Ok(a.is_some())
+        Ok(*self.cached_value(&format!("frozen:{name}"), || {
+            Ok(self.conn()?.query_row(
+                "SELECT activation IS NOT NULL FROM workspaces WHERE name=?1",
+                [name],
+                |r| r.get::<_, bool>(0),
+            )?)
+        })?)
     }
     pub fn apply(&self, name: &str, deltas: Vec<Delta>) -> Result<i64> {
         let _l = self.workspace_lock(name)?;
@@ -170,6 +210,25 @@ impl Store {
         )?;
         crate::failpoint("revision-before-commit");
         t.commit()?;
+        {
+            let mut changed = self.runtime.changed.lock().unwrap();
+            if parent.is_none() {
+                changed.insert(format!("workspaces/{name}/"));
+            } else {
+                for d in deltas {
+                    if let Some(m) = map.mount.iter().find(|m| m.id == d.mount) {
+                        let p = join(&m.path, &d.path);
+                        changed.insert(format!("workspaces/{name}/depot/{p}"));
+                        changed.insert(
+                            format!("workspaces/{name}/depot/{}", crate::metadata::split(&p).0)
+                                .trim_end_matches('/')
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        self.observe_committed()?;
         Ok(id)
     }
     pub fn snapshot(&self, name: &str) -> Result<i64> {
@@ -191,14 +250,21 @@ impl Store {
         )?;
         crate::failpoint("snapshot-before-commit");
         t.commit()?;
+        self.observe_committed()?;
         Ok(n)
     }
     pub fn snapshot_revision(&self, name: &str, n: i64) -> Result<(i64, String)> {
-        Ok(self.conn()?.query_row(
+        let key = format!("snapshot:{name}:{n}");
+        if let Some(v) = self.runtime.get::<(i64, String)>(&key) {
+            return Ok(v.as_ref().clone());
+        }
+        let value: (i64, String) = self.conn()?.query_row(
             "SELECT revision,draft FROM snapshots WHERE workspace=?1 AND number=?2",
             params![name, n],
             |r| Ok((r.get(0)?, r.get(1)?)),
-        )?)
+        )?;
+        let bytes = value.1.len() + 128;
+        Ok(self.runtime.put(key, value, bytes)?.as_ref().clone())
     }
     pub fn snapshots(&self, name: &str) -> Result<Vec<i64>> {
         let c = self.conn()?;

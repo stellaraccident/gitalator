@@ -2,9 +2,11 @@ pub mod backend;
 pub mod cache;
 pub mod cli;
 pub mod db;
+pub mod metadata;
 pub mod model;
 pub mod ops;
 pub mod vfs;
+pub mod workers;
 pub mod workflow;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub fn error(s: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
@@ -17,3 +19,7 @@ pub fn failpoint(name: &str) {
         std::process::exit(86);
     }
 }
+
+pub mod persistent;
+
+pub mod activity;

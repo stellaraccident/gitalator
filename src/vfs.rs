@@ -1,6 +1,6 @@
 use crate::{
     db::Store,
-    error,
+    error, metadata,
     model::{Entry, Kind},
     ops::{directory, View},
     Result,
@@ -10,6 +10,10 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 #[derive(Clone, PartialEq, Eq)]
@@ -18,7 +22,7 @@ enum Node {
     Control(String, Control),
     Source(View, String),
 }
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Control {
     Draft,
     Active,
@@ -36,42 +40,169 @@ struct Handle {
     bytes: Option<Vec<u8>>,
     generation: Option<String>,
 }
-pub struct Fs {
-    store: Store,
+#[derive(Default)]
+struct Inodes {
     paths: BTreeMap<u64, String>,
     ids: BTreeMap<String, u64>,
     next: u64,
+    lineages: BTreeMap<u64, String>,
+    saved: BTreeMap<u64, (Entry, SystemTime)>,
+    references: BTreeMap<u64, u64>,
+    opens: BTreeMap<u64, u64>,
+    detached: BTreeMap<u64, (Entry, SystemTime)>,
+}
+impl Inodes {
+    fn collect(&mut self, ino: u64) {
+        if ino == 1
+            || self.references.get(&ino).copied().unwrap_or(0) != 0
+            || self.opens.get(&ino).copied().unwrap_or(0) != 0
+        {
+            return;
+        }
+        if let Some(path) = self.paths.remove(&ino) {
+            if self.ids.get(&path) == Some(&ino) {
+                self.ids.remove(&path);
+            }
+        }
+        self.references.remove(&ino);
+        self.opens.remove(&ino);
+        self.detached.remove(&ino);
+        self.lineages.remove(&ino);
+        self.saved.remove(&ino);
+    }
+}
+#[derive(Clone)]
+struct DirectoryEntry {
+    name: String,
+    entry: Entry,
+    time: SystemTime,
+    generation: String,
+}
+#[derive(Clone)]
+struct DirectoryHandle {
+    path: String,
+    epoch: u64,
+    entries: Arc<Vec<DirectoryEntry>>,
+}
+pub struct Fs {
+    store: Store,
+    inodes: Arc<Mutex<Inodes>>,
     handles: BTreeMap<u64, Handle>,
     next_handle: u64,
+    file_inodes: BTreeMap<u64, u64>,
     temps: BTreeMap<String, Vec<u8>>,
+    directories: Arc<Mutex<BTreeMap<u64, DirectoryHandle>>>,
+    next_directory: Arc<AtomicU64>,
+    workers: Arc<crate::workers::Workers>,
+    ttl: Arc<AtomicU64>,
 }
 impl Fs {
     pub fn new(store: Store) -> Self {
+        store.runtime.managed.store(true, Ordering::Release);
+        let workers = Arc::new(crate::workers::Workers::new(store.runtime.clone()));
         Self {
             store,
-            paths: BTreeMap::from([(1, String::new())]),
-            ids: BTreeMap::from([(String::new(), 1)]),
-            next: 2,
+            inodes: Arc::new(Mutex::new(Inodes {
+                paths: BTreeMap::from([(1, String::new())]),
+                ids: BTreeMap::from([(String::new(), 1)]),
+                next: 2,
+                ..Default::default()
+            })),
             handles: BTreeMap::new(),
             next_handle: 1,
+            file_inodes: BTreeMap::new(),
             temps: BTreeMap::new(),
+            directories: Default::default(),
+            next_directory: Arc::new(AtomicU64::new(1)),
+            workers,
+            ttl: Arc::new(AtomicU64::new(0)),
         }
     }
-    fn inode(&mut self, p: &str) -> u64 {
-        if let Some(i) = self.ids.get(p) {
-            return *i;
+    fn reader(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            inodes: self.inodes.clone(),
+            handles: BTreeMap::new(),
+            next_handle: 1,
+            file_inodes: BTreeMap::new(),
+            temps: self.temps.clone(),
+            directories: self.directories.clone(),
+            next_directory: self.next_directory.clone(),
+            workers: self.workers.clone(),
+            ttl: self.ttl.clone(),
         }
-        let i = self.next;
-        self.next += 1;
-        self.paths.insert(i, p.into());
-        self.ids.insert(p.into(), i);
-        i
+    }
+    fn inode(&self, p: &str) -> u64 {
+        let generation = match self.node(p) {
+            Ok(Node::Source(v, _)) => self
+                .store
+                .view_snapshot(&v)
+                .map(|s| s.generation())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.inode_key(p, &generation)
+    }
+    fn inode_key(&self, p: &str, generation: &str) -> u64 {
+        let mut i = self.inodes.lock().unwrap();
+        if let Some(ino) = i.ids.get(p).copied() {
+            if i.lineages.get(&ino).map(String::as_str).unwrap_or("") == generation {
+                return ino;
+            }
+            if let Some(saved) = i.saved.get(&ino).cloned() {
+                i.detached.insert(ino, saved);
+            }
+        }
+        let ino = i.next;
+        i.next += 1;
+        i.ids.insert(p.into(), ino);
+        i.paths.insert(ino, p.into());
+        i.lineages.insert(ino, generation.into());
+        ino
+    }
+    fn reference(&self, ino: u64) {
+        *self
+            .inodes
+            .lock()
+            .unwrap()
+            .references
+            .entry(ino)
+            .or_default() += 1;
     }
     fn path(&self, ino: u64) -> Result<String> {
-        self.paths
+        self.inodes
+            .lock()
+            .unwrap()
+            .paths
             .get(&ino)
             .cloned()
             .ok_or_else(|| error("not found"))
+    }
+    fn ttl(&self, p: &str) -> Duration {
+        if p.starts_with("workspaces/") && !p.contains("/depot") && !p.contains("/READONLY") {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(self.ttl.load(Ordering::Acquire))
+        }
+    }
+    fn enqueue(&self, job: impl FnOnce(bool) + Send + 'static) {
+        // Keep the reply on a shared slot so rejection can return EAGAIN without
+        // running blocking work on the dispatch thread.
+        let job = Arc::new(Mutex::new(Some(job)));
+        let queued = job.clone();
+        if self
+            .workers
+            .submit(Box::new(move || {
+                if let Some(f) = queued.lock().unwrap().take() {
+                    f(true);
+                }
+            }))
+            .is_err()
+        {
+            if let Some(f) = job.lock().unwrap().take() {
+                f(false);
+            }
+        }
     }
     fn node(&self, p: &str) -> Result<Node> {
         let parts: Vec<_> = p.split('/').filter(|x| !x.is_empty()).collect();
@@ -141,7 +272,10 @@ impl Fs {
         }
     }
     fn control(&self, n: &str, c: &Control) -> Result<Vec<u8>> {
-        let s = match c {
+        let key = format!("control:{n}:{c:?}");
+        let result =
+            self.store.cached_value(&key, || {
+                let s = match c {
             Control::Draft => self.store.draft(n)?,
             Control::Active => toml::to_string_pretty(&self.store.state(self.store.head(n)?)?.0)?,
             Control::SnapshotDraft(i) => self.store.snapshot_revision(n, *i)?.1,
@@ -162,7 +296,9 @@ impl Fs {
                 |r| r.get(0),
             )?,
         };
-        Ok(s.into_bytes())
+                Ok(s.into_bytes())
+            })?;
+        Ok(result.as_ref().clone())
     }
     fn stat(&self, p: &str) -> Result<Entry> {
         if let Some(b) = self.temps.get(p) {
@@ -188,40 +324,30 @@ impl Fs {
             Node::Source(v, p) => {
                 let mut e = self.store.entry(&v, &p)?;
                 if e.kind != Kind::Directory {
-                    e.size = self.store.bytes(&e)?.len() as u64;
+                    e.size = self.store.traversal_size(&v, &p, &e)?;
                 }
                 Ok(e)
             }
         }
     }
     fn attr(&self, ino: u64, e: &Entry) -> FileAttr {
-        let fingerprint = format!("{:?}:{}:{}:{}", e.kind, e.mode, e.content, e.size);
-        let p = self.paths.get(&ino).cloned().unwrap_or_default();
-        let time = self
-            .store
-            .attribute_time(&p, &fingerprint)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        FileAttr {
-            ino,
-            size: e.size,
-            blocks: e.size.div_ceil(512),
-            atime: UNIX_EPOCH,
-            mtime: time,
-            ctime: time,
-            crtime: UNIX_EPOCH,
-            kind: match e.kind {
-                Kind::Directory => FileType::Directory,
-                Kind::File => FileType::RegularFile,
-                Kind::Symlink => FileType::Symlink,
-            },
-            perm: e.mode as u16,
-            nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 4096,
-            flags: 0,
-        }
+        let p = self.path(ino).unwrap_or_default();
+        let time = match self.node(&p) {
+            Ok(Node::Source(v, path)) => self
+                .store
+                .view_snapshot(&v)
+                .map(|s| s.time(&path))
+                .unwrap_or(UNIX_EPOCH),
+            _ => {
+                UNIX_EPOCH + Duration::from_nanos(self.store.runtime.stamp.load(Ordering::Acquire))
+            }
+        };
+        self.inodes
+            .lock()
+            .unwrap()
+            .saved
+            .insert(ino, (e.clone(), time));
+        make_attr(ino, e, time)
     }
     fn children(&self, p: &str) -> Result<Vec<String>> {
         let parts: Vec<_> = p.split('/').filter(|x| !x.is_empty()).collect();
@@ -267,18 +393,7 @@ impl Fs {
             ],
             _ => {
                 if let Node::Source(v, path) = self.node(p)? {
-                    let prefix = if path.is_empty() {
-                        String::new()
-                    } else {
-                        path + "/"
-                    };
-                    self.store
-                        .entries(&v)?
-                        .keys()
-                        .filter_map(|k| k.strip_prefix(&prefix))
-                        .filter(|r| !r.is_empty() && !r.contains('/'))
-                        .map(str::to_string)
-                        .collect()
+                    self.store.children(&v, &path)?.into_keys().collect()
                 } else {
                     return Err(error("not a directory"));
                 }
@@ -302,11 +417,176 @@ impl Fs {
         result.dedup();
         Ok(result)
     }
+    fn directory_handle(&self, path: &str) -> Result<DirectoryHandle> {
+        let epoch = self.store.runtime.epoch.load(Ordering::Acquire);
+        let key = if let Node::Source(view, relative) = self.node(path)? {
+            let state = self.store.view_snapshot(&view)?;
+            self.store.note_listing(&view, &state, &relative)?;
+            format!(
+                "listing:{view:?}:{}:{}:{path}",
+                state.lineage,
+                state.times.get(&relative).unwrap_or(&state.stamp)
+            )
+        } else {
+            format!("mutable:dirhandle:{epoch}:{path}")
+        };
+        let entries = if let Some(entries) = self.store.runtime.get::<Vec<DirectoryEntry>>(&key) {
+            entries
+        } else {
+            let mut entries = vec![(".".into(), directory()), ("..".into(), directory())];
+            if let Node::Source(view, relative) = self.node(path)? {
+                let state = self.store.view_snapshot(&view)?;
+                entries.extend(
+                    self.store
+                        .directory_metadata(&state, &relative)?
+                        .iter()
+                        .map(|(n, e)| (n.clone(), e.clone())),
+                );
+            } else {
+                for name in self.children(path)? {
+                    let full = crate::model::join(path, &name);
+                    let entry = match self.node(&full)? {
+                        Node::Source(v, p) => self.store.entry(&v, &p)?,
+                        _ => self.stat(&full)?,
+                    };
+                    entries.push((name, entry));
+                }
+            }
+            let entries = entries
+                .into_iter()
+                .map(|(name, entry)| -> Result<DirectoryEntry> {
+                    let full = directory_path(path, &name);
+                    let (time, generation) = match self.node(&full)? {
+                        Node::Source(view, relative) => {
+                            let state = self.store.view_snapshot(&view)?;
+                            (state.time(&relative), state.generation())
+                        }
+                        _ => (
+                            UNIX_EPOCH
+                                + Duration::from_nanos(
+                                    self.store.runtime.stamp.load(Ordering::Acquire),
+                                ),
+                            String::new(),
+                        ),
+                    };
+                    Ok(DirectoryEntry {
+                        name,
+                        entry,
+                        time,
+                        generation,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let bytes = entries
+                .iter()
+                .map(|r| r.name.len() + r.entry.content.len() + r.generation.len() + 192)
+                .sum();
+            self.store.runtime.put(key, entries, bytes)?
+        };
+        Ok(DirectoryHandle {
+            path: path.into(),
+            epoch,
+            entries,
+        })
+    }
+    fn directory_page(&self, fh: u64, offset: i64) -> Result<DirectoryHandle> {
+        let handle = self
+            .directories
+            .lock()
+            .unwrap()
+            .get(&fh)
+            .cloned()
+            .ok_or_else(|| error("invalid directory handle"))?;
+        if offset < 0 || offset as usize > handle.entries.len() {
+            return Err(error("invalid directory offset"));
+        }
+        if offset == 0 && handle.epoch != self.store.runtime.epoch.load(Ordering::Acquire) {
+            let new = self.directory_handle(&handle.path)?;
+            self.directories.lock().unwrap().insert(fh, new.clone());
+            return Ok(new);
+        }
+        Ok(handle)
+    }
+    fn reply_directory(&self, handle: DirectoryHandle, offset: i64, mut reply: ReplyDirectory) {
+        for (index, record) in handle.entries.iter().enumerate().skip(offset as usize) {
+            let path = directory_path(&handle.path, &record.name);
+            let ino = self
+                .inodes
+                .lock()
+                .unwrap()
+                .ids
+                .get(&path)
+                .copied()
+                .unwrap_or(0);
+            if reply.add(
+                ino,
+                (index + 1) as i64,
+                file_type(&record.entry.kind),
+                &record.name,
+            ) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+    fn reply_directory_plus(
+        &self,
+        handle: DirectoryHandle,
+        offset: i64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let fresh = handle.epoch == self.store.runtime.epoch.load(Ordering::Acquire);
+        for (index, record) in handle.entries.iter().enumerate().skip(offset as usize) {
+            let path = directory_path(&handle.path, &record.name);
+            let size = if fresh {
+                metadata::cached_only(|| self.store.known_size(&record.entry))
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            if let Some(size) = size {
+                let mut entry = record.entry.clone();
+                entry.size = size;
+                let ino = self.inode_key(&path, &record.generation);
+                let attr = make_attr(ino, &entry, record.time);
+                if reply.add(
+                    ino,
+                    (index + 1) as i64,
+                    &record.name,
+                    &self.ttl(&path),
+                    &attr,
+                    0,
+                ) {
+                    break;
+                }
+                self.inodes
+                    .lock()
+                    .unwrap()
+                    .saved
+                    .insert(ino, (entry, record.time));
+                if record.name != "." && record.name != ".." {
+                    self.reference(ino);
+                }
+            } else {
+                let attr = make_attr(0, &record.entry, record.time);
+                if reply.add(
+                    0,
+                    (index + 1) as i64,
+                    &record.name,
+                    &Duration::ZERO,
+                    &attr,
+                    0,
+                ) {
+                    break;
+                }
+            }
+        }
+        reply.ok();
+    }
     fn generation(&self, node: &Node) -> Result<Option<String>> {
         match node {
-            Node::Source(v, _) => Ok(Some(crate::cache::hash(
-                serde_json::to_string(&self.store.view_state(v)?.0)?.as_bytes(),
-            ))),
+            Node::Source(v, _) => Ok(Some(self.store.view_snapshot(v)?.generation())),
             _ => Ok(None),
         }
     }
@@ -346,8 +626,28 @@ impl Fs {
         Ok(crate::model::join(&self.path(parent)?, n))
     }
 }
+fn file_type(kind: &Kind) -> FileType {
+    match kind {
+        Kind::File => FileType::RegularFile,
+        Kind::Directory => FileType::Directory,
+        Kind::Symlink => FileType::Symlink,
+    }
+}
+fn directory_path(parent: &str, name: &str) -> String {
+    match name {
+        "." => parent.into(),
+        ".." => metadata::split(parent).0.into(),
+        _ => crate::model::join(parent, name),
+    }
+}
 fn errno(e: &(dyn std::error::Error + Send + Sync)) -> i32 {
     let s = e.to_string();
+    if s.contains("Resource temporarily unavailable") {
+        return libc::EAGAIN;
+    }
+    if s.contains("Cannot allocate memory") {
+        return libc::ENOMEM;
+    }
     if s.contains("not found") || s.contains("Query returned no rows") {
         libc::ENOENT
     } else if s.contains("read-only") {
@@ -368,60 +668,251 @@ fn errno(e: &(dyn std::error::Error + Send + Sync)) -> i32 {
     }
 }
 impl Filesystem for Fs {
+    fn init(
+        &mut self,
+        _: &Request<'_>,
+        config: &mut KernelConfig,
+    ) -> std::result::Result<(), libc::c_int> {
+        // Notifications are installed by mount() before Session::run. Their
+        // coherence guarantee does not depend on optional READDIRPLUS_AUTO.
+        let _ = config.add_capabilities(fuser::consts::FUSE_DO_READDIRPLUS);
+        let _ = config.add_capabilities(fuser::consts::FUSE_READDIRPLUS_AUTO);
+        self.ttl.store(1, Ordering::Release);
+        Ok(())
+    }
+    fn forget(&mut self, _: &Request<'_>, ino: u64, nlookup: u64) {
+        let mut table = self.inodes.lock().unwrap();
+        let n = table.references.entry(ino).or_default();
+        *n = n.saturating_sub(nlookup);
+        table.collect(ino);
+    }
+
     fn lookup(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        match self
-            .child_path(parent, name)
-            .and_then(|p| self.stat(&p).map(|e| (p, e)))
-        {
-            Ok((p, e)) => {
-                let i = self.inode(&p);
-                reply.entry(&Duration::ZERO, &self.attr(i, &e), 0)
+        self.store
+            .runtime
+            .metrics
+            .lookups
+            .fetch_add(1, Ordering::Relaxed);
+        let path = match self.child_path(parent, name) {
+            Ok(p) => p,
+            Err(e) => {
+                reply.error(errno(&*e));
+                return;
+            }
+        };
+        let work = |reader: &Fs| -> Result<(u64, FileAttr)> {
+            let e = reader.stat(&path)?;
+            let ino = reader.inode(&path);
+            Ok((ino, reader.attr(ino, &e)))
+        };
+        let runtime = self.store.runtime.clone();
+        let fence = runtime.reply_fence.read().unwrap();
+        match metadata::cached_only(|| work(self)) {
+            Ok((ino, attr)) => {
+                self.reference(ino);
+                reply.entry(&self.ttl(&path), &attr, 0);
+            }
+            Err(e) if metadata::would_block(&*e) => {
+                drop(fence);
+                let reader = self.reader();
+                self.enqueue(move |accepted| {
+                    if !accepted {
+                        reply.error(libc::EAGAIN);
+                        return;
+                    }
+                    crate::workers::complete(
+                        &reader.store.runtime,
+                        || {
+                            let e = reader.stat(&path)?;
+                            let ino = reader.inode(&path);
+                            Ok((ino, reader.attr(ino, &e)))
+                        },
+                        |result| match result {
+                            Ok((ino, attr)) => {
+                                reader.reference(ino);
+                                reply.entry(&reader.ttl(&path), &attr, 0)
+                            }
+                            Err(e) => reply.error(errno(&*e)),
+                        },
+                    );
+                });
             }
             Err(e) => reply.error(errno(&*e)),
         }
     }
     fn getattr(&mut self, _: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        match self.path(ino).and_then(|p| self.stat(&p)) {
-            Ok(e) => reply.attr(&Duration::ZERO, &self.attr(ino, &e)),
+        self.store
+            .runtime
+            .metrics
+            .getattrs
+            .fetch_add(1, Ordering::Relaxed);
+        let path = match self.path(ino) {
+            Ok(p) => p,
+            Err(e) => {
+                reply.error(errno(&*e));
+                return;
+            }
+        };
+        let runtime = self.store.runtime.clone();
+        let fence = runtime.reply_fence.read().unwrap();
+        let work_path = path.clone();
+        let work = move |reader: &Fs| -> Result<FileAttr> {
+            let path = &work_path;
+            // Resolve before deciding whether this inode belongs to a retired generation.
+            if let Some((entry, stamp)) = reader.inodes.lock().unwrap().detached.get(&ino).cloned()
+            {
+                return Ok(make_attr(ino, &entry, stamp));
+            }
+            if let Ok(Node::Source(view, _)) = reader.node(path) {
+                reader.store.view_snapshot(&view)?;
+            }
+            reader.inode(path);
+            if let Some((entry, stamp)) = reader.inodes.lock().unwrap().detached.get(&ino).cloned()
+            {
+                return Ok(make_attr(ino, &entry, stamp));
+            }
+            let e = reader.stat(path)?;
+            Ok(reader.attr(ino, &e))
+        };
+        match metadata::cached_only(|| work(self)) {
+            Ok(attr) => reply.attr(&self.ttl(&path), &attr),
+            Err(e) if metadata::would_block(&*e) => {
+                drop(fence);
+                let reader = self.reader();
+                self.enqueue(move |accepted| {
+                    if !accepted {
+                        reply.error(libc::EAGAIN);
+                        return;
+                    }
+                    crate::workers::complete(
+                        &reader.store.runtime,
+                        || work(&reader),
+                        |result| match result {
+                            Ok(attr) => reply.attr(&reader.ttl(&path), &attr),
+                            Err(e) => reply.error(errno(&*e)),
+                        },
+                    );
+                });
+            }
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn readdir(
+    fn opendir(&mut self, _: &Request<'_>, ino: u64, _: i32, reply: ReplyOpen) {
+        let path = match self.path(ino) {
+            Ok(p) => p,
+            Err(e) => {
+                reply.error(errno(&*e));
+                return;
+            }
+        };
+        let runtime = self.store.runtime.clone();
+        let fence = runtime.reply_fence.read().unwrap();
+        match metadata::cached_only(|| self.directory_handle(&path)) {
+            Ok(handle) => {
+                let fh = self.next_directory.fetch_add(1, Ordering::Relaxed);
+                self.directories.lock().unwrap().insert(fh, handle);
+                *self.inodes.lock().unwrap().opens.entry(ino).or_default() += 1;
+                reply.opened(fh, if path.starts_with("snapshots/") { 8 } else { 0 });
+            }
+            Err(e) if metadata::would_block(&*e) => {
+                drop(fence);
+                let reader = self.reader();
+                self.enqueue(move |accepted| {
+                    if !accepted {
+                        reply.error(libc::EAGAIN);
+                        return;
+                    }
+                    crate::workers::complete(
+                        &reader.store.runtime,
+                        || reader.directory_handle(&path),
+                        |result| match result {
+                            Ok(handle) => {
+                                let fh = reader.next_directory.fetch_add(1, Ordering::Relaxed);
+                                reader.directories.lock().unwrap().insert(fh, handle);
+                                *reader.inodes.lock().unwrap().opens.entry(ino).or_default() += 1;
+                                reply.opened(fh, if path.starts_with("snapshots/") { 8 } else { 0 })
+                            }
+                            Err(e) => reply.error(errno(&*e)),
+                        },
+                    );
+                });
+            }
+            Err(e) => reply.error(errno(&*e)),
+        }
+    }
+    fn releasedir(&mut self, _: &Request<'_>, ino: u64, fh: u64, _: i32, reply: ReplyEmpty) {
+        self.directories.lock().unwrap().remove(&fh);
+        let mut t = self.inodes.lock().unwrap();
+        let n = t.opens.entry(ino).or_default();
+        *n = n.saturating_sub(1);
+        t.collect(ino);
+        reply.ok();
+    }
+    fn readdir(&mut self, _: &Request<'_>, _: u64, fh: u64, offset: i64, reply: ReplyDirectory) {
+        self.store
+            .runtime
+            .metrics
+            .readdirs
+            .fetch_add(1, Ordering::Relaxed);
+        let runtime = self.store.runtime.clone();
+        let fence = runtime.reply_fence.read().unwrap();
+        match metadata::cached_only(|| self.directory_page(fh, offset)) {
+            Ok(handle) => self.reply_directory(handle, offset, reply),
+            Err(e) if metadata::would_block(&*e) => {
+                drop(fence);
+                let reader = self.reader();
+                self.enqueue(move |ok| {
+                    if !ok {
+                        reply.error(libc::EAGAIN);
+                        return;
+                    }
+                    crate::workers::complete(
+                        &reader.store.runtime,
+                        || reader.directory_page(fh, offset),
+                        |result| match result {
+                            Ok(h) => reader.reply_directory(h, offset, reply),
+                            Err(e) => reply.error(errno(&*e)),
+                        },
+                    );
+                });
+            }
+            Err(e) => reply.error(errno(&*e)),
+        }
+    }
+    fn readdirplus(
         &mut self,
         _: &Request<'_>,
-        ino: u64,
         _: u64,
+        fh: u64,
         offset: i64,
-        mut reply: ReplyDirectory,
+        reply: ReplyDirectoryPlus,
     ) {
-        let r = self
-            .path(ino)
-            .and_then(|p| self.children(&p).map(|c| (p, c)));
-        match r {
-            Ok((p, c)) => {
-                let mut entries = vec![
-                    (ino, FileType::Directory, ".".into()),
-                    (1, FileType::Directory, "..".into()),
-                ];
-                for name in c {
-                    let full = crate::model::join(&p, &name);
-                    let metadata = match self.node(&full) {
-                        Ok(Node::Source(v, p)) => self.store.entry(&v, &p),
-                        _ => self.stat(&full),
-                    };
-                    if let Ok(e) = metadata {
-                        let i = self.inode(&full);
-                        entries.push((i, self.attr(i, &e).kind, name));
+        self.store
+            .runtime
+            .metrics
+            .readdirplus
+            .fetch_add(1, Ordering::Relaxed);
+        let runtime = self.store.runtime.clone();
+        let fence = runtime.reply_fence.read().unwrap();
+        match metadata::cached_only(|| self.directory_page(fh, offset)) {
+            Ok(handle) => self.reply_directory_plus(handle, offset, reply),
+            Err(e) if metadata::would_block(&*e) => {
+                drop(fence);
+                let reader = self.reader();
+                self.enqueue(move |ok| {
+                    if !ok {
+                        reply.error(libc::EAGAIN);
+                        return;
                     }
-                }
-                for (index, (i, kind, name)) in
-                    entries.into_iter().enumerate().skip(offset as usize)
-                {
-                    if reply.add(i, (index + 1) as i64, kind, name) {
-                        break;
-                    }
-                }
-                reply.ok()
+                    crate::workers::complete(
+                        &reader.store.runtime,
+                        || reader.directory_page(fh, offset),
+                        |result| match result {
+                            Ok(h) => reader.reply_directory_plus(h, offset, reply),
+                            Err(e) => reply.error(errno(&*e)),
+                        },
+                    );
+                });
             }
             Err(e) => reply.error(errno(&*e)),
         }
@@ -458,6 +949,8 @@ impl Filesystem for Fs {
                 let id = self.next_handle;
                 self.next_handle += 1;
                 self.handles.insert(id, h);
+                self.file_inodes.insert(id, ino);
+                *self.inodes.lock().unwrap().opens.entry(ino).or_default() += 1;
                 reply.opened(id, 1)
             }
             Err(e) => reply.error(errno(&*e)),
@@ -474,21 +967,31 @@ impl Filesystem for Fs {
         _: Option<u64>,
         reply: ReplyData,
     ) {
-        let r = (|| -> Result<Vec<u8>> {
-            let h = self
-                .handles
-                .get(&fh)
-                .ok_or_else(|| error("invalid handle"))?;
-            self.handle_bytes(h)
-        })();
-        match r {
-            Ok(b) => {
-                let start = (offset as usize).min(b.len());
-                reply.data(&b[start..(start + size as usize).min(b.len())])
-            }
-            Err(e) => reply.error(errno(&*e)),
+        if offset < 0 {
+            reply.error(libc::EINVAL);
+            return;
         }
+        let Some(handle) = self.handles.get(&fh).cloned() else {
+            reply.error(libc::EBADF);
+            return;
+        };
+        let reader = self.reader();
+        // Payload fetches must not stall cached metadata on the dispatch thread.
+        self.enqueue(move |accepted| {
+            if !accepted {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            match reader.handle_bytes(&handle) {
+                Ok(bytes) => {
+                    let start = (offset as usize).min(bytes.len());
+                    reply.data(&bytes[start..start.saturating_add(size as usize).min(bytes.len())]);
+                }
+                Err(e) => reply.error(errno(&*e)),
+            }
+        });
     }
+
     fn write(
         &mut self,
         _: &Request<'_>,
@@ -528,7 +1031,7 @@ impl Filesystem for Fs {
                         data,
                     )?;
                     for handle in self.handles.values_mut() {
-                        if handle.node == h.node {
+                        if handle.node == h.node && handle.bytes.is_none() {
                             handle.entry = entry.clone();
                         }
                     }
@@ -542,8 +1045,18 @@ impl Filesystem for Fs {
             b.resize(b.len().max(offset as usize + data.len()), 0);
             b[offset as usize..offset as usize + data.len()].copy_from_slice(data);
             if h.bytes.is_some() {
-                if let Some(handle) = self.handles.get_mut(&fh) {
-                    handle.bytes = Some(b);
+                if let Some(ino) = self.file_inodes.get(&fh).copied() {
+                    for (other, handle) in &mut self.handles {
+                        if self.file_inodes.get(other) == Some(&ino) {
+                            handle.bytes = Some(b.clone());
+                            handle.entry.size = b.len() as u64;
+                        }
+                    }
+                    if let Some((entry, stamp)) = self.inodes.lock().unwrap().detached.get_mut(&ino)
+                    {
+                        entry.size = b.len() as u64;
+                        *stamp = SystemTime::now();
+                    }
                 }
                 return Ok(());
             }
@@ -553,7 +1066,7 @@ impl Filesystem for Fs {
                 _ => None,
             };
             for handle in self.handles.values_mut() {
-                if handle.node == h.node {
+                if handle.node == h.node && handle.bytes.is_none() {
                     if let Some(e) = &entry {
                         handle.entry = e.clone();
                     }
@@ -577,6 +1090,12 @@ impl Filesystem for Fs {
         reply: ReplyEmpty,
     ) {
         self.handles.remove(&fh);
+        if let Some(ino) = self.file_inodes.remove(&fh) {
+            let mut t = self.inodes.lock().unwrap();
+            let n = t.opens.entry(ino).or_default();
+            *n = n.saturating_sub(1);
+            t.collect(ino);
+        }
         reply.ok()
     }
     fn flush(&mut self, _: &Request<'_>, _: u64, _: u64, _: u64, reply: ReplyEmpty) {
@@ -642,6 +1161,9 @@ impl Filesystem for Fs {
                 let fh = self.next_handle;
                 self.next_handle += 1;
                 self.handles.insert(fh, h);
+                self.file_inodes.insert(fh, ino);
+                *self.inodes.lock().unwrap().opens.entry(ino).or_default() += 1;
+                self.reference(ino);
                 reply.created(&Duration::ZERO, &attr, 0, fh, 1)
             }
             Err(e) => reply.error(errno(&*e)),
@@ -672,6 +1194,7 @@ impl Filesystem for Fs {
         match r {
             Ok((p, e)) => {
                 let i = self.inode(&p);
+                self.reference(i);
                 reply.entry(&Duration::ZERO, &self.attr(i, &e), 0)
             }
             Err(e) => reply.error(errno(&*e)),
@@ -686,7 +1209,8 @@ impl Filesystem for Fs {
             let Node::Source(v, path) = self.node(&p)? else {
                 return Err(error("read-only view"));
             };
-            let e = self.store.entry(&v, &path)?;
+            let mut e = self.store.entry(&v, &path)?;
+            e.size = self.store.exact_size(&e)?;
             if e.kind == Kind::Directory {
                 return Err(error("is a directory"));
             }
@@ -695,7 +1219,12 @@ impl Filesystem for Fs {
                     h.bytes = Some(self.store.bytes(&e)?);
                 }
             }
-            self.store.mutate(&v, &path, None)
+            self.store.mutate(&v, &path, None)?;
+            let mut table = self.inodes.lock().unwrap();
+            if let Some(ino) = table.ids.remove(&p) {
+                table.detached.insert(ino, (e, SystemTime::now()));
+            }
+            Ok(())
         })();
         match r {
             Ok(()) => reply.ok(),
@@ -735,6 +1264,9 @@ impl Filesystem for Fs {
         let r = (|| -> Result<()> {
             let from = self.child_path(parent, name)?;
             let to = self.child_path(newparent, newname)?;
+            if from == to {
+                return Ok(());
+            }
             if let Some(bytes) = self.temps.get(&from).cloned() {
                 if let Ok(Node::Control(n, Control::Draft)) = self.node(&to) {
                     self.store.set_draft(&n, std::str::from_utf8(&bytes)?)?;
@@ -776,10 +1308,42 @@ impl Filesystem for Fs {
                     changes.push((dest, Some(e.clone())));
                 }
             }
+            if let Some(overwritten) = entries.get(&b) {
+                for h in self.handles.values_mut() {
+                    if h.node == Node::Source(v.clone(), b.clone()) {
+                        h.bytes = Some(self.store.bytes(overwritten)?);
+                    }
+                }
+            }
             self.store.mutate_locked(&v, changes)?;
+            {
+                let mut table = self.inodes.lock().unwrap();
+                if let Some(overwritten) = entries.get(&b) {
+                    if let Some(ino) = table.ids.remove(&to) {
+                        let saved = table
+                            .saved
+                            .get(&ino)
+                            .cloned()
+                            .unwrap_or((overwritten.clone(), SystemTime::now()));
+                        table.detached.insert(ino, saved);
+                    }
+                }
+                let moved: Vec<_> = table
+                    .ids
+                    .iter()
+                    .filter(|(p, _)| *p == &from || p.starts_with(&(from.clone() + "/")))
+                    .map(|(p, i)| (p.clone(), *i))
+                    .collect();
+                for (path, ino) in moved {
+                    let new = format!("{}{}", to, &path[from.len()..]);
+                    table.ids.remove(&path);
+                    table.ids.insert(new.clone(), ino);
+                    table.paths.insert(ino, new);
+                }
+            }
             for h in self.handles.values_mut() {
-                if let Node::Source(_, hp) = &mut h.node {
-                    if hp == &a || hp.starts_with(&(a.clone() + "/")) {
+                if let Node::Source(hv, hp) = &mut h.node {
+                    if *hv == v && (hp == &a || hp.starts_with(&(a.clone() + "/"))) {
                         *hp = format!("{}{}", b, &hp[a.len()..]);
                     }
                 }
@@ -813,6 +1377,63 @@ impl Filesystem for Fs {
         _: Option<u32>,
         reply: ReplyAttr,
     ) {
+        if size.is_some() || mode.is_some() {
+            if let Some(h) = self
+                .file_inodes
+                .iter()
+                .find(|(_, i)| **i == ino)
+                .and_then(|(fh, _)| self.handles.get(fh))
+            {
+                if self.generation(&h.node).ok().flatten() != h.generation {
+                    reply.error(libc::ESTALE);
+                    return;
+                }
+            }
+        }
+        let detached = self.inodes.lock().unwrap().detached.get(&ino).cloned();
+        if let Some((mut entry, _)) = detached {
+            let result = (|| -> Result<()> {
+                if let Some(mode) = mode {
+                    entry.mode = mode & 0o777;
+                }
+                if let Some(size) = size {
+                    let fh = self
+                        .file_inodes
+                        .iter()
+                        .find(|(_, i)| **i == ino)
+                        .map(|(fh, _)| *fh)
+                        .ok_or_else(|| error("not found"))?;
+                    let handle = self
+                        .handles
+                        .get(&fh)
+                        .cloned()
+                        .ok_or_else(|| error("not found"))?;
+                    let mut bytes = self.handle_bytes(&handle)?;
+                    bytes.resize(usize::try_from(size)?, 0);
+                    for (fh, h) in &mut self.handles {
+                        if self.file_inodes.get(fh) == Some(&ino) {
+                            h.bytes = Some(bytes.clone());
+                            h.entry.size = size;
+                        }
+                    }
+                    entry.size = size;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    let stamp = SystemTime::now();
+                    self.inodes
+                        .lock()
+                        .unwrap()
+                        .detached
+                        .insert(ino, (entry.clone(), stamp));
+                    reply.attr(&Duration::ZERO, &make_attr(ino, &entry, stamp));
+                }
+                Err(e) => reply.error(errno(&*e)),
+            }
+            return;
+        }
         let r = (|| -> Result<Entry> {
             let p = self.path(ino)?;
             if let Some(b) = self.temps.get_mut(&p) {
@@ -873,6 +1494,7 @@ impl Filesystem for Fs {
         match r {
             Ok((p, e)) => {
                 let i = self.inode(&p);
+                self.reference(i);
                 reply.entry(&Duration::ZERO, &self.attr(i, &e), 0)
             }
             Err(e) => reply.error(errno(&*e)),
@@ -889,6 +1511,12 @@ impl Filesystem for Fs {
         }
     }
     fn getxattr(&mut self, _: &Request<'_>, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+        // ls and other tools probe ACL/security attributes on every entry.
+        // These attributes are unsupported regardless of repository contents.
+        if name != "user.ws.content_id" && name != "user.ws.digest.sha256" {
+            reply.error(libc::ENODATA);
+            return;
+        }
         let r = (|| -> Result<Vec<u8>> {
             let p = self.path(ino)?;
             let Node::Source(v, path) = self.node(&p)? else {
@@ -925,24 +1553,74 @@ impl Filesystem for Fs {
         }
     }
 }
+fn mount_path_error(
+    path: &Path,
+    operation: &str,
+    e: std::io::Error,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    if e.raw_os_error() == Some(libc::ENOTCONN) {
+        error(format!("disconnected FUSE mount at {}; detach the old mount with fusermount3 -uz PATH, then retry (PATH is this mount directory)", path.display()))
+    } else {
+        error(format!(
+            "{operation} mount directory {}: {e}",
+            path.display()
+        ))
+    }
+}
 pub fn mount(store: Store, path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)?;
-    let path = std::fs::canonicalize(path)?;
+    // create_dir_all masks stat failures on stale FUSE endpoints as EEXIST.
+    // Inspect first, preserving the actual error and an actionable recovery path.
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(error(format!(
+                "mount path is not a directory: {}",
+                path.display()
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)
+                .map_err(|e| error(format!("create mount directory {}: {e}", path.display())))?;
+        }
+        Err(e) => return Err(mount_path_error(path, "inspect", e)),
+    }
+    let path = std::fs::canonicalize(path).map_err(|e| mount_path_error(path, "resolve", e))?;
     if path.starts_with(&store.root) || store.root.starts_with(&path) {
         return Err(error("mount and state directories must not overlap"));
     }
-    if std::fs::read_dir(&path)?.next().is_some() {
+    // Cached root attributes can outlive a dead daemon. Opening/enumerating the
+    // directory must preserve ENOTCONN too, even when the initial stat succeeded.
+    let mut entries = std::fs::read_dir(&path).map_err(|e| mount_path_error(&path, "read", e))?;
+    if let Some(entry) = entries.next() {
+        entry.map_err(|e| mount_path_error(&path, "read", e))?;
         return Err(error("mount directory must be empty"));
     }
+
+    let auto = store.clone();
+    let runtime = store.runtime.clone();
+    let fs = Fs::new(store);
+    let inodes = fs.inodes.clone();
+    let mut session = fuser::Session::new(
+        fs,
+        &path,
+        &[
+            MountOption::FSName("gitalator".into()),
+            MountOption::DefaultPermissions,
+            MountOption::RW,
+        ],
+    )
+    .map_err(|e| error(format!("attach FUSE mount {}: {e}", path.display())))?;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = stop.clone();
-    let auto = store.clone();
     let thread = std::thread::spawn(move || {
         let mut ticks = 0;
         while !flag.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(1));
             if let Err(e) = auto.auto_snapshots() {
                 eprintln!("automatic snapshot failed: {e}");
+            }
+            if let Err(e) = auto.runtime.flush() {
+                eprintln!("metadata publication failed: {e}");
             }
             ticks += 1;
             if ticks % 10 == 0 {
@@ -955,17 +1633,98 @@ pub fn mount(store: Store, path: &Path) -> Result<()> {
             }
         }
     });
-    let result = fuser::mount2(
-        Fs::new(store),
-        path,
-        &[
-            MountOption::FSName("gitalator".into()),
-            MountOption::DefaultPermissions,
-            MountOption::RW,
-        ],
-    );
+    let notifier = session.notifier();
+    let mut unmounter = session.unmount_callable();
+    let (send, recv) =
+        std::sync::mpsc::channel::<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>();
+    let notification_runtime = runtime.clone();
+    let notification_thread = std::thread::spawn(move || {
+        while let Ok(done) = recv.recv() {
+            let changed = std::mem::take(&mut *notification_runtime.changed.lock().unwrap());
+            let records: Vec<_> = {
+                let table = inodes.lock().unwrap();
+                table
+                    .paths
+                    .iter()
+                    .filter(|(_, p)| {
+                        changed.is_empty()
+                            || changed.iter().any(|c| {
+                                c.is_empty() || c == *p || (c.ends_with('/') && p.starts_with(c))
+                            })
+                    })
+                    .map(|(ino, p)| {
+                        (
+                            *ino,
+                            p.clone(),
+                            table.ids.get(metadata::split(p).0).copied(),
+                        )
+                    })
+                    .collect()
+            };
+            let result = (|| -> std::io::Result<()> {
+                for (ino, path, parent) in records {
+                    notifier.inval_inode(ino, -1, 0)?;
+                    if !path.is_empty() {
+                        if let Some(parent) = parent {
+                            notifier.inval_entry(parent, OsStr::new(metadata::split(&path).1))?;
+                        }
+                    }
+                    notification_runtime
+                        .metrics
+                        .invalidations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            })()
+            .map_err(|e| e.to_string());
+            if result.is_err() {
+                notification_runtime
+                    .unhealthy
+                    .store(true, Ordering::Release);
+                let _ = unmounter.unmount();
+            }
+            let _ = done.send(result);
+        }
+    });
+    *runtime.invalidator.lock().unwrap() = Some(Arc::new(move || {
+        let (done, result) = std::sync::mpsc::sync_channel(1);
+        send.send(done)
+            .map_err(|_| error("notification worker stopped"))?;
+        result
+            .recv()
+            .map_err(|_| error("notification worker stopped"))?
+            .map_err(error)
+    }));
+    runtime.pending.store(false, Ordering::Release);
+    let result = session.run();
+    runtime.invalidator.lock().unwrap().take();
+    let _ = notification_thread.join();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = thread.join();
-    result?;
+    result.map_err(|e| error(format!("serve FUSE mount {}: {e}", path.display())))?;
     Ok(())
+}
+
+fn make_attr(ino: u64, e: &Entry, time: SystemTime) -> FileAttr {
+    FileAttr {
+        ino,
+        size: e.size,
+        blocks: e.size.div_ceil(512),
+        atime: UNIX_EPOCH,
+        mtime: time,
+        ctime: time,
+        crtime: UNIX_EPOCH,
+        kind: match e.kind {
+            Kind::Directory => FileType::Directory,
+            Kind::File => FileType::RegularFile,
+            Kind::Symlink => FileType::Symlink,
+        },
+        perm: e.mode as u16,
+        nlink: 1,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        rdev: 0,
+        blksize: 4096,
+        flags: 0,
+    }
 }

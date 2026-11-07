@@ -32,11 +32,6 @@ fn deltas(o: &Overlay) -> Vec<Delta> {
         })
         .collect()
 }
-fn overlay(d: Vec<Delta>) -> Overlay {
-    d.into_iter()
-        .map(|d| ((d.mount, d.path), d.entry))
-        .collect()
-}
 pub fn directory() -> Entry {
     Entry {
         kind: Kind::Directory,
@@ -47,29 +42,14 @@ pub fn directory() -> Entry {
 }
 impl Store {
     pub fn view_state(&self, v: &View) -> Result<(Map, Overlay)> {
-        match v {
-            View::Live(n) => self.state(self.head(n)?),
-            View::Base(n) => {
-                let (m, _) = self.state(self.head(n)?)?;
-                Ok((m, Overlay::new()))
-            }
-            View::Snapshot(n, num, base) => {
-                let (r, _) = self.snapshot_revision(n, *num)?;
-                let (m, o) = self.state(r)?;
-                Ok((m, if *base { Overlay::new() } else { o }))
-            }
-            View::Transaction(id) => {
-                let (m, d): (String, String) = self.conn()?.query_row(
-                    "SELECT proposal,candidate FROM activations WHERE id=?1",
-                    [id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )?;
-                Ok((
-                    serde_json::from_str(&m)?,
-                    overlay(serde_json::from_str(&d)?),
-                ))
-            }
-        }
+        let s = self.view_snapshot(v)?;
+        Ok((
+            s.map.clone(),
+            s.overlay
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ))
     }
     pub fn compose(&self, map: &Map, o: &Overlay) -> Result<BTreeMap<String, Entry>> {
         let mut all = BTreeMap::new();
@@ -112,9 +92,12 @@ impl Store {
         self.compose(&m, &o)
     }
     pub fn entry(&self, v: &View, path: &str) -> Result<Entry> {
-        self.entries(v)?
-            .remove(path)
-            .ok_or_else(|| error("not found"))
+        let state = self.view_snapshot(v)?;
+        self.lookup_metadata(&state, path)
+    }
+    pub fn children(&self, v: &View, path: &str) -> Result<BTreeMap<String, Entry>> {
+        let state = self.view_snapshot(v)?;
+        Ok(self.directory_metadata(&state, path)?.as_ref().clone())
     }
     pub fn read(&self, v: &View, path: &str) -> Result<Vec<u8>> {
         let e = self.entry(v, path)?;
@@ -195,8 +178,7 @@ impl Store {
         data: &[u8],
     ) -> Result<Entry> {
         let _guard = self.view_lock(v)?;
-        let map = self.view_state(v)?.0;
-        if hash(serde_json::to_string(&map)?.as_bytes()) != generation {
+        if self.view_snapshot(v)?.generation() != generation {
             return Err(error("stale generation: reopen after activation"));
         }
         let mut entry = self.entry(v, path)?;
@@ -254,6 +236,7 @@ impl Store {
             params![name, tx.last_insert_rowid(), d],
         )?;
         tx.commit()?;
+        self.observe_committed()?;
         self.snapshot_unlocked(name)?;
         Ok(())
     }
@@ -294,6 +277,7 @@ impl Store {
                 params![name, id],
             )?;
             t.commit()?;
+            self.observe_committed()?;
             (id, oldmap, oldoverlay, proposed)
         };
         let span = Span::new(&self.root, &format!("activate:{id}"));
@@ -513,6 +497,7 @@ impl Store {
         )?;
         crate::failpoint("activation-before-commit");
         t.commit()?;
+        self.observe_committed()?;
         crate::failpoint("activation-after-commit");
         self.snapshot_unlocked(&name)?;
         if !abort {
@@ -775,6 +760,7 @@ impl Store {
                 params![name, id],
             )?;
             tx.commit()?;
+            self.observe_committed()?;
             (id, source, map, candidate)
         };
         let result = (|| -> Result<()> {

@@ -56,7 +56,24 @@ required after switching. Layout branches are local and are not pushed anywhere.
 
 Editing VERSION_MAP is only editing a proposal. `activate NAME --plan` fetches
 and resolves references without changing the active view (it can take time and
-populate caches). `activate NAME` prepares a candidate, rebases local edits, and
+populate caches). Activation defaults to selective, blob-lazy fetching: only the
+requested branches/tags or missing exact commit IDs are fetched. Cached exact
+pins skip the remote fetch; named refs are refreshed on every activation. Git
+servers must allow fetching the requested commit and support blob filtering to
+avoid transferring file contents. Git reports filter fallback in the progress
+output. Commit history and tree metadata are still fetched and enumerated to
+validate the layout; this is not a shallow clone or fully deferred tree loading.
+File/LFS contents are retrieved when needed (including reads during edit rebases).
+`repo fetch ID` explicitly refreshes all branches and tags.
+
+Fetch status and Git transfer progress appear on stderr, prefixed with the
+repository alias, mount path(s), and shortened origin, both offline and through a
+mounted daemon (for example `repo-ab12 [compiler/amd-llvm · ROCm/llvm-project]`).
+The root mount is shown as `/`; URL credentials, query strings and fragments are
+omitted from labels. Stdout remains the
+final JSON result, including with `--json`. Progress includes pending, lock wait,
+fetching/cached, tree indexing, ready, and fetch failures. Restart a daemon from
+an older binary before using the new client's progress protocol. `activate NAME` prepares a candidate, rebases local edits, and
 publishes automatically if there are no conflicts.
 
 During a transaction, old depot reads remain available; writes are frozen.

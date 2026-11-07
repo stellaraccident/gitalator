@@ -9,12 +9,11 @@ unfinished or deliberately conservative, not claims of completed functionality.
   ordinary private mappings used by some compilers/loaders. Build outputs and tools
   that require mappings should live on a normal filesystem. Add a compatibility
   suite covering real compilers, editors, Ninja, linkers and repository tooling.
-- **Open inode semantics:** Rename/unlink are covered in basic mounted tests, but
-  destination-overwrite descriptors, fstat after rename, multiple descriptors for
-  an unlinked file, inode reuse, and directory handles need a full inode model.
-  Activation protection is generation-based; restore/import within an identical
-  map needs stronger descriptor-generation fencing.
-- **Metadata:** Directory mtimes do not yet track child changes. atime/utimens,
+- **Open inode semantics:** Expand coverage for destination-overwrite descriptors,
+  rename/type edge cases and descriptor lifetimes under concurrent mutations. Basic
+  rename/unlink identity, multiple unlinked descriptors, directory streams, and
+  same-map restore generation fencing now have mounted regression coverage.
+- **Metadata:** Directory mtimes track child changes. atime/utimens,
   chown, hardlinks, advisory locks, ACLs, general xattrs, non-UTF8 names, sparse
   files and special files are not implemented. Only the two documented content
   xattrs are exposed; listxattr discovery is pending. Control-file temporary saves
@@ -29,23 +28,23 @@ unfinished or deliberately conservative, not claims of completed functionality.
 
 ## Performance and storage
 
-- Replace serial FUSE callbacks with bounded asynchronous backend dispatch;
-  independent control-plane operations already run concurrently. Measure lock
-  contention and expose queue/wait timings and in-progress status/cancellation.
-- Avoid whole-tree metadata enumeration on first access and repeated composition;
-  add indexed tree nodes and persistent overlay structure/compaction. Current
-  revision chains and JSON candidate maps favor correctness over scale.
-- Avoid hydration on ordinary stat and hashing whole files for digest xattrs.
-  Introduce safe kernel caching/invalidation and read-only mmap.
+- Extend bounded backend dispatch to remaining blocking mutation/control paths.
+  Measure lock contention and expose queue/wait timings and cancellation. Cold
+  metadata and file reads now use bounded workers; warm metadata bypasses them.
+- Avoid whole-tree metadata enumeration when building the initial persistent index.
+  Indexed lookups, shared revision state, checkpoints, and bounded directory caches
+  now serve subsequent requests; continue measuring large-overlay publication cost.
+- Reduce cold-stat blob transfer requirements and whole-file digest hashing. Exact
+  size facts, coherent kernel metadata caching, and bounded recursive fetch lookahead
+  are implemented. Read-only mmap remains unsupported.
 - Add configurable snapshot expiration, safe history-aware durable object GC,
   orphan cleanup, Git-pack quotas and maintenance. Pin metadata currently has no
   effect because all history is retained. Cache quota covers fetched payloads only.
-- Add log rotation,
-  lock-wait metrics, richer transfer progress and structured backend error codes.
-- Fetch negotiation/fallback telemetry, selective refs, arbitrary reachable commit
-  fetching, retries with jitter, cancellation, and broader auth/proxy/SSH overrides.
-  Missing pinned commits outside fetched refs currently fail instead of fetching
-  the exact OID. Startup does not automatically resume PREPARING transactions.
+- Add lock-wait metrics, structured backend error codes and configurable log
+  retention. Default activity summaries, detailed transfer logs and rotation exist.
+- Richer fetch negotiation/fallback telemetry, retries with jitter, cancellation,
+  and broader auth/proxy/SSH overrides. Activation now fetches selected refs or
+  missing exact pins with blob filtering and streams per-repository progress. Startup does not automatically resume PREPARING transactions.
 
 ## Workflow completion
 
@@ -72,8 +71,9 @@ unfinished or deliberately conservative, not claims of completed functionality.
 
 - Crash/fault tests for disk-full, interrupted fetches, SQLite I/O failures, daemon
   reconnect, simultaneous mount/CLI races, and candidate checkpoint boundaries.
-- Schema migrations, consistent online backups, store repair/diagnostics and
-  explicitly supported Rust/Linux/Git version matrix.
+- Extend migration and recovery coverage beyond the transactional v1-to-v2 migration
+  and its automatic pre-migration backup. Add consistent online backups, store repair
+  diagnostics and an explicitly supported Rust/Linux/Git version matrix.
 - CI runner provisioning with /dev/fuse, fuzzing of maps/paths/protocol, benchmarks,
   dependency auditing, package/install scripts, and service lifecycle support.
 - Store ACLs rely on one OS user and upstream Git authorization. No multi-user

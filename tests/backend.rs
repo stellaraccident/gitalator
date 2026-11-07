@@ -140,3 +140,174 @@ fn repository_locks_serialize_shared_work_without_blocking_other_repos() {
             && v["status"] == "succeeded"
             && v["timestamp_ms"].is_number()));
 }
+
+#[test]
+fn activation_fetches_only_requested_refs_and_defers_blobs() {
+    use gitalator::{db::Store, model::Map};
+    let f = Fixture::new();
+    git(&f.repo, &["config", "uploadpack.allowFilter", "true"]).unwrap();
+    git(&f.repo, &["branch", "unrelated"]).unwrap();
+    git(&f.repo, &["tag", "unrequested"]).unwrap();
+    let pin = String::from_utf8(git(&f.repo, &["rev-parse", "HEAD"]).unwrap())
+        .unwrap()
+        .trim()
+        .to_string();
+    let blob = String::from_utf8(git(&f.repo, &["rev-parse", "HEAD:file"]).unwrap())
+        .unwrap()
+        .trim()
+        .to_string();
+    let s = Store::open(&f.temp.path().join("lazy-state")).unwrap();
+    s.repo_add(
+        "source",
+        &format!(
+            "file://{}",
+            std::fs::canonicalize(&f.repo).unwrap().display()
+        ),
+    )
+    .unwrap();
+    let mut map =
+        Map::parse("format=1\n[[mount]]\nid='root'\nrepo='source'\npath=''\nrevision='main'\n")
+            .unwrap();
+    s.resolve_map(&map).unwrap();
+    let refs = String::from_utf8(
+        git(
+            &s.repo_path("source"),
+            &["for-each-ref", "--format=%(refname)"],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(refs.contains("refs/remotes/origin/main"));
+    assert!(!refs.contains("unrelated"));
+    assert!(!refs.contains("unrequested"));
+    let mut check = std::process::Command::new("git");
+    check
+        .arg("-C")
+        .arg(s.repo_path("source"))
+        .args(["cat-file", "-e", &blob])
+        .env("GIT_NO_LAZY_FETCH", "1");
+    assert!(
+        !execute_command(&mut check, None, std::time::Duration::from_secs(10))
+            .unwrap()
+            .status
+            .success()
+    );
+    // Fetch an exact commit that was never covered by the selected branch fetch.
+    std::fs::write(f.repo.join("file"), b"new pin\n").unwrap();
+    commit(&f.repo);
+    map.mount[0].revision = String::from_utf8(git(&f.repo, &["rev-parse", "HEAD"]).unwrap())
+        .unwrap()
+        .trim()
+        .to_string();
+    let resolved = s.resolve_map(&map).unwrap();
+    assert_eq!(
+        resolved.mount[0].commit.as_ref(),
+        Some(&map.mount[0].revision)
+    );
+    let entry = s.tree(&resolved.mount[0]).unwrap().remove("file").unwrap();
+    assert_eq!(s.bytes(&entry).unwrap(), b"new pin\n");
+    // Cached immutable pins can be activated without contacting the origin.
+    std::fs::rename(&f.repo, f.temp.path().join("offline-origin")).unwrap();
+    map.mount[0].revision = pin;
+    s.resolve_map(&map).unwrap();
+}
+
+#[test]
+fn legacy_cached_git_directories_are_searchable() {
+    let f = Fixture::new();
+    let (map, _) = f.store.view_state(&View::Live("a".into())).unwrap();
+    let mut tree = f.store.tree(&map.mount[0]).unwrap();
+    assert_eq!(tree["nested"].mode, 0o755);
+    tree.get_mut("nested").unwrap().mode = 0;
+    f.store
+        .conn()
+        .unwrap()
+        .execute(
+            "UPDATE tree_cache SET data=?1",
+            [serde_json::to_string(&tree).unwrap()],
+        )
+        .unwrap();
+    let reopened = gitalator::db::Store::open(&f.store.root).unwrap();
+    assert_eq!(
+        reopened
+            .entry(&View::Live("a".into()), "nested")
+            .unwrap()
+            .mode,
+        0o755
+    );
+}
+
+#[test]
+fn metadata_fetch_repairs_missing_promised_blobs_and_coalesces_with_reads() {
+    use gitalator::{db::Store, model::Map};
+    let f = Fixture::new();
+    git(&f.repo, &["config", "uploadpack.allowFilter", "true"]).unwrap();
+    let s = Store::open(&f.temp.path().join("missing-blobs")).unwrap();
+    s.repo_add(
+        "source",
+        &format!(
+            "file://{}",
+            std::fs::canonicalize(&f.repo).unwrap().display()
+        ),
+    )
+    .unwrap();
+    let map =
+        Map::parse("format=1\n[[mount]]\nid='root'\nrepo='source'\npath=''\nrevision='main'\n")
+            .unwrap();
+    let resolved = s.resolve_map(&map).unwrap();
+    let entries = s.tree(&resolved.mount[0]).unwrap();
+    let blobs: Vec<_> = entries
+        .values()
+        .filter(|e| e.kind == Kind::File)
+        .cloned()
+        .collect();
+    // These commits are already present, while their blobs are promised/missing.
+    for e in &blobs {
+        let oid = e.content.rsplit(':').next().unwrap();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(s.repo_path("source"))
+            .args(["cat-file", "--batch-check"])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                writeln!(child.stdin.take().unwrap(), "{oid}")?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("missing"));
+    }
+    // Exercise a repository configured for ordinary skipping negotiation.
+    git(
+        &s.repo_path("source"),
+        &["config", "fetch.negotiationAlgorithm", "skipping"],
+    )
+    .unwrap();
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| s.resolve_sizes(&blobs));
+        let b = scope.spawn(|| s.bytes(&entries["file"]));
+        a.join().unwrap().unwrap();
+        assert_eq!(b.join().unwrap().unwrap(), b"base\n");
+    });
+    assert_eq!(s.known_size(&entries["file"]).unwrap(), Some(5));
+    assert_eq!(s.known_size(&entries["nested/hidden"]).unwrap(), Some(7));
+    let log = std::fs::read_to_string(s.root.join("operations.jsonl")).unwrap();
+    let records: Vec<serde_json::Value> = log
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(records
+        .iter()
+        .any(|r| r["operation"] == "fetch-blobs:source" && r["status"] == "succeeded"));
+    assert!(!records
+        .iter()
+        .any(|r| r["operation"] == "fetch-blobs:source" && r["status"] == "failed"));
+    // Once known, offline repeats do not fetch or log backend work.
+    std::fs::rename(&f.repo, f.temp.path().join("offline")).unwrap();
+    let before = s.metrics();
+    s.resolve_sizes(&blobs).unwrap();
+    assert_eq!(s.metrics()["metadata_fetches"], before["metadata_fetches"]);
+}

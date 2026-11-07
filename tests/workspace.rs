@@ -213,3 +213,120 @@ fn layout_branches_keep_independent_ancestry_and_tags_resolve() {
         b"1\n"
     );
 }
+
+#[test]
+fn view_root_metadata_does_not_load_repository_trees() {
+    let f = Fixture::new();
+    let number = f.store.snapshot("a").unwrap();
+    let transaction = f.store.activate("a").unwrap();
+    // Poison the tree cache: any attempt to deserialize a repository tree fails.
+    f.store
+        .conn()
+        .unwrap()
+        .execute("UPDATE tree_cache SET data='invalid json'", [])
+        .unwrap();
+    let store = gitalator::db::Store::open(&f.store.root).unwrap();
+    for view in [
+        View::Live("a".into()),
+        View::Base("a".into()),
+        View::Snapshot("a".into(), number, false),
+        View::Snapshot("a".into(), number, true),
+        View::Transaction(transaction),
+    ] {
+        assert_eq!(store.entry(&view, "").unwrap(), gitalator::ops::directory());
+        assert!(store.entry(&view, "file").is_err());
+    }
+    for view in [
+        View::Live("missing".into()),
+        View::Base("missing".into()),
+        View::Snapshot("a".into(), 99999, false),
+        View::Transaction("missing".into()),
+    ] {
+        assert!(f.store.entry(&view, "").is_err());
+    }
+}
+
+#[test]
+fn targeted_lookup_and_listing_match_composition_with_nested_mounts() {
+    use gitalator::model::{Delta, Mount};
+    let f = Fixture::new();
+    let (mut map, _) = f.store.view_state(&View::Live("a".into())).unwrap();
+    let pin = map.mount[0].commit.clone();
+    map.mount.push(Mount {
+        id: "child".into(),
+        repo: "origin".into(),
+        path: "nested".into(),
+        revision: "main".into(),
+        subtree: "".into(),
+        commit: pin.clone(),
+    });
+    map.mount.push(Mount {
+        id: "detached".into(),
+        repo: "origin".into(),
+        path: "virtual/sub".into(),
+        revision: "main".into(),
+        subtree: "nested".into(),
+        commit: pin,
+    });
+    let edited = gitalator::model::Entry {
+        kind: Kind::File,
+        mode: 0o600,
+        content: f.store.cache.put(b"edit").unwrap(),
+        size: 4,
+    };
+    let delta = vec![
+        Delta {
+            mount: "root".into(),
+            path: "new".into(),
+            entry: Some(edited.clone()),
+        },
+        Delta {
+            mount: "root".into(),
+            path: "nested/hidden-overlay".into(),
+            entry: Some(edited),
+        },
+        Delta {
+            mount: "child".into(),
+            path: "file".into(),
+            entry: None,
+        },
+    ];
+    f.store.publish("a", None, &map, &delta).unwrap();
+    let v = View::Live("a".into());
+    let composed = f.store.entries(&v).unwrap();
+    for (path, entry) in &composed {
+        assert_eq!(&f.store.entry(&v, path).unwrap(), entry, "{path}");
+        if entry.kind == Kind::Directory {
+            let prefix = if path.is_empty() {
+                String::new()
+            } else {
+                format!("{path}/")
+            };
+            let expected: std::collections::BTreeMap<_, _> = composed
+                .iter()
+                .filter_map(|(key, value)| {
+                    let tail = key.strip_prefix(&prefix)?;
+                    (!tail.is_empty() && !tail.contains('/'))
+                        .then(|| (tail.to_string(), value.clone()))
+                })
+                .collect();
+            assert_eq!(f.store.children(&v, path).unwrap(), expected, "{path}");
+        }
+    }
+    assert!(f.store.entry(&v, "nested/file").is_err());
+    assert!(f.store.entry(&v, "nested/hidden-overlay").is_err());
+}
+
+#[test]
+fn repeated_lookups_reuse_parsed_immutable_tree() {
+    let f = Fixture::new();
+    let v = View::Live("a".into());
+    let entries = f.store.children(&v, "").unwrap();
+    f.store
+        .conn()
+        .unwrap()
+        .execute("UPDATE tree_cache SET data='invalid json'", [])
+        .unwrap();
+    assert_eq!(f.store.children(&v, "").unwrap(), entries);
+    assert_eq!(f.store.entry(&v, "file").unwrap(), entries["file"]);
+}

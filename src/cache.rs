@@ -135,13 +135,18 @@ impl Span {
         s
     }
     pub fn event(&self, status: &str, detail: Option<&str>) {
-        let v = serde_json::json!({"pid":std::process::id(),"operation_id":self.id,"operation":self.op,"status":status,"elapsed_ms":self.start.elapsed().as_millis(),"detail":detail});
-        if let Ok(mut f) = OpenOptions::new()
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let v = serde_json::json!({"timestamp_ms":timestamp_ms,"pid":std::process::id(),"operation_id":self.id,"operation":self.op,"status":status,"elapsed_ms":self.start.elapsed().as_millis(),"detail":detail});
+        let result = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.root.join("operations.jsonl"))
-        {
-            let _ = f.write_all(format!("{v}\n").as_bytes());
+            .and_then(|mut f| f.write_all(format!("{v}\n").as_bytes()));
+        if let Err(e) = result {
+            eprintln!("gtl: operation log write failed: {e}");
         }
     }
 }

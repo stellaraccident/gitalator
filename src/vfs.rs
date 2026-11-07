@@ -182,7 +182,7 @@ impl Fs {
                 } else {
                     0o444
                 },
-                content: String::new(),
+                content: crate::cache::hash(&self.control(&n, &c)?),
                 size: self.control(&n, &c)?.len() as u64,
             }),
             Node::Source(v, p) => {
@@ -860,6 +860,9 @@ impl Filesystem for Fs {
             let Node::Source(v, path) = self.node(&p)? else {
                 return Err(error("read-only view"));
             };
+            if self.store.entry(&v, &path).is_ok() {
+                return Err(error("already exists"));
+            }
             let b = target
                 .to_str()
                 .ok_or_else(|| error("non-UTF8 symlink"))?

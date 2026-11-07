@@ -97,9 +97,14 @@ impl Store {
             )?;
             Ok(())
         })();
-        if result.is_err() {
-            span.event("failed", Some("fetch failed; inspect CLI error"));
-        }
+        span.event(
+            if result.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+            Some("fetch completed; errors are returned to caller"),
+        );
         result
     }
     pub fn resolve_map(&self, map: &Map) -> Result<Map> {
@@ -128,7 +133,10 @@ impl Store {
             let p = self.repo_path(&mount.repo);
             let rev = if let Some(b) = mount.revision.strip_prefix("refs/heads/") {
                 format!("refs/remotes/origin/{b}")
-            } else if mount.revision.len() == 40 || mount.revision.len() == 64 {
+            } else if mount.revision.starts_with("refs/tags/")
+                || ((mount.revision.len() == 40 || mount.revision.len() == 64)
+                    && mount.revision.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
                 mount.revision.clone()
             } else {
                 format!("refs/remotes/origin/{}", mount.revision)
@@ -250,46 +258,56 @@ impl Store {
                 }
             }
             let span = Span::new(&self.root, &format!("hydrate:{repo}:{oid}"));
-            let _repo_lock = Lock::take(&self.root.join("locks").join(format!("repo-{repo}")))?;
-            let mut b = git(&self.repo_path(repo), &["cat-file", "blob", oid])
-                .inspect_err(|_| span.event("failed", Some("object hydration failed")))?;
-            if b.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
-                let pointer = String::from_utf8(b.clone())?;
-                let expected = pointer
-                    .lines()
-                    .find_map(|l| l.strip_prefix("oid sha256:"))
-                    .ok_or_else(|| error("invalid LFS pointer"))?;
-                let size: u64 = pointer
-                    .lines()
-                    .find_map(|l| l.strip_prefix("size "))
-                    .ok_or_else(|| error("invalid LFS size"))?
-                    .parse()?;
-                let mut cmd = Command::new("git");
-                cmd.arg("-C")
-                    .arg(self.repo_path(repo))
-                    .args(["lfs", "smudge"])
-                    .env_remove("GIT_LFS_SKIP_SMUDGE")
-                    .env("GIT_TERMINAL_PROMPT", "0")
-                    .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
-                let output =
-                    execute_command(&mut cmd, Some(&b), std::time::Duration::from_secs(300))?;
-                if !output.status.success() {
-                    return Err(error(format!(
-                        "LFS retrieval failed for {repo}:{oid}: {}",
-                        redact(&String::from_utf8_lossy(&output.stderr))
-                    )));
+            let result = (|| -> Result<Vec<u8>> {
+                let _repo_lock = Lock::take(&self.root.join("locks").join(format!("repo-{repo}")))?;
+                let mut b = git(&self.repo_path(repo), &["cat-file", "blob", oid])?;
+                if b.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
+                    let pointer = String::from_utf8(b.clone())?;
+                    let expected = pointer
+                        .lines()
+                        .find_map(|l| l.strip_prefix("oid sha256:"))
+                        .ok_or_else(|| error("invalid LFS pointer"))?;
+                    let size: u64 = pointer
+                        .lines()
+                        .find_map(|l| l.strip_prefix("size "))
+                        .ok_or_else(|| error("invalid LFS size"))?
+                        .parse()?;
+                    let mut cmd = Command::new("git");
+                    cmd.arg("-C")
+                        .arg(self.repo_path(repo))
+                        .args(["lfs", "smudge"])
+                        .env_remove("GIT_LFS_SKIP_SMUDGE")
+                        .env("GIT_TERMINAL_PROMPT", "0")
+                        .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+                    let output =
+                        execute_command(&mut cmd, Some(&b), std::time::Duration::from_secs(300))?;
+                    if !output.status.success() {
+                        return Err(error(format!(
+                            "LFS retrieval failed for {repo}:{oid}: {}",
+                            redact(&String::from_utf8_lossy(&output.stderr))
+                        )));
+                    }
+                    b = output.stdout;
+                    if hash(&b) != expected || b.len() as u64 != size {
+                        return Err(error("LFS integrity mismatch"));
+                    }
                 }
-                b = output.stdout;
-                if hash(&b) != expected || b.len() as u64 != size {
-                    return Err(error("LFS integrity mismatch"));
-                }
-            }
-            let id = self.fetched.put(&b)?;
-            self.conn()?.execute(
-                "INSERT OR REPLACE INTO objects(repo,oid,content,size) VALUES(?1,?2,?3,?4)",
-                params![repo, oid, id, b.len()],
-            )?;
-            Ok(b)
+                let id = self.fetched.put(&b)?;
+                self.conn()?.execute(
+                    "INSERT OR REPLACE INTO objects(repo,oid,content,size) VALUES(?1,?2,?3,?4)",
+                    params![repo, oid, id, b.len()],
+                )?;
+                Ok(b)
+            })();
+            span.event(
+                if result.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+                Some("hydration completed; errors are returned to caller"),
+            );
+            result
         } else {
             self.cache.get(&e.content)
         }

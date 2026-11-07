@@ -91,3 +91,125 @@ fn activation_abort_preserves_original() {
     assert_eq!(s.head("a").unwrap(), old);
     assert!(!s.frozen("a").unwrap());
 }
+#[test]
+fn import_reconciles_advanced_workspace_through_conflicts() {
+    let f = Fixture::new();
+    let s = &f.store;
+    let v = View::Live("a".into());
+    s.write_file(&v, "file", b"exported\n", 0o644, Kind::File)
+        .unwrap();
+    let export = f.temp.path().join("export");
+    s.export("a", &export).unwrap();
+    std::fs::write(export.join("root/file"), b"review edit\n").unwrap();
+    s.write_file(&v, "file", b"local edit\n", 0o644, Kind::File)
+        .unwrap();
+    let value = gitalator::cli::dispatch(
+        s,
+        gitalator::cli::Cmd::Import {
+            workspace: "a".into(),
+            export,
+        },
+    )
+    .unwrap();
+    assert_eq!(value["state"], "CONFLICTED");
+    let id = value["transaction"].as_str().unwrap();
+    s.write_file(
+        &View::Transaction(id.into()),
+        "file",
+        b"resolved import\n",
+        0o644,
+        Kind::File,
+    )
+    .unwrap();
+    s.resolve_conflict(id, "root", "file", false).unwrap();
+    s.finish_activation(id, false).unwrap();
+    assert_eq!(s.read(&v, "file").unwrap(), b"resolved import\n");
+}
+#[test]
+fn bundle_reproduces_export_tree_without_original_state() {
+    let f = Fixture::new();
+    f.store
+        .write_file(
+            &View::Live("a".into()),
+            "file",
+            b"bundled\n",
+            0o644,
+            Kind::File,
+        )
+        .unwrap();
+    let export = f.temp.path().join("export");
+    f.store.export("a", &export).unwrap();
+    let bundle = f.temp.path().join("bundle");
+    gitalator::workflow::bundle(&export, &bundle).unwrap();
+    let receiver = f.temp.path().join("receiver");
+    std::fs::create_dir(&receiver).unwrap();
+    git(
+        &receiver,
+        &[
+            "clone",
+            std::fs::canonicalize(bundle.join("root.bundle"))
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            ".",
+        ],
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(receiver.join("file")).unwrap(), b"bundled\n");
+}
+
+#[test]
+fn import_new_directories_and_review_plan_are_local() {
+    let f = Fixture::new();
+    let s = &f.store;
+    let v = View::Live("a".into());
+    s.write_file(&v, "file", b"checkpoint\n", 0o644, Kind::File)
+        .unwrap();
+    let export = f.temp.path().join("export");
+    s.export("a", &export).unwrap();
+    let before = git(&f.repo, &["show-ref"]).unwrap();
+    let plan = gitalator::workflow::review(s, &export, false, None).unwrap();
+    assert_eq!(plan["publish"], false);
+    assert_eq!(git(&f.repo, &["show-ref"]).unwrap(), before);
+    std::fs::create_dir_all(export.join("root/new/deep")).unwrap();
+    std::fs::write(export.join("root/new/deep/file"), b"new\n").unwrap();
+    gitalator::cli::dispatch(
+        s,
+        gitalator::cli::Cmd::Import {
+            workspace: "a".into(),
+            export,
+        },
+    )
+    .unwrap();
+    assert_eq!(s.entry(&v, "new").unwrap().kind, Kind::Directory);
+    assert_eq!(s.read(&v, "new/deep/file").unwrap(), b"new\n");
+}
+
+#[test]
+fn layout_branches_keep_independent_ancestry_and_tags_resolve() {
+    let f = Fixture::new();
+    let s = &f.store;
+    git(&f.repo, &["tag", "v1"]).unwrap();
+    s.create(
+        "b",
+        &s.draft("a").unwrap().replace("'main'", "'refs/tags/v1'"),
+    )
+    .unwrap();
+    let tx = s.activate("b").unwrap();
+    s.finish_activation(&tx, false).unwrap();
+    let layouts = s.root.join("layouts");
+    assert_eq!(
+        git(&layouts, &["rev-list", "--count", "b"]).unwrap(),
+        b"1\n"
+    );
+    let tx = s.activate("a").unwrap();
+    s.finish_activation(&tx, false).unwrap();
+    assert_eq!(
+        git(&layouts, &["rev-list", "--count", "a"]).unwrap(),
+        b"2\n"
+    );
+    assert_eq!(
+        git(&layouts, &["rev-list", "--count", "b"]).unwrap(),
+        b"1\n"
+    );
+}

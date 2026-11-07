@@ -97,10 +97,13 @@ impl Store {
             })?)
     }
     pub fn set_draft(&self, name: &str, data: &str) -> Result<()> {
-        self.conn()?.execute(
+        let count = self.conn()?.execute(
             "UPDATE workspaces SET draft=?2,dirty=1,changed=unixepoch() WHERE name=?1",
             params![name, data],
         )?;
+        if count != 1 {
+            return Err(error("unknown workspace"));
+        }
         Ok(())
     }
     pub fn state(&self, id: i64) -> Result<(Map, Overlay)> {

@@ -74,4 +74,69 @@ fn local_lfs_payload_hydration() {
             .unwrap(),
         b"local-lfs-payload"
     );
+    f.store
+        .write_file(
+            &View::Live("a".into()),
+            "file",
+            b"export me\n",
+            0o644,
+            Kind::File,
+        )
+        .unwrap();
+    let export = f.temp.path().join("export");
+    f.store.export("a", &export).unwrap();
+    assert_eq!(
+        std::fs::read(export.join("root/payload.bin")).unwrap(),
+        b"local-lfs-payload"
+    );
+    let bundle = f.temp.path().join("bundle");
+    gitalator::workflow::bundle(&export, &bundle).unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bundle.join("gitalator-export.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest["repositories"][0]["lfs_payloads"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn repository_locks_serialize_shared_work_without_blocking_other_repos() {
+    use gitalator::cache::Lock;
+    use std::{sync::mpsc, time::Duration};
+    let f = Fixture::new();
+    f.store
+        .repo_add(
+            "independent",
+            std::fs::canonicalize(&f.repo).unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+    let held = Lock::take(&f.store.root.join("locks/repo-origin")).unwrap();
+    let (send, recv) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let s = &f.store;
+        let send_other = send.clone();
+        scope.spawn(move || {
+            s.fetch("independent").unwrap();
+            send_other.send("other").unwrap();
+        });
+        scope.spawn(move || {
+            s.fetch("origin").unwrap();
+            send.send("same").unwrap();
+        });
+        assert_eq!(recv.recv_timeout(Duration::from_secs(10)).unwrap(), "other");
+        assert!(recv.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(held);
+        assert_eq!(recv.recv_timeout(Duration::from_secs(10)).unwrap(), "same");
+    });
+    let log = std::fs::read_to_string(f.store.root.join("operations.jsonl")).unwrap();
+    assert!(log
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .any(|v| v["operation"] == "fetch:independent"
+            && v["status"] == "succeeded"
+            && v["timestamp_ms"].is_number()));
 }

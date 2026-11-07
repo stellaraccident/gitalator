@@ -40,7 +40,7 @@ fn text<'a>(v: &'a Value, k: &str) -> Result<&'a str> {
     v[k].as_str()
         .ok_or_else(|| error(format!("missing manifest field {k}")))
 }
-pub fn review(s: &Store, path: &Path, publish: bool) -> Result<Value> {
+pub fn review(s: &Store, path: &Path, publish: bool, base: Option<&str>) -> Result<Value> {
     let path = std::fs::canonicalize(path)?;
     let _lock = Lock::take(&s.root.join("locks").join(format!(
         "review-{}",
@@ -60,6 +60,15 @@ pub fn review(s: &Store, path: &Path, publish: bool) -> Result<Value> {
         let root = Path::new(text(repo, "path")?);
         let head = text(repo, "head")?;
         let branch = format!("gtl/{workspace}/{revision}/{mount}");
+        let target = base.or_else(|| repo["target_branch"].as_str());
+        if let Some(target) = target {
+            git(root, &["check-ref-format", &format!("refs/heads/{target}")])?;
+        }
+        if publish && target.is_none() {
+            return Err(error(
+                "review requires --base for an export pinned to a commit or tag",
+            ));
+        }
         if !publish {
             result.push(json!({"mount":mount,"branch":branch,"head":head,"action":"push and create/reconcile PR"}));
             continue;
@@ -74,6 +83,7 @@ pub fn review(s: &Store, path: &Path, publish: bool) -> Result<Value> {
             return Err(error("export HEAD differs from recorded checkpoint"));
         }
         s.conn()?.execute("INSERT INTO reviews(export_path,mount,branch,head,state) VALUES(?1,?2,?3,?4,'PREPARING') ON CONFLICT(export_path,mount) DO NOTHING",params![path.to_string_lossy(),mount,branch,head])?;
+        git(root, &["lfs", "push", "origin", head])?;
         git(
             root,
             &["push", "origin", &format!("{head}:refs/heads/{branch}")],
@@ -104,6 +114,8 @@ pub fn review(s: &Store, path: &Path, publish: bool) -> Result<Value> {
                 &[
                     "pr",
                     "create",
+                    "--base",
+                    target.unwrap(),
                     "--head",
                     &branch,
                     "--title",

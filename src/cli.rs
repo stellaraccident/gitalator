@@ -1,4 +1,4 @@
-use crate::{backend::git, cache::Span, db::Store, error, model::*, ops::View, Result};
+use crate::{backend::git, cache::Span, db::Store, error, model::*, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -106,6 +106,8 @@ pub enum Cmd {
         export: PathBuf,
         #[arg(long)]
         publish: bool,
+        #[arg(long)]
+        base: Option<String>,
     },
     Land {
         export: PathBuf,
@@ -170,9 +172,14 @@ pub enum LayoutCmd {
 pub fn dispatch(s: &Store, cmd: Cmd) -> Result<Value> {
     let span = Span::new(&s.root, cmd.label());
     let result = execute(s, cmd);
-    if result.is_err() {
-        span.event("failed", Some("command failed; see client error"));
-    }
+    span.event(
+        if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        },
+        Some("command completed; errors are returned to client"),
+    );
     result
 }
 impl Cmd {
@@ -406,7 +413,10 @@ fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
                         return Err(error("invalid layout name"));
                     }
                     s.record_layout(&workspace)?;
-                    git(&path, &["branch", "-f", &name, "HEAD"])?;
+                    git(
+                        &path,
+                        &["branch", "-f", &name, &format!("refs/heads/{workspace}")],
+                    )?;
                     Ok(json!({"branch": name}))
                 }
                 LayoutCmd::Switch { workspace, name } => {
@@ -429,7 +439,11 @@ fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
             export,
             destination,
         } => crate::workflow::bundle(&export, &destination),
-        Cmd::Review { export, publish } => crate::workflow::review(s, &export, publish),
+        Cmd::Review {
+            export,
+            publish,
+            base,
+        } => crate::workflow::review(s, &export, publish, base.as_deref()),
         Cmd::Land {
             export,
             verify_only,
@@ -510,8 +524,8 @@ fn import_export(s: &Store, name: &str, path: &Path) -> Result<Value> {
     let revision = manifest["revision"]
         .as_i64()
         .ok_or_else(|| error("invalid export revision"))?;
-    if s.head(name)? != revision {
-        return Err(error("workspace advanced since export; import requires explicit reconciliation (see backlog)"));
+    if manifest["workspace"].as_str() != Some(name) {
+        return Err(error("export belongs to another workspace"));
     }
     let (map, _) = s.state(revision)?;
     let mut changes = vec![];
@@ -572,8 +586,14 @@ fn import_export(s: &Store, name: &str, path: &Path) -> Result<Value> {
             changes.push((viewpath, entry));
         }
     }
-    s.mutate_many(&View::Live(name.into()), changes)?;
-    Ok(json!({"imported":name}))
+    let id = s.import_changes(name, revision, changes)?;
+    let conflicts = s.conflict_list(&id)?;
+    if conflicts.is_empty() {
+        s.finish_activation(&id, false)?;
+    }
+    Ok(
+        json!({"imported":name,"transaction":id,"state":if conflicts.is_empty(){"COMMITTED"}else{"CONFLICTED"},"conflicts":conflicts}),
+    )
 }
 pub fn request(root: &Path, cmd: &Cmd) -> Result<Option<Value>> {
     let socket = root.join("control.sock");

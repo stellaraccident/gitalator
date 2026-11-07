@@ -240,8 +240,20 @@ impl Store {
         self.snapshot_unlocked(name)?;
         let (r, d) = self.snapshot_revision(name, number)?;
         let (m, o) = self.state(r)?;
-        self.publish(name, None, &m, &deltas(&o))?;
-        self.set_draft(name, &d)?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO revisions(parent,map,delta) VALUES(NULL,?1,?2)",
+            params![
+                serde_json::to_string(&m)?,
+                serde_json::to_string(&deltas(&o))?
+            ],
+        )?;
+        tx.execute(
+            "UPDATE workspaces SET head=?2,draft=?3,dirty=1,changed=unixepoch() WHERE name=?1",
+            params![name, tx.last_insert_rowid(), d],
+        )?;
+        tx.commit()?;
         self.snapshot_unlocked(name)?;
         Ok(())
     }
@@ -521,25 +533,31 @@ impl Store {
             toml::to_string_pretty(&m)?.as_bytes(),
         )?;
         git(&path, &["add", "VERSION_MAP"])?;
-        git(
-            &path,
-            &[
-                "-c",
-                "user.name=Gitalator",
-                "-c",
-                "user.email=gtl@localhost",
-                "commit",
-                "--allow-empty",
-                "-m",
-                &format!("Activate {name}"),
-            ],
-        )?;
-        git(&path, &["branch", "-f", name, "HEAD"])?;
+        let tree = String::from_utf8(git(&path, &["write-tree"])?)?;
+        let reference = format!("refs/heads/{name}");
+        let parent = git(&path, &["rev-parse", "--verify", &reference]).ok();
+        let parent = parent.map(String::from_utf8).transpose()?;
+        let message = format!("Activate {name}");
+        let mut args = vec![
+            "-c",
+            "user.name=Gitalator",
+            "-c",
+            "user.email=gtl@localhost",
+            "commit-tree",
+            tree.trim(),
+            "-m",
+            &message,
+        ];
+        if let Some(parent) = &parent {
+            args.extend(["-p", parent.trim()]);
+        }
+        let commit = String::from_utf8(git(&path, &args)?)?;
+        git(&path, &["update-ref", &reference, commit.trim()])?;
         Ok(())
     }
     pub fn export(&self, name: &str, destination: &Path) -> Result<serde_json::Value> {
-        self.snapshot(name)?;
-        let revision = self.head(name)?;
+        let number = self.snapshot(name)?;
+        let revision = self.snapshot_revision(name, number)?.0;
         let (map, overlay) = self.state(revision)?;
         if destination.exists() {
             return Err(error("export destination must not exist"));
@@ -579,6 +597,7 @@ impl Store {
             git(&path, &["remote", "set-url", "origin", &origin])?;
             if path.join(".gitattributes").exists() {
                 git(&path, &["lfs", "install", "--local", "--skip-repo"])?;
+                git(&path, &["lfs", "pull"])?;
             }
 
             for ((_, p), e) in edits {
@@ -644,7 +663,19 @@ impl Store {
             let head = String::from_utf8(git(&path, &["rev-parse", "HEAD"])?)?
                 .trim()
                 .to_string();
-            repos.push(serde_json::json!({"mount":m.id,"repo":m.repo,"base":m.commit,"head":head,"path":path}));
+            let target = if m.revision.starts_with("refs/tags/")
+                || ((m.revision.len() == 40 || m.revision.len() == 64)
+                    && m.revision.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                None
+            } else {
+                Some(
+                    m.revision
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(&m.revision),
+                )
+            };
+            repos.push(serde_json::json!({"mount":m.id,"repo":m.repo,"base":m.commit,"head":head,"path":path,"target_branch":target}));
         }
         let manifest = serde_json::json!({"format":1,"workspace":name,"revision":revision,"repositories":repos});
         atomic(
@@ -712,5 +743,170 @@ impl Store {
         Ok(
             serde_json::json!({"dry_run":dry_run,"cached_bytes_before":before,"cached_bytes_after":total,"evicted":evict,"history_retained":true}),
         )
+    }
+}
+impl Store {
+    /// Import an immutable export delta through the same candidate/publish protocol as activation.
+    pub fn import_changes(
+        &self,
+        name: &str,
+        base_revision: i64,
+        changes: Vec<(String, Option<Entry>)>,
+    ) -> Result<String> {
+        let (id, source, map, mut candidate) = {
+            let _guard = self.workspace_lock(name)?;
+            if self.frozen(name)? {
+                return Err(error("activation in progress"));
+            }
+            self.snapshot_unlocked(name)?;
+            let source = self.head(name)?;
+            let (map, candidate) = self.state(source)?;
+            let id = format!(
+                "{name}-import-{source}-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos()
+            );
+            let mut c = self.conn()?;
+            let tx = c.transaction()?;
+            tx.execute("INSERT INTO activations(id,workspace,source,proposal,candidate,conflicts,state) VALUES(?1,?2,?3,?4,'[]','[]','PREPARING')",params![id,name,source,serde_json::to_string(&map)?])?;
+            tx.execute(
+                "UPDATE workspaces SET activation=?2 WHERE name=?1",
+                params![name, id],
+            )?;
+            tx.commit()?;
+            (id, source, map, candidate)
+        };
+        let result = (|| -> Result<()> {
+            let (base_map, base_overlay) = self.state(base_revision)?;
+            let base = self.compose(&base_map, &base_overlay)?;
+            let current = self.compose(&map, &candidate)?;
+            let mut conflicts = vec![];
+            for (path, incoming) in changes {
+                let (owner, relative) = map
+                    .owner(&path)
+                    .ok_or_else(|| error("import path has no active mount"))?;
+                let old_owner = base_map
+                    .owner(&path)
+                    .ok_or_else(|| error("import path has no original mount"))?
+                    .0;
+                if owner.id != old_owner.id
+                    || owner.repo != old_owner.repo
+                    || owner.subtree != old_owner.subtree
+                {
+                    return Err(error(
+                        "import ownership changed; relocate the change explicitly",
+                    ));
+                }
+                let before = base.get(&path).cloned();
+                let ours = current.get(&path).cloned();
+                let (merged, reason) = if self.same(&ours, &before)? {
+                    (incoming, None)
+                } else if self.same(&ours, &incoming)? || self.same(&incoming, &before)? {
+                    continue;
+                } else {
+                    self.merge_versions(&id, &path, &before, &ours, &incoming)?
+                };
+                if let Some(reason) = reason {
+                    conflicts.push(Conflict {
+                        path: relative.clone(),
+                        mount: owner.id.clone(),
+                        reason,
+                        resolved: false,
+                    });
+                }
+                if merged.is_some() {
+                    let mut parent = Path::new(&relative).parent();
+                    while let Some(p) = parent {
+                        let p = p.to_str().ok_or_else(|| error("non-UTF8 path"))?;
+                        if p.is_empty() {
+                            break;
+                        }
+                        let full = join(&owner.path, p);
+                        if let Some(existing) = current.get(&full) {
+                            if existing.kind != Kind::Directory {
+                                return Err(error("import parent is not a directory"));
+                            }
+                        } else {
+                            candidate.insert((owner.id.clone(), p.into()), Some(directory()));
+                        }
+                        parent = Path::new(p).parent();
+                    }
+                }
+                candidate.insert((owner.id.clone(), relative), merged);
+            }
+            let state = if conflicts.is_empty() {
+                "READY"
+            } else {
+                "CONFLICTED"
+            };
+            self.conn()?.execute("UPDATE activations SET candidate=?2,conflicts=?3,state=?4 WHERE id=?1 AND source=?5",params![id,serde_json::to_string(&deltas(&candidate))?,serde_json::to_string(&conflicts)?,state,source])?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            self.conn()?
+                .execute("UPDATE activations SET state='FAILED' WHERE id=?1", [&id])?;
+            return Err(error(format!(
+                "import {id} failed: {e}; abort with gtl activate {name} --abort"
+            )));
+        }
+        Ok(id)
+    }
+    fn merge_versions(
+        &self,
+        id: &str,
+        path: &str,
+        base: &Option<Entry>,
+        ours: &Option<Entry>,
+        theirs: &Option<Entry>,
+    ) -> Result<(Option<Entry>, Option<String>)> {
+        let (Some(base), Some(ours), Some(theirs)) = (base, ours, theirs) else {
+            return Ok((ours.clone(), Some("delete/add conflict".into())));
+        };
+        if base.kind != Kind::File || ours.kind != Kind::File || theirs.kind != Kind::File {
+            return Ok((Some(ours.clone()), Some("type/symlink conflict".into())));
+        }
+        if ours.mode != base.mode && theirs.mode != base.mode && ours.mode != theirs.mode {
+            return Ok((Some(ours.clone()), Some("mode conflict".into())));
+        }
+        let (b, o, t) = (self.bytes(base)?, self.bytes(ours)?, self.bytes(theirs)?);
+        if b.contains(&0) || o.contains(&0) || t.contains(&0) {
+            return Ok((Some(ours.clone()), Some("binary conflict".into())));
+        }
+        let dir = self
+            .root
+            .join("transactions")
+            .join(id)
+            .join(hash(path.as_bytes()));
+        std::fs::create_dir_all(&dir)?;
+        atomic(&dir.join("base"), &b)?;
+        atomic(&dir.join("ours"), &o)?;
+        atomic(&dir.join("theirs"), &t)?;
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["merge-file", "-p", "ours", "base", "theirs"])
+            .current_dir(&dir);
+        let output =
+            crate::backend::execute_command(&mut cmd, None, std::time::Duration::from_secs(30))?;
+        if output.status.code().is_none_or(|code| code > 127) {
+            return Err(error("merge-file failed"));
+        }
+        let reason = if output.status.success() {
+            None
+        } else {
+            Some("text conflict".into())
+        };
+        Ok((
+            Some(Entry {
+                kind: Kind::File,
+                mode: if ours.mode == base.mode {
+                    theirs.mode
+                } else {
+                    ours.mode
+                },
+                content: self.cache.put(&output.stdout)?,
+                size: output.stdout.len() as u64,
+            }),
+            reason,
+        ))
     }
 }

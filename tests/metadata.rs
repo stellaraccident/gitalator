@@ -149,43 +149,32 @@ fn publication_barrier_serializes_and_retries_stale_responses() {
 }
 
 #[test]
-fn migration_preserves_v1_backup_and_checkpoint_replays() {
+fn old_schema_is_rejected_without_modification_and_checkpoint_replays() {
     let f = Fixture::new();
-    let original = f.store.head("a").unwrap();
-    // v1 authoritative tables are unchanged; remove only v2 derived schema.
-    let c = f.store.conn().unwrap();
-    let triggers: Vec<String> = c
-        .prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'metadata_%'")
+    f.store
+        .conn()
         .unwrap()
-        .query_map([], |r| r.get(0))
+        .execute_batch("PRAGMA user_version=2")
+        .unwrap();
+    assert!(gitalator::db::Store::open(&f.store.root)
+        .err()
         .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    for trigger in triggers {
-        c.execute_batch(&format!("DROP TRIGGER {trigger}")).unwrap();
-    }
-    for table in [
-        "metadata_entries",
-        "metadata_trees",
-        "metadata_sizes",
-        "metadata_checkpoints",
-        "revision_stamps",
-        "metadata_epoch",
-    ] {
-        c.execute_batch(&format!("DROP TABLE {table}")).unwrap();
-    }
-    c.execute_batch("PRAGMA user_version=1").unwrap();
-    drop(c);
-    let s = gitalator::db::Store::open(&f.store.root).unwrap();
-    let backup = rusqlite::Connection::open(s.root.join("schema-v1-backup.sqlite3")).unwrap();
+        .to_string()
+        .contains("fresh --state-dir"));
     assert_eq!(
-        backup
+        f.store
+            .conn()
+            .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
-    assert_eq!(s.head("a").unwrap(), original);
-    assert_eq!(s.read(&View::Live("a".into()), "file").unwrap(), b"base\n");
+    f.store
+        .conn()
+        .unwrap()
+        .execute_batch("PRAGMA user_version=3")
+        .unwrap();
+    let s = &f.store;
     // Force a checkpoint id without creating a thousand fsyncs.
     s.conn().unwrap().execute("INSERT INTO revisions(id,parent,map,delta) SELECT 1024,head,(SELECT map FROM revisions WHERE id=head),'[]' FROM workspaces WHERE name='a'", []).unwrap();
     s.revision_snapshot(1024).unwrap();

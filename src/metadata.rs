@@ -1059,7 +1059,7 @@ impl Store {
                         .join("\n")
                         + "\n";
                     let bytes = crate::backend::run_git(
-                        &self.repo_path(&repo),
+                        &self.repo_path(&repo)?,
                         &["cat-file", "--batch"],
                         Some(input.as_bytes()),
                         None,

@@ -16,6 +16,16 @@ pub struct Store {
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
+        if root.join("state.sqlite3").exists() {
+            let probe = rusqlite::Connection::open_with_flags(
+                root.join("state.sqlite3"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let version: i64 = probe.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version != 0 && version != 3 {
+                return Err(error(format!("unsupported store schema {version}; use a fresh --state-dir (this binary requires schema 3)")));
+            }
+        }
         std::fs::create_dir_all(root)?;
         let root = std::fs::canonicalize(root)?;
         use std::os::unix::fs::PermissionsExt;
@@ -30,10 +40,10 @@ impl Store {
         let _l = Lock::take(&s.root.join("schema.lock"))?;
         let c = s.conn()?;
         let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 2 {
+        if version > 3 {
             return Err(error("database is newer than this binary"));
         }
-        if version == 2 {
+        if version == 3 {
             let (epoch, stamp) =
                 c.query_row("SELECT epoch,stamp FROM metadata_epoch", [], |r| {
                     Ok((r.get(0)?, r.get(1)?))
@@ -44,14 +54,9 @@ impl Store {
                 .limit(s.setting("metadata_cache_bytes", 512 * 1024 * 1024)? as usize);
             return Ok(s);
         }
-        if version == 1 {
-            let backup = s.root.join("schema-v1-backup.sqlite3");
-            if !backup.exists() {
-                c.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
-            }
-        }
         c.execute_batch("BEGIN IMMEDIATE;
- CREATE TABLE IF NOT EXISTS repos(id TEXT PRIMARY KEY,origin TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS repo_cache(storage TEXT PRIMARY KEY,origin TEXT NOT NULL UNIQUE);
+ CREATE TABLE IF NOT EXISTS repos(id TEXT PRIMARY KEY,origin TEXT NOT NULL,storage TEXT NOT NULL REFERENCES repo_cache(storage));
  CREATE TABLE IF NOT EXISTS revisions(id INTEGER PRIMARY KEY,parent INTEGER REFERENCES revisions(id),map TEXT NOT NULL,delta TEXT NOT NULL,created INTEGER NOT NULL DEFAULT(unixepoch()));
  CREATE TABLE IF NOT EXISTS workspaces(name TEXT PRIMARY KEY,head INTEGER NOT NULL REFERENCES revisions(id),draft TEXT NOT NULL,dirty INTEGER NOT NULL DEFAULT 0,changed INTEGER NOT NULL DEFAULT(unixepoch()),last_snapshot INTEGER NOT NULL DEFAULT(unixepoch()),activation TEXT);
  CREATE TABLE IF NOT EXISTS snapshots(workspace TEXT NOT NULL REFERENCES workspaces(name),number INTEGER NOT NULL,revision INTEGER NOT NULL REFERENCES revisions(id),draft TEXT NOT NULL,pinned INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(workspace,number));
@@ -62,8 +67,8 @@ impl Store {
  CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS tree_cache(repo TEXT NOT NULL,tree_key TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(repo,tree_key));
  CREATE TABLE IF NOT EXISTS attributes(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,stamp INTEGER NOT NULL);
- PRAGMA user_version=1;COMMIT;")?;
-        c.execute_batch("BEGIN IMMEDIATE;
+")?;
+        c.execute_batch("
 CREATE TABLE IF NOT EXISTS metadata_epoch(epoch INTEGER NOT NULL,stamp INTEGER NOT NULL);
 INSERT INTO metadata_epoch SELECT 0,0 WHERE NOT EXISTS(SELECT 1 FROM metadata_epoch);
 CREATE TABLE IF NOT EXISTS revision_stamps(revision INTEGER PRIMARY KEY,stamp INTEGER NOT NULL);
@@ -80,7 +85,7 @@ INSERT OR IGNORE INTO metadata_sizes SELECT 'git:'||repo||':'||oid,size FROM obj
             }
         }
         c.execute_batch("CREATE TRIGGER IF NOT EXISTS metadata_revision_stamp AFTER INSERT ON revisions BEGIN INSERT OR REPLACE INTO revision_stamps VALUES(NEW.id,max((SELECT stamp+1 FROM metadata_epoch),CAST(unixepoch('subsec')*1000000000 AS INTEGER))); END;")?;
-        c.execute_batch("PRAGMA user_version=2;COMMIT;")?;
+        c.execute_batch("PRAGMA user_version=3;COMMIT;")?;
         let (epoch, stamp) = c.query_row("SELECT epoch,stamp FROM metadata_epoch", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;

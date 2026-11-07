@@ -23,3 +23,5 @@ pub fn failpoint(name: &str) {
 pub mod persistent;
 
 pub mod activity;
+
+pub mod ergonomics;

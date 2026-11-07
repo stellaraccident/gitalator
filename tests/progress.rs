@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use gitalator::{cache::Lock, cli};
+use gitalator::cli;
 use std::{
     process::{Command, Stdio},
     sync::{
@@ -20,7 +20,7 @@ fn daemon_streams_progress_before_completion_and_keeps_json_stdout() {
     f.store.set_draft("a", &draft).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let server = cli::server(f.store.clone(), stop.clone()).unwrap();
-    let held = Lock::take(&f.store.root.join("locks/repo-origin")).unwrap();
+    let held = f.store.repo_lock("origin").unwrap();
     let log_path = f.temp.path().join("progress.log");
     let mut child = Command::new(env!("CARGO_BIN_EXE_gtl"))
         .arg("--state-dir")

@@ -84,14 +84,45 @@ impl Store {
         if !name_ok(id) || origin.starts_with('-') {
             return Err(error("invalid repository ID/origin"));
         }
-        self.conn()?.execute(
-            "INSERT INTO repos(id,origin) VALUES(?1,?2)",
-            params![id, origin],
+        let origin = crate::ergonomics::canonical_remote(origin)?;
+        let storage = hash(origin.as_bytes());
+        let mut c = self.conn()?;
+        let tx = c.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO repo_cache(storage,origin) VALUES(?1,?2)",
+            params![storage, origin],
         )?;
+        let existing: Option<String> = tx
+            .query_row("SELECT origin FROM repos WHERE id=?1", [id], |r| r.get(0))
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing != origin {
+                return Err(error("repository alias already names a different remote"));
+            }
+        } else {
+            tx.execute(
+                "INSERT INTO repos(id,origin,storage) VALUES(?1,?2,?3)",
+                params![id, origin, storage],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
-    pub fn repo_path(&self, id: &str) -> PathBuf {
-        self.root.join("repos").join(id)
+    pub fn repo_storage(&self, id: &str) -> Result<String> {
+        Ok(self
+            .conn()?
+            .query_row("SELECT storage FROM repos WHERE id=?1", [id], |r| r.get(0))?)
+    }
+    pub fn repo_path(&self, id: &str) -> Result<PathBuf> {
+        Ok(self.root.join("repos").join(self.repo_storage(id)?))
+    }
+    pub fn repo_lock(&self, id: &str) -> Result<Lock> {
+        Lock::take(
+            &self
+                .root
+                .join("locks")
+                .join(format!("repo-{}", self.repo_storage(id)?)),
+        )
     }
     pub fn fetch(&self, id: &str) -> Result<()> {
         self.with_progress_context(&[(id, Vec::new())])?
@@ -104,11 +135,11 @@ impl Store {
         (self.progress)(&format!("{id}: waiting for repository lock"));
         let span = Span::new(&self.root, &format!("fetch:{id}"));
         let result: Result<()> = (|| {
-            let _l = Lock::take(&self.root.join("locks").join(format!("repo-{id}")))?;
+            let _l = self.repo_lock(id)?;
             let origin: String =
                 self.conn()?
                     .query_row("SELECT origin FROM repos WHERE id=?1", [id], |r| r.get(0))?;
-            let p = self.repo_path(id);
+            let p = self.repo_path(id)?;
             std::fs::create_dir_all(&p)?;
             if !p.join("HEAD").exists() {
                 git(&p, &["init", "--bare"])?;
@@ -277,7 +308,7 @@ impl Store {
         }
         let mut m = map.clone();
         for mount in &mut m.mount {
-            let p = self.repo_path(&mount.repo);
+            let p = self.repo_path(&mount.repo)?;
             let rev = if let Some(b) = mount.revision.strip_prefix("refs/heads/") {
                 format!("refs/remotes/origin/{b}")
             } else if mount.revision.starts_with("refs/tags/")
@@ -369,7 +400,7 @@ impl Store {
                 .join(format!("tree-{}-{key}", m.repo)),
         )?;
         let out = git(
-            &self.repo_path(&m.repo),
+            &self.repo_path(&m.repo)?,
             &["ls-tree", "-r", "-t", "-z", &spec],
         )?;
         let mut entries = BTreeMap::new();
@@ -454,7 +485,7 @@ impl Store {
             });
             let _priority = gate.acquire(speculative);
             // Same lock used by activation, explicit fetch and payload hydration.
-            let _lock = Lock::take(&self.root.join("locks").join(format!("repo-{repo}")))?;
+            let _lock = self.repo_lock(repo)?;
             let mut sizes = self.blob_sizes_local(repo, oids)?;
             for attempt in 1..=2 {
                 let missing: Vec<_> = oids
@@ -475,7 +506,7 @@ impl Store {
                     missing.len()
                 ));
                 let fetch = run_git(
-                    &self.repo_path(repo),
+                    &self.repo_path(repo)?,
                     &[
                         "-c",
                         "fetch.negotiationAlgorithm=noop",
@@ -556,7 +587,7 @@ impl Store {
         }
         let input = oids.join("\n") + "\n";
         let out = run_git(
-            &self.repo_path(repo),
+            &self.repo_path(repo)?,
             &["cat-file", "--batch-check"],
             Some(input.as_bytes()),
             None,
@@ -592,9 +623,9 @@ impl Store {
             let span = Span::new(&self.root, &format!("hydrate:{repo}:{oid}"));
             let result = (|| -> Result<Vec<u8>> {
                 self.ensure_blobs(repo, &[oid.to_string()])?;
-                let _repo_lock = Lock::take(&self.root.join("locks").join(format!("repo-{repo}")))?;
+                let _repo_lock = self.repo_lock(repo)?;
                 let mut b = run_git(
-                    &self.repo_path(repo),
+                    &self.repo_path(repo)?,
                     &["cat-file", "blob", oid],
                     None,
                     None,
@@ -621,7 +652,7 @@ impl Store {
                     let result = (|| -> Result<Vec<u8>> {
                         let mut cmd = Command::new("git");
                         cmd.arg("-C")
-                            .arg(self.repo_path(repo))
+                            .arg(self.repo_path(repo)?)
                             .args(["lfs", "smudge"])
                             .env_remove("GIT_LFS_SKIP_SMUDGE")
                             .env("GIT_TERMINAL_PROMPT", "0")

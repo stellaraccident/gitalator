@@ -13,16 +13,37 @@ use std::{
     about = "Versioned workspaces across independent Git repositories"
 )]
 pub struct Cli {
-    #[arg(long, global = true, default_value = ".gtl")]
+    #[arg(long, global = true, default_value_os_t = crate::ergonomics::default_root())]
     pub state_dir: PathBuf,
     #[arg(long, global = true)]
     pub json: bool,
+    #[arg(long, global = true)]
+    pub offline: bool,
     #[command(subcommand)]
     pub command: Cmd,
 }
 #[derive(Subcommand, Serialize, Deserialize, Debug)]
 pub enum Cmd {
     Init,
+    NewWorkspace {
+        name: String,
+        #[arg(long, group="source", required_unless_present_any=["like", "clone"])]
+        from: Option<String>,
+        #[arg(long, group = "source")]
+        like: Option<String>,
+        #[arg(long, group = "source")]
+        clone: Option<String>,
+        #[arg(long = "name", requires = "from")]
+        mount_name: Option<String>,
+        #[arg(long, requires = "from")]
+        revision: Option<String>,
+        #[arg(long, requires = "from")]
+        no_submodules: bool,
+    },
+    Submodules {
+        #[command(subcommand)]
+        command: SubmoduleCmd,
+    },
     Config {
         #[arg(long)]
         idle_seconds: Option<u64>,
@@ -131,6 +152,16 @@ pub enum Cmd {
     },
 }
 #[derive(Subcommand, Serialize, Deserialize, Debug)]
+pub enum SubmoduleCmd {
+    Expand {
+        paths: Vec<String>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        recursive: bool,
+    },
+}
+#[derive(Subcommand, Serialize, Deserialize, Debug)]
 pub enum RepoCmd {
     Add { id: String, origin: String },
     List,
@@ -207,7 +238,43 @@ impl Cmd {
 }
 fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
     match cmd {
-        Cmd::Init => Ok(json!({"state_dir": s.root, "schema": 2})),
+        Cmd::Init => Ok(json!({"state_dir": s.root, "schema": 3})),
+        Cmd::NewWorkspace {
+            name,
+            from,
+            like,
+            clone,
+            mount_name,
+            revision,
+            no_submodules,
+        } => {
+            s.new_workspace(
+                &name,
+                from.as_deref(),
+                like.as_deref(),
+                clone.as_deref(),
+                mount_name.as_deref(),
+                revision.as_deref(),
+                no_submodules,
+            )?;
+            Ok(
+                json!({"workspace":name,"path":s.root.join("mount/workspaces").join(&name),"map":s.state(s.head(&name)?)?.0}),
+            )
+        }
+        Cmd::Submodules {
+            command:
+                SubmoduleCmd::Expand {
+                    paths,
+                    workspace,
+                    recursive,
+                },
+        } => {
+            let workspace =
+                workspace.ok_or_else(|| error("specify --workspace outside a managed tree"))?;
+            Ok(
+                json!({"workspace":workspace,"added":s.expand_submodules(&workspace,&paths,recursive)?}),
+            )
+        }
         Cmd::Config {
             idle_seconds,
             max_seconds,
@@ -300,11 +367,8 @@ fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
                     } else {
                         (s.head(&source)?, s.draft(&source)?)
                     };
-                    s.create(&name, &draft)?;
-                    s.conn()?.execute(
-                        "UPDATE workspaces SET head=?2 WHERE name=?1",
-                        rusqlite::params![name, revision],
-                    )?;
+                    let (map, overlay) = s.state(revision)?;
+                    s.create_resolved(&name, &map, &overlay, &draft)?;
                 } else {
                     let draft = if let Some(path) = map {
                         std::fs::read_to_string(path)?
@@ -731,6 +795,13 @@ impl Cmd {
             }
         };
         match self {
+            Self::NewWorkspace {
+                from: Some(origin), ..
+            } if !origin.contains("://") && (!origin.contains(':') || origin.starts_with('/')) => {
+                *origin = std::fs::canonicalize(&*origin)?
+                    .to_string_lossy()
+                    .into_owned();
+            }
             Self::Mount { path } | Self::Unmount { path } => absolute(path),
             Self::Workspace {
                 command:

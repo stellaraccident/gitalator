@@ -105,16 +105,26 @@ fn local_lfs_payload_hydration() {
 
 #[test]
 fn repository_locks_serialize_shared_work_without_blocking_other_repos() {
-    use gitalator::cache::Lock;
     use std::{sync::mpsc, time::Duration};
     let f = Fixture::new();
+    let other = f.temp.path().join("other-origin");
+    git(
+        f.temp.path(),
+        &[
+            "clone",
+            "--bare",
+            f.repo.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
     f.store
         .repo_add(
             "independent",
-            std::fs::canonicalize(&f.repo).unwrap().to_str().unwrap(),
+            std::fs::canonicalize(&other).unwrap().to_str().unwrap(),
         )
         .unwrap();
-    let held = Lock::take(&f.store.root.join("locks/repo-origin")).unwrap();
+    let held = f.store.repo_lock("origin").unwrap();
     let (send, recv) = mpsc::channel();
     std::thread::scope(|scope| {
         let s = &f.store;
@@ -171,7 +181,7 @@ fn activation_fetches_only_requested_refs_and_defers_blobs() {
     s.resolve_map(&map).unwrap();
     let refs = String::from_utf8(
         git(
-            &s.repo_path("source"),
+            &s.repo_path("source").unwrap(),
             &["for-each-ref", "--format=%(refname)"],
         )
         .unwrap(),
@@ -183,7 +193,7 @@ fn activation_fetches_only_requested_refs_and_defers_blobs() {
     let mut check = std::process::Command::new("git");
     check
         .arg("-C")
-        .arg(s.repo_path("source"))
+        .arg(s.repo_path("source").unwrap())
         .args(["cat-file", "-e", &blob])
         .env("GIT_NO_LAZY_FETCH", "1");
     assert!(
@@ -266,7 +276,7 @@ fn metadata_fetch_repairs_missing_promised_blobs_and_coalesces_with_reads() {
         let oid = e.content.rsplit(':').next().unwrap();
         let output = std::process::Command::new("git")
             .arg("-C")
-            .arg(s.repo_path("source"))
+            .arg(s.repo_path("source").unwrap())
             .args(["cat-file", "--batch-check"])
             .env("GIT_NO_LAZY_FETCH", "1")
             .stdin(std::process::Stdio::piped())
@@ -282,7 +292,7 @@ fn metadata_fetch_repairs_missing_promised_blobs_and_coalesces_with_reads() {
     }
     // Exercise a repository configured for ordinary skipping negotiation.
     git(
-        &s.repo_path("source"),
+        &s.repo_path("source").unwrap(),
         &["config", "fetch.negotiationAlgorithm", "skipping"],
     )
     .unwrap();

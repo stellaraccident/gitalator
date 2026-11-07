@@ -569,7 +569,7 @@ impl Store {
                     "clone",
                     "--no-checkout",
                     "--no-hardlinks",
-                    self.repo_path(&m.repo).to_str().unwrap(),
+                    self.repo_path(&m.repo)?.to_str().unwrap(),
                     ".",
                 ],
             )?;

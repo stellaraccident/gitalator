@@ -21,7 +21,7 @@ There are no writable aliases into immutable storage.
 ## Persistent state
 
 ```text
-STATE/
+~/.gitalator_state/       default STATE
   state.sqlite3[-wal,-shm]   versioned schema, WAL + synchronous FULL
   content/objects/<sha256>  durable user changes; never evicted by cache GC
   fetched/objects/<sha256>  verified materialized backend payload cache
@@ -31,11 +31,12 @@ STATE/
   config.toml              authoritative user configuration
   logs/operations.jsonl    rotated structured operation events
   logs/daemon.log          rotated lifecycle/activity/error log
-  mount/                   source and parallel control views
   control.sock             mode-0600 daemon control channel
 ```
 
-The state root is mode 0700. SQLite stores repository registry, revisions,
+The source and parallel control views mount at `~/.gitalator`, outside private
+state. Isolated `--state-dir` roots default to `STATE/mount`; an explicit config
+mount overrides either default. The state root is mode 0700. SQLite stores repository registry, revisions,
 workspaces, snapshots, activation candidates/conflicts, exports/review receipts,
 Git object-to-payload mappings, immutable tree metadata, stable stat fingerprints,
 and settings. Schema `user_version=3` is required; older and newer unsupported

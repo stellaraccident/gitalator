@@ -45,7 +45,33 @@ fn explicit_start_required_and_offline_administration_works() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(home.join(".gitalator/state.sqlite3").exists());
+    assert!(home.join(".gitalator_state/state.sqlite3").exists());
+    assert!(!home.join(".gitalator").exists());
+    let out = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .env("HOME", &home)
+        .args(["--offline", "workspace", "create", "dev"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .env("HOME", &home)
+        .args(["--offline", "dir", "top", "--workspace", "dev"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        home.join(".gitalator/workspaces/dev").to_str().unwrap()
+    );
+    assert_eq!(Config::default().mount_path(&root), root.join("mount"));
+    let config = Config {
+        mount: Some(tmp.path().join("custom")),
+        ..Config::default()
+    };
+    assert_eq!(
+        config.mount_path(&home.join(".gitalator_state")),
+        tmp.path().join("custom")
+    );
 }
 #[test]
 fn configuration_validates_before_applying() {

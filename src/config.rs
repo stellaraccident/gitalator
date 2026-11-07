@@ -45,7 +45,17 @@ impl Config {
         match &self.mount {
             Some(p) if p.is_absolute() => p.clone(),
             Some(p) => root.join(p),
-            None => root.join("mount"),
+            None => {
+                let default = crate::ergonomics::default_root();
+                // Store paths are canonicalized at startup; HOME or the state
+                // directory may itself be a symlink.
+                let canonical = std::fs::canonicalize(&default).unwrap_or(default.clone());
+                if root == default || root == canonical {
+                    default.with_file_name(".gitalator")
+                } else {
+                    root.join("mount")
+                }
+            }
         }
     }
     pub fn validate(&self) -> Result<()> {

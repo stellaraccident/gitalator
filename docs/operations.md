@@ -20,10 +20,12 @@ normally and reports a busy mount; `daemon stop --lazy` explicitly detaches one.
 The systemd unit uses lazy detach for service shutdown. SIGINT/SIGTERM also detach
 and drain. Changing the executable on disk does not upgrade a running daemon.
 
+`STATE` defaults to `~/.gitalator_state`; the default user mount is `~/.gitalator`.
+An isolated `--state-dir` retains `STATE/mount` unless configured otherwise.
 `STATE/config.toml` is authoritative; missing keys use defaults:
 
 ```toml
-# mount = "/absolute/alternate/mount"  # restart required; default STATE/mount
+# mount = "/absolute/alternate/mount"  # restart required; default ~/.gitalator for the user-wide state
 snapshot_idle_seconds = 2
 snapshot_max_seconds = 30
 cache_bytes = 1073741824
@@ -58,7 +60,7 @@ silent. Git transfer progress stays in the detailed log instead of flooding the
 mount console. LFS payload work is also tracked. To follow the default store:
 
 ```sh
-tail -F ~/.gitalator/logs/daemon.log ~/.gitalator/logs/operations.jsonl
+tail -F ~/.gitalator_state/logs/daemon.log ~/.gitalator_state/logs/operations.jsonl
 ```
 
 Missing-blob fetches use Git's no-op negotiation, skip recursive submodule fetching

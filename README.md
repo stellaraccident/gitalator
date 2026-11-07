@@ -31,7 +31,8 @@ is installed.
 
 ## First workspace
 
-Gitalator defaults to `~/.gitalator`, with shared backing repositories and one
+Gitalator keeps private state in `~/.gitalator_state` and mounts the workspace tree
+at `~/.gitalator`, with shared backing repositories and one
 explicitly started user daemon. Run this once (it is safe to repeat in `.bashrc`):
 
 ```sh
@@ -74,7 +75,7 @@ with an activation in progress.
 Mounted layout:
 
 ```text
-~/.gitalator/mount/
+~/.gitalator/
   workspaces/dev/therock/              writable sources, including nested mounts
   readonly/dev/therock/                active base without edits
   snapshots/dev/1/therock/             immutable checkpoint
@@ -92,14 +93,15 @@ gtl status dev
 gtl diff dev
 gtl snapshot create dev
 gtl daemon status
-gtl daemon reload                     # validate/apply ~/.gitalator/config.toml
+gtl daemon reload                     # validate/apply ~/.gitalator_state/config.toml
 gtl daemon stop                       # reports busy mounts instead of detaching
 # gtl daemon stop --lazy               # explicit detach, including busy cwd
 ```
 
 Use `--state-dir /absolute/isolated/state` on every command for isolated setups.
 `gtl --offline ...` is explicit administration with the daemon stopped. The default
-mount is `STATE/mount`; `gtl mount /elsewhere` remains a foreground expert option.
+mount is `~/.gitalator` for the default state root, or `STATE/mount` for an isolated
+state root; `gtl mount /elsewhere` remains a foreground expert option.
 State must live on a local filesystem supporting SQLite locks and fsync.
 
 **This version requires fresh schema-3 state.** Older stores are rejected without

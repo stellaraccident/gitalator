@@ -6,7 +6,7 @@ pub fn default_root() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".gitalator")
+        .join(".gitalator_state")
 }
 /// Conservative normalization: do not merge transports, SSH aliases, or URL paths.
 pub fn canonical_remote(remote: &str) -> Result<String> {

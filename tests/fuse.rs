@@ -613,3 +613,175 @@ fn recursive_du_combines_small_sibling_directories() {
         "40 directories should use two fetches, bounded to 32 directories each"
     );
 }
+
+// Spawned as a separate test process so its signal disposition cannot affect
+// other tests. Raw syscalls avoid language runtimes silently retrying EINTR.
+#[test]
+fn interrupted_metadata_child() {
+    use std::ffi::CString;
+    let Ok(path) = std::env::var("GTL_INTERRUPT_PATH") else {
+        return;
+    };
+    extern "C" fn handled(_: libc::c_int) {}
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handled as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        assert_eq!(
+            libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()),
+            0
+        );
+        std::fs::write(
+            std::env::var("GTL_INTERRUPT_TID").unwrap(),
+            libc::syscall(libc::SYS_gettid).to_string(),
+        )
+        .unwrap();
+        let path = CString::new(path).unwrap();
+        let failed = if std::env::var("GTL_INTERRUPT_OPERATION").unwrap() == "opendir" {
+            let dir = libc::opendir(path.as_ptr());
+            if !dir.is_null() {
+                libc::closedir(dir);
+                false
+            } else {
+                true
+            }
+        } else {
+            let mut stat: libc::stat = std::mem::zeroed();
+            libc::stat(path.as_ptr(), &mut stat) == -1
+        };
+        assert!(failed, "metadata operation completed before interruption");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINTR)
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires real /dev/fuse mount; run explicitly"]
+fn metadata_interrupt_releases_caller_while_backend_finishes() {
+    use gitalator::{
+        cache::{hash, Lock},
+        db::Store,
+    };
+    use std::time::Instant;
+    for operation in ["stat", "opendir"] {
+        let mut f = Fixture::new();
+        git(&f.repo, &["config", "uploadpack.allowFilter", "true"]).unwrap();
+        f.store = Store::open(&f.temp.path().join("interrupt-state")).unwrap();
+        f.store
+            .repo_add(
+                "source",
+                &format!(
+                    "file://{}",
+                    std::fs::canonicalize(&f.repo).unwrap().display()
+                ),
+            )
+            .unwrap();
+        f.store
+            .create(
+                "a",
+                "format=1\n[[mount]]\nid='root'\nrepo='source'\npath=''\nrevision='main'\n",
+            )
+            .unwrap();
+        let tx = f.store.activate("a").unwrap();
+        f.store.finish_activation(&tx, false).unwrap();
+        let held = if operation == "stat" {
+            f.store.repo_lock("source").unwrap()
+        } else {
+            let map = f.store.state(f.store.head("a").unwrap()).unwrap().0;
+            let key = hash(map.mount[0].commit.as_ref().unwrap().as_bytes());
+            f.store.conn().unwrap().execute_batch("DELETE FROM tree_cache;DELETE FROM metadata_trees;DELETE FROM metadata_entries;").unwrap();
+            Lock::take(
+                &f.store
+                    .root
+                    .join("locks")
+                    .join(format!("tree-source-{key}")),
+            )
+            .unwrap()
+        };
+        let mount = start_mount(&f);
+        let before = command(&f, &["metrics"])["queued"].as_u64().unwrap();
+        let path = mount.path.join(if operation == "stat" {
+            "workspaces/a/file"
+        } else {
+            "workspaces/a"
+        });
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "interrupted_metadata_child", "--nocapture"])
+            .env("GTL_INTERRUPT_PATH", &path)
+            .env("GTL_INTERRUPT_OPERATION", operation)
+            .env("GTL_INTERRUPT_TID", f.temp.path().join("caller.tid"))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while command(&f, &["metrics"])["queued"].as_u64().unwrap() <= before {
+            assert!(
+                Instant::now() < deadline,
+                "metadata request never reached a worker"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(child.try_wait().unwrap().is_none());
+        let tid: libc::pid_t = std::fs::read_to_string(f.temp.path().join("caller.tid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        unsafe {
+            assert_eq!(
+                libc::syscall(
+                    libc::SYS_tgkill,
+                    child.id() as libc::pid_t,
+                    tid,
+                    libc::SIGUSR1
+                ),
+                0
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Release the backend only AFTER checking the signaled caller's exit.
+        drop(held);
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "{operation} did not return EINTR while its backend was blocked"
+        );
+        if operation == "stat" {
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 5);
+            let log = std::fs::read_to_string(f.store.root.join("logs/operations.jsonl")).unwrap();
+            let fetches = log
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|v| {
+                    v["operation"] == "fetch-blobs:source"
+                        && v["status"] == "phase"
+                        && v["detail"]
+                            .as_str()
+                            .is_some_and(|s| s.starts_with("fetching "))
+                })
+                .count();
+            assert_eq!(
+                fetches, 1,
+                "interruption must not discard or duplicate the fetch"
+            );
+        } else {
+            assert_eq!(std::fs::read_dir(&path).unwrap().count(), 2);
+        }
+        // A canceled operation must not damage the mount or later metadata replies.
+        assert!(std::fs::metadata(mount.path.join("workspaces/a"))
+            .unwrap()
+            .is_dir());
+    }
+}

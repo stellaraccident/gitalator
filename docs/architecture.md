@@ -85,6 +85,11 @@ Final map+overlay publication and unfreezing are one database transaction.
 
 The FUSE dispatch thread serves warm metadata directly. Four bounded workers handle
 cold metadata and reads; backend activity does not block unrelated warm callbacks.
+Cold metadata replies are registered by FUSE request ID. Interrupt and completion
+race to claim each reply; only the winner publishes kernel lookup references or
+directory handles. In-flight work continues after interruption, while canceled
+queued work is skipped. The registry lives in `src/interrupts.rs`; a narrow vendor
+patch exposes the FUSE interrupt callback.
 Shutdown drains accepted control requests and workers before releasing ownership.
 `src/namespace.rs` defines the live, readonly, snapshot and parallel control paths.
 

@@ -31,3 +31,5 @@ pub mod namespace;
 pub mod config;
 pub mod daemon;
 pub mod logging;
+
+mod interrupts;

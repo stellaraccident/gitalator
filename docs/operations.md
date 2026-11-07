@@ -96,6 +96,29 @@ it; `config --cache-bytes N` sets the daemon's periodic target. GC never prunes
 history. Disk use can exceed that target substantially because Git objects,
 durable overlays, metadata and logs are outside it.
 
+## Interrupting metadata reads
+
+Cold lookup, getattr, opendir, readdir/readdirplus, readlink, and supported getxattr
+requests can honor FUSE interrupts. A signal can release the caller with `EINTR`
+without waiting for a slow Git fetch or repository lock. Applications may choose
+to retry interrupted syscalls according to their signal handling.
+
+Only the original request's reply is canceled. Work already running continues and
+warms shared caches; queued work skips execution if cancellation arrived first.
+Canceled workers cannot publish lookup references or new directory handles, and
+completion races send at most one reply. Fetches may still occupy workers after
+the caller exits. File open/read, writes, mutations, and backend subprocesses do
+not gain cancellation in this implementation. Interrupt delivery also depends on
+the dispatch thread remaining available; this is not a guarantee that every
+filesystem syscall can be interrupted immediately.
+
+The vendored `fuser` 0.14.0 has a small interrupt-dispatch callback patch; see
+[`vendor/fuser/GITALATOR-PATCH.md`](../vendor/fuser/GITALATOR-PATCH.md). Gitalator
+owns the cancellation policy and pending-reply registry. Mounted regressions hold
+repository/tree locks, signal the actual caller thread, and require its metadata
+syscall to return `EINTR` before releasing the backend. Fetch completion and later
+metadata access are verified afterward.
+
 ## Recovery
 
 1. After a crash, `gtl daemon start` verifies a disconnected gitalator mount at

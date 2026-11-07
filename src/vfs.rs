@@ -79,6 +79,7 @@ pub struct Fs {
     next_directory: Arc<AtomicU64>,
     workers: Arc<crate::workers::Workers>,
     ttl: Arc<AtomicU64>,
+    pending: crate::interrupts::PendingRequests,
 }
 impl Fs {
     pub fn new(store: Store) -> Self {
@@ -100,6 +101,7 @@ impl Fs {
             next_directory: Arc::new(AtomicU64::new(1)),
             workers,
             ttl: Arc::new(AtomicU64::new(0)),
+            pending: Default::default(),
         }
     }
     fn reader(&self) -> Self {
@@ -114,6 +116,7 @@ impl Fs {
             next_directory: self.next_directory.clone(),
             workers: self.workers.clone(),
             ttl: self.ttl.clone(),
+            pending: self.pending.clone(),
         }
     }
     fn inode(&self, p: &str) -> u64 {
@@ -379,11 +382,16 @@ impl Fs {
             return Err(error("invalid directory offset"));
         }
         if offset == 0 && handle.epoch != self.store.runtime.epoch.load(Ordering::Acquire) {
-            let new = self.directory_handle(&handle.path)?;
-            self.directories.lock().unwrap().insert(fh, new.clone());
-            return Ok(new);
+            return self.directory_handle(&handle.path);
         }
         Ok(handle)
+    }
+    fn publish_directory_page(&self, fh: u64, handle: &DirectoryHandle) {
+        // An interrupted readdir may have been followed by releasedir while its
+        // worker was still running. Never resurrect a closed directory handle.
+        if let Some(current) = self.directories.lock().unwrap().get_mut(&fh) {
+            *current = handle.clone();
+        }
     }
     fn reply_directory(&self, handle: DirectoryHandle, offset: i64, mut reply: ReplyDirectory) {
         for (index, record) in handle.entries.iter().enumerate().skip(offset as usize) {
@@ -559,6 +567,13 @@ impl Filesystem for Fs {
         self.store.runtime.ready.store(true, Ordering::Release);
         Ok(())
     }
+    fn interrupt(&mut self, _: &Request<'_>, unique: u64) -> std::result::Result<(), libc::c_int> {
+        if self.pending.interrupt(unique) {
+            Ok(())
+        } else {
+            Err(libc::EAGAIN)
+        }
+    }
     fn forget(&mut self, _: &Request<'_>, ino: u64, nlookup: u64) {
         let mut table = self.inodes.lock().unwrap();
         let n = table.references.entry(ino).or_default();
@@ -566,7 +581,7 @@ impl Filesystem for Fs {
         table.collect(ino);
     }
 
-    fn lookup(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         self.store
             .runtime
             .metrics
@@ -594,24 +609,28 @@ impl Filesystem for Fs {
             Err(e) if metadata::would_block(&*e) => {
                 drop(fence);
                 let reader = self.reader();
+                let pending = self.pending.register(req.unique(), reply);
                 self.enqueue(move |accepted| {
+                    if pending.canceled() {
+                        return;
+                    }
                     if !accepted {
-                        reply.error(libc::EAGAIN);
+                        pending.complete(|reply| reply.error(libc::EAGAIN));
                         return;
                     }
                     crate::workers::complete(
                         &reader.store.runtime,
-                        || {
-                            let e = reader.stat(&path)?;
-                            let ino = reader.inode(&path);
-                            Ok((ino, reader.attr(ino, &e)))
-                        },
-                        |result| match result {
-                            Ok((ino, attr)) => {
-                                reader.reference(ino);
-                                reply.entry(&reader.ttl(&path), &attr, 0)
-                            }
-                            Err(e) => reply.error(errno(&*e)),
+                        || reader.stat(&path),
+                        |result| {
+                            pending.complete(|reply| match result {
+                                Ok(entry) => {
+                                    let ino = reader.inode(&path);
+                                    let attr = reader.attr(ino, &entry);
+                                    reader.reference(ino);
+                                    reply.entry(&reader.ttl(&path), &attr, 0)
+                                }
+                                Err(e) => reply.error(errno(&*e)),
+                            })
                         },
                     );
                 });
@@ -619,7 +638,7 @@ impl Filesystem for Fs {
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn getattr(&mut self, _: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         self.store
             .runtime
             .metrics
@@ -635,40 +654,67 @@ impl Filesystem for Fs {
         let runtime = self.store.runtime.clone();
         let fence = runtime.reply_fence.read().unwrap();
         let work_path = path.clone();
-        let work = move |reader: &Fs| -> Result<FileAttr> {
+        let work = move |reader: &Fs| -> Result<(Entry, SystemTime)> {
             let path = &work_path;
-            // Resolve before deciding whether this inode belongs to a retired generation.
-            if let Some((entry, stamp)) = reader.inodes.lock().unwrap().detached.get(&ino).cloned()
-            {
-                return Ok(make_attr(ino, &entry, stamp));
+            if let Some(saved) = reader.inodes.lock().unwrap().detached.get(&ino).cloned() {
+                return Ok(saved);
             }
-            if let Ok(Node::Source(view, _)) = reader.node(path) {
-                reader.store.view_snapshot(&view)?;
-            }
-            reader.inode(path);
-            if let Some((entry, stamp)) = reader.inodes.lock().unwrap().detached.get(&ino).cloned()
-            {
-                return Ok(make_attr(ino, &entry, stamp));
-            }
-            let e = reader.stat(path)?;
-            Ok(reader.attr(ino, &e))
+            let time = if let Ok(Node::Source(view, relative)) = reader.node(path) {
+                let state = reader.store.view_snapshot(&view)?;
+                let table = reader.inodes.lock().unwrap();
+                if table
+                    .lineages
+                    .get(&ino)
+                    .is_some_and(|g| *g != state.generation())
+                {
+                    if let Some(saved) = table.saved.get(&ino) {
+                        return Ok(saved.clone());
+                    }
+                }
+                state.time(&relative)
+            } else {
+                UNIX_EPOCH
+                    + Duration::from_nanos(reader.store.runtime.stamp.load(Ordering::Acquire))
+            };
+            Ok((reader.stat(path)?, time))
         };
         match metadata::cached_only(|| work(self)) {
-            Ok(attr) => reply.attr(&self.ttl(&path), &attr),
+            Ok((entry, time)) => {
+                self.inodes
+                    .lock()
+                    .unwrap()
+                    .saved
+                    .insert(ino, (entry.clone(), time));
+                reply.attr(&self.ttl(&path), &make_attr(ino, &entry, time));
+            }
             Err(e) if metadata::would_block(&*e) => {
                 drop(fence);
                 let reader = self.reader();
+                let pending = self.pending.register(req.unique(), reply);
                 self.enqueue(move |accepted| {
+                    if pending.canceled() {
+                        return;
+                    }
                     if !accepted {
-                        reply.error(libc::EAGAIN);
+                        pending.complete(|reply| reply.error(libc::EAGAIN));
                         return;
                     }
                     crate::workers::complete(
                         &reader.store.runtime,
                         || work(&reader),
-                        |result| match result {
-                            Ok(attr) => reply.attr(&reader.ttl(&path), &attr),
-                            Err(e) => reply.error(errno(&*e)),
+                        |result| {
+                            pending.complete(|reply| match result {
+                                Ok((entry, time)) => {
+                                    reader
+                                        .inodes
+                                        .lock()
+                                        .unwrap()
+                                        .saved
+                                        .insert(ino, (entry.clone(), time));
+                                    reply.attr(&reader.ttl(&path), &make_attr(ino, &entry, time));
+                                }
+                                Err(e) => reply.error(errno(&*e)),
+                            })
                         },
                     );
                 });
@@ -676,7 +722,7 @@ impl Filesystem for Fs {
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn opendir(&mut self, _: &Request<'_>, ino: u64, _: i32, reply: ReplyOpen) {
+    fn opendir(&mut self, req: &Request<'_>, ino: u64, _: i32, reply: ReplyOpen) {
         let path = match self.path(ino) {
             Ok(p) => p,
             Err(e) => {
@@ -696,22 +742,32 @@ impl Filesystem for Fs {
             Err(e) if metadata::would_block(&*e) => {
                 drop(fence);
                 let reader = self.reader();
+                let pending = self.pending.register(req.unique(), reply);
                 self.enqueue(move |accepted| {
+                    if pending.canceled() {
+                        return;
+                    }
                     if !accepted {
-                        reply.error(libc::EAGAIN);
+                        pending.complete(|reply| reply.error(libc::EAGAIN));
                         return;
                     }
                     crate::workers::complete(
                         &reader.store.runtime,
                         || reader.directory_handle(&path),
-                        |result| match result {
-                            Ok(handle) => {
-                                let fh = reader.next_directory.fetch_add(1, Ordering::Relaxed);
-                                reader.directories.lock().unwrap().insert(fh, handle);
-                                *reader.inodes.lock().unwrap().opens.entry(ino).or_default() += 1;
-                                reply.opened(fh, if path.starts_with("snapshots/") { 8 } else { 0 })
-                            }
-                            Err(e) => reply.error(errno(&*e)),
+                        |result| {
+                            pending.complete(|reply| match result {
+                                Ok(handle) => {
+                                    let fh = reader.next_directory.fetch_add(1, Ordering::Relaxed);
+                                    reader.directories.lock().unwrap().insert(fh, handle);
+                                    *reader.inodes.lock().unwrap().opens.entry(ino).or_default() +=
+                                        1;
+                                    reply.opened(
+                                        fh,
+                                        if path.starts_with("snapshots/") { 8 } else { 0 },
+                                    )
+                                }
+                                Err(e) => reply.error(errno(&*e)),
+                            })
                         },
                     );
                 });
@@ -727,7 +783,7 @@ impl Filesystem for Fs {
         t.collect(ino);
         reply.ok();
     }
-    fn readdir(&mut self, _: &Request<'_>, _: u64, fh: u64, offset: i64, reply: ReplyDirectory) {
+    fn readdir(&mut self, req: &Request<'_>, _: u64, fh: u64, offset: i64, reply: ReplyDirectory) {
         self.store
             .runtime
             .metrics
@@ -736,21 +792,33 @@ impl Filesystem for Fs {
         let runtime = self.store.runtime.clone();
         let fence = runtime.reply_fence.read().unwrap();
         match metadata::cached_only(|| self.directory_page(fh, offset)) {
-            Ok(handle) => self.reply_directory(handle, offset, reply),
+            Ok(handle) => {
+                self.publish_directory_page(fh, &handle);
+                self.reply_directory(handle, offset, reply)
+            }
             Err(e) if metadata::would_block(&*e) => {
                 drop(fence);
                 let reader = self.reader();
+                let pending = self.pending.register(req.unique(), reply);
                 self.enqueue(move |ok| {
+                    if pending.canceled() {
+                        return;
+                    }
                     if !ok {
-                        reply.error(libc::EAGAIN);
+                        pending.complete(|reply| reply.error(libc::EAGAIN));
                         return;
                     }
                     crate::workers::complete(
                         &reader.store.runtime,
                         || reader.directory_page(fh, offset),
-                        |result| match result {
-                            Ok(h) => reader.reply_directory(h, offset, reply),
-                            Err(e) => reply.error(errno(&*e)),
+                        |result| {
+                            pending.complete(|reply| match result {
+                                Ok(h) => {
+                                    reader.publish_directory_page(fh, &h);
+                                    reader.reply_directory(h, offset, reply)
+                                }
+                                Err(e) => reply.error(errno(&*e)),
+                            })
                         },
                     );
                 });
@@ -760,7 +828,7 @@ impl Filesystem for Fs {
     }
     fn readdirplus(
         &mut self,
-        _: &Request<'_>,
+        req: &Request<'_>,
         _: u64,
         fh: u64,
         offset: i64,
@@ -774,21 +842,33 @@ impl Filesystem for Fs {
         let runtime = self.store.runtime.clone();
         let fence = runtime.reply_fence.read().unwrap();
         match metadata::cached_only(|| self.directory_page(fh, offset)) {
-            Ok(handle) => self.reply_directory_plus(handle, offset, reply),
+            Ok(handle) => {
+                self.publish_directory_page(fh, &handle);
+                self.reply_directory_plus(handle, offset, reply)
+            }
             Err(e) if metadata::would_block(&*e) => {
                 drop(fence);
                 let reader = self.reader();
+                let pending = self.pending.register(req.unique(), reply);
                 self.enqueue(move |ok| {
+                    if pending.canceled() {
+                        return;
+                    }
                     if !ok {
-                        reply.error(libc::EAGAIN);
+                        pending.complete(|reply| reply.error(libc::EAGAIN));
                         return;
                     }
                     crate::workers::complete(
                         &reader.store.runtime,
                         || reader.directory_page(fh, offset),
-                        |result| match result {
-                            Ok(h) => reader.reply_directory_plus(h, offset, reply),
-                            Err(e) => reply.error(errno(&*e)),
+                        |result| {
+                            pending.complete(|reply| match result {
+                                Ok(h) => {
+                                    reader.publish_directory_page(fh, &h);
+                                    reader.reply_directory_plus(h, offset, reply)
+                                }
+                                Err(e) => reply.error(errno(&*e)),
+                            })
                         },
                     );
                 });
@@ -1379,57 +1459,89 @@ impl Filesystem for Fs {
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn readlink(&mut self, _: &Request<'_>, ino: u64, reply: ReplyData) {
-        let r = self
-            .path(ino)
-            .and_then(|p| self.node(&p))
-            .and_then(|n| self.read_node(&n));
-        match r {
-            Ok(b) => reply.data(&b),
-            Err(e) => reply.error(errno(&*e)),
-        }
+    fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let reader = self.reader();
+        let pending = self.pending.register(req.unique(), reply);
+        self.enqueue(move |accepted| {
+            if pending.canceled() {
+                return;
+            }
+            if !accepted {
+                pending.complete(|reply| reply.error(libc::EAGAIN));
+                return;
+            }
+            crate::workers::complete(
+                &reader.store.runtime,
+                || {
+                    reader
+                        .path(ino)
+                        .and_then(|p| reader.node(&p))
+                        .and_then(|n| reader.read_node(&n))
+                },
+                |result| {
+                    pending.complete(|reply| match result {
+                        Ok(bytes) => reply.data(&bytes),
+                        Err(e) => reply.error(errno(&*e)),
+                    })
+                },
+            );
+        });
     }
-    fn getxattr(&mut self, _: &Request<'_>, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
-        // ls and other tools probe ACL/security attributes on every entry.
-        // These attributes are unsupported regardless of repository contents.
+    fn getxattr(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
         if name != "user.ws.content_id" && name != "user.ws.digest.sha256" {
             reply.error(libc::ENODATA);
             return;
         }
-        let r = (|| -> Result<Vec<u8>> {
-            let p = self.path(ino)?;
-            let Node::Source(v, path) = self.node(&p)? else {
-                return Err(error("no attribute"));
-            };
-            let e = self.store.entry(&v, &path)?;
-            if e.kind == Kind::Directory {
-                return Err(error("no attribute"));
+        let digest = name == "user.ws.digest.sha256";
+        let reader = self.reader();
+        let pending = self.pending.register(req.unique(), reply);
+        self.enqueue(move |accepted| {
+            if pending.canceled() {
+                return;
             }
-            if name == "user.ws.content_id" {
-                Ok(format!("v1:{}", e.content).into_bytes())
-            } else if name == "user.ws.digest.sha256" {
-                use sha2::{Digest, Sha256};
-                Ok(Sha256::digest(self.store.bytes(&e)?).to_vec())
-            } else {
-                Err(error("no attribute"))
+            if !accepted {
+                pending.complete(|reply| reply.error(libc::EAGAIN));
+                return;
             }
-        })();
-        match r {
-            Ok(b) => {
-                if size == 0 {
-                    reply.size(b.len() as u32)
-                } else if size < (b.len() as u32) {
-                    reply.error(libc::ERANGE)
-                } else {
-                    reply.data(&b)
-                }
-            }
-            Err(e) => reply.error(if e.to_string() == "no attribute" {
-                libc::ENODATA
-            } else {
-                errno(&*e)
-            }),
-        }
+            crate::workers::complete(
+                &reader.store.runtime,
+                || -> Result<Vec<u8>> {
+                    let p = reader.path(ino)?;
+                    let Node::Source(view, path) = reader.node(&p)? else {
+                        return Err(error("no attribute"));
+                    };
+                    let e = reader.store.entry(&view, &path)?;
+                    if e.kind == Kind::Directory {
+                        return Err(error("no attribute"));
+                    }
+                    if digest {
+                        use sha2::{Digest, Sha256};
+                        Ok(Sha256::digest(reader.store.bytes(&e)?).to_vec())
+                    } else {
+                        Ok(format!("v1:{}", e.content).into_bytes())
+                    }
+                },
+                |result| {
+                    pending.complete(|reply| match result {
+                        Ok(bytes) if size == 0 => reply.size(bytes.len() as u32),
+                        Ok(bytes) if size < bytes.len() as u32 => reply.error(libc::ERANGE),
+                        Ok(bytes) => reply.data(&bytes),
+                        Err(e) => reply.error(if e.to_string() == "no attribute" {
+                            libc::ENODATA
+                        } else {
+                            errno(&*e)
+                        }),
+                    })
+                },
+            );
+        });
     }
 }
 fn mount_path_error(

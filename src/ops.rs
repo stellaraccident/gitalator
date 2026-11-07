@@ -16,7 +16,7 @@ pub struct Conflict {
     pub reason: String,
     pub resolved: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum View {
     Live(String),
     Base(String),
@@ -127,12 +127,22 @@ impl Store {
         self.mutate_many(v, vec![(path.into(), entry)])
     }
     pub fn mutate_many(&self, v: &View, changes: Vec<(String, Option<Entry>)>) -> Result<()> {
-        let lockname = match v {
+        let _guard = self.view_lock(v)?;
+        self.mutate_locked(v, changes)
+    }
+    pub(crate) fn view_lock(&self, v: &View) -> Result<Lock> {
+        let name = match v {
             View::Live(n) => n.clone(),
             View::Transaction(id) => format!("tx-{id}"),
             _ => return Err(error("read-only view")),
         };
-        let _guard = self.workspace_lock(&lockname)?;
+        self.workspace_lock(&name)
+    }
+    pub(crate) fn mutate_locked(
+        &self,
+        v: &View,
+        changes: Vec<(String, Option<Entry>)>,
+    ) -> Result<()> {
         if let View::Live(n) = v {
             if self.frozen(n)? {
                 return Err(error("workspace activation in progress: writes frozen"));
@@ -175,6 +185,32 @@ impl Store {
             _ => unreachable!(),
         }
         Ok(())
+    }
+    pub fn write_range(
+        &self,
+        v: &View,
+        path: &str,
+        generation: &str,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<Entry> {
+        let _guard = self.view_lock(v)?;
+        let map = self.view_state(v)?.0;
+        if hash(serde_json::to_string(&map)?.as_bytes()) != generation {
+            return Err(error("stale generation: reopen after activation"));
+        }
+        let mut entry = self.entry(v, path)?;
+        let mut bytes = self.bytes(&entry)?;
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| error("invalid write size"))?;
+        bytes.try_reserve(end.saturating_sub(bytes.len()))?;
+        bytes.resize(bytes.len().max(end), 0);
+        bytes[offset..end].copy_from_slice(data);
+        entry.content = self.cache.put(&bytes)?;
+        entry.size = bytes.len() as u64;
+        self.mutate_locked(v, vec![(path.into(), Some(entry.clone()))])?;
+        Ok(entry)
     }
     pub fn write_file(
         &self,
@@ -463,7 +499,9 @@ impl Store {
             "UPDATE activations SET state=?2 WHERE id=?1",
             params![id, if abort { "ABORTED" } else { "COMMITTED" }],
         )?;
+        crate::failpoint("activation-before-commit");
         t.commit()?;
+        crate::failpoint("activation-after-commit");
         self.snapshot_unlocked(&name)?;
         if !abort {
             self.record_layout(&name)?;
@@ -533,6 +571,16 @@ impl Store {
                 ],
             )?;
             git(&path, &["checkout", "--detach", m.commit.as_ref().unwrap()])?;
+            let origin: String =
+                self.conn()?
+                    .query_row("SELECT origin FROM repos WHERE id=?1", [&m.repo], |r| {
+                        r.get(0)
+                    })?;
+            git(&path, &["remote", "set-url", "origin", &origin])?;
+            if path.join(".gitattributes").exists() {
+                git(&path, &["lfs", "install", "--local", "--skip-repo"])?;
+            }
+
             for ((_, p), e) in edits {
                 let visible = join(&m.path, p);
                 if !map

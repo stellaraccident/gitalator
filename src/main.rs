@@ -5,7 +5,8 @@ use gitalator::{
     Result,
 };
 fn execute() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.command.absolutize()?;
     if let Cmd::Unmount { path } = cli.command {
         let status = std::process::Command::new("fusermount3")
             .arg("-u")
@@ -18,7 +19,7 @@ fn execute() -> Result<()> {
     }
     let store = Store::open(&cli.state_dir)?;
     if let Cmd::Mount { path } = cli.command {
-        let _lock = gitalator::cache::Lock::take(&store.root.join("daemon.lock"))?;
+        let _lock = gitalator::cache::Lock::try_take(&store.root.join("daemon.lock"))?;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server = gitalator::cli::server(store.clone(), stop.clone())?;
         let result = gitalator::vfs::mount(store, &path);

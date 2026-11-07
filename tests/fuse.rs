@@ -114,3 +114,57 @@ fn mounted_workspace_roundtrip() {
     use sha2::{Digest, Sha256};
     assert_eq!(digest.as_slice(), Sha256::digest(b"hello").as_slice());
 }
+#[test]
+#[ignore = "requires real /dev/fuse mount; run explicitly"]
+fn activation_preserves_open_read_generation() {
+    let f = Fixture::new();
+    let p = f.temp.path().join("mount");
+    std::fs::create_dir_all(&p).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .args([
+            "--state-dir",
+            f.store.root.to_str().unwrap(),
+            "mount",
+            p.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    let _m = Mount {
+        child,
+        path: p.clone(),
+    };
+    let file = p.join("workspaces/a/depot/file");
+    for _ in 0..100 {
+        if file.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut old = std::fs::File::open(&file).unwrap();
+    let mut old_writer = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+    std::fs::write(f.repo.join("file"), b"new generation\n").unwrap();
+    commit(&f.repo);
+    let tx = f.store.activate("a").unwrap();
+    f.store.finish_activation(&tx, false).unwrap();
+    let mut bytes = vec![];
+    old.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"base\n");
+    assert_eq!(std::fs::read(&file).unwrap(), b"new generation\n");
+    assert!(old_writer.write_all(b"stale").is_err());
+    let output = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .args([
+            "--state-dir",
+            f.store.root.to_str().unwrap(),
+            "--json",
+            "status",
+            "a",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["frozen"], false);
+    let temporary = p.join("workspaces/a/.save");
+    std::fs::write(&temporary, b"bad").unwrap();
+    assert!(std::fs::rename(&temporary, p.join("workspaces/a/ACTIVE_VERSION_MAP")).is_err());
+}

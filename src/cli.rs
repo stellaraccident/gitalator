@@ -1,12 +1,4 @@
-use crate::{
-    backend::git,
-    cache::{atomic, Span},
-    db::Store,
-    error,
-    model::*,
-    ops::View,
-    Result,
-};
+use crate::{backend::git, cache::Span, db::Store, error, model::*, ops::View, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -31,6 +23,14 @@ pub struct Cli {
 #[derive(Subcommand, Serialize, Deserialize, Debug)]
 pub enum Cmd {
     Init,
+    Config {
+        #[arg(long)]
+        idle_seconds: Option<u64>,
+        #[arg(long)]
+        max_seconds: Option<u64>,
+        #[arg(long)]
+        cache_bytes: Option<u64>,
+    },
     Doctor,
     Repo {
         #[command(subcommand)]
@@ -106,6 +106,11 @@ pub enum Cmd {
         export: PathBuf,
         #[arg(long)]
         publish: bool,
+    },
+    Land {
+        export: PathBuf,
+        #[arg(long)]
+        verify_only: bool,
     },
     Gc {
         #[arg(long)]
@@ -184,29 +189,256 @@ impl Cmd {
     }
 }
 fn execute(s: &Store, cmd: Cmd) -> Result<Value> {
-    match cmd{
- Cmd::Init=>Ok(json!({"state_dir":s.root,"schema":1})),
- Cmd::Doctor=>Ok(json!({"database":s.conn()?.query_row("PRAGMA integrity_check",[],|r|r.get::<_,String>(0))?,"git":String::from_utf8(git(&s.root,&["--version"])?)?,"fuse_device":Path::new("/dev/fuse").exists()})),
- Cmd::Repo{command}=>match command{RepoCmd::Add{id,origin}=>{let origin=if Path::new(&origin).exists(){std::fs::canonicalize(&origin)?.to_string_lossy().into_owned()}else{origin};s.repo_add(&id,&origin)?;Ok(json!({"registered":id}))},RepoCmd::Fetch{id}=>{s.fetch(&id)?;Ok(json!({"fetched":id}))},RepoCmd::List=>{let c=s.conn()?;let mut q=c.prepare("SELECT id FROM repos ORDER BY id")?;let ids=q.query_map([],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;Ok(json!(ids))}},
- Cmd::Workspace{command}=>match command{WorkspaceCmd::List=>Ok(json!(s.names()?)),WorkspaceCmd::Create{name,map,from,snapshot}=>{if let Some(source)=from{let revision=if let Some(number)=snapshot{s.snapshot_revision(&source,number)?.0}else{s.head(&source)?};let draft=if let Some(number)=snapshot{s.snapshot_revision(&source,number)?.1}else{s.draft(&source)?};s.create(&name,&draft)?;s.conn()?.execute("UPDATE workspaces SET head=?2 WHERE name=?1",rusqlite::params![name,revision])?;}else{s.create(&name,&if let Some(path)=map{std::fs::read_to_string(path)?}else{"format = 1\n".into()})?;}Ok(json!({"workspace":name}))}},
- Cmd::Status{workspace}=>{let(m,o)=s.state(s.head(&workspace)?)?;let draft=s.draft(&workspace)?;let draft_map=Map::parse(&draft);let mut active=m.clone();for m in &mut active.mount{m.commit=None;}Ok(json!({"workspace":workspace,"head":s.head(&workspace)?,"frozen":s.frozen(&workspace)?,"overlay_entries":o.len(),"draft_valid":draft_map.is_ok(),"draft_differs":draft_map.map(|m|serde_json::to_string(&m).ok()!=serde_json::to_string(&active).ok()).unwrap_or(true)}))},
- Cmd::Diff{workspace}=>{let(m,o)=s.state(s.head(&workspace)?)?;Ok(json!(o.iter().map(|((id,p),e)|json!({"mount":id,"path":m.mount.iter().find(|m|&m.id==id).map(|m|join(&m.path,p)),"operation":if e.is_some(){"write"}else{"delete"},"entry":e})).collect::<Vec<_>>()))},
- Cmd::Map{command}=>match command{MapCmd::Show{workspace,active}=>Ok(json!({"contents":if active{toml::to_string_pretty(&s.state(s.head(&workspace)?)?.0)?}else{s.draft(&workspace)?}})),MapCmd::Set{workspace,file}=>{s.set_draft(&workspace,&std::fs::read_to_string(file)?)?;Ok(json!({"staged":workspace}))},MapCmd::ImportSuperrepo{workspace,path,revision}=>import_super(s,&workspace,&path,&revision)},
- Cmd::Snapshot{command}=>match command{SnapshotCmd::Create{workspace}=>Ok(json!({"number":s.snapshot(&workspace)?})),SnapshotCmd::List{workspace}=>Ok(json!(s.snapshots(&workspace)?)),SnapshotCmd::Pin{workspace,number}=>{let count=s.conn()?.execute("UPDATE snapshots SET pinned=1 WHERE workspace=?1 AND number=?2",rusqlite::params![workspace,number])?;if count==0{return Err(error("snapshot not found"));}Ok(json!({"pinned":number}))}},
- Cmd::Restore{workspace,number}=>{s.restore(&workspace,number)?;Ok(json!({"restored":number}))},
- Cmd::Stash{workspace}=>{let number=s.snapshot(&workspace)?;let _guard=s.workspace_lock(&workspace)?;if s.frozen(&workspace)?{return Err(error("activation in progress"));}let(m,_)=s.state(s.head(&workspace)?)?;s.publish(&workspace,None,&m,&[])?;Ok(json!({"stash_snapshot":number}))},
- Cmd::Activate{workspace,plan,resume,abort}=>{if plan{return Ok(json!({"proposal":s.activate_plan(&workspace)?}));}if resume||abort{let id:Option<String>=s.conn()?.query_row("SELECT activation FROM workspaces WHERE name=?1",[&workspace],|r|r.get(0))?;let id=id.ok_or_else(||error("no activation in progress"))?;s.finish_activation(&id,abort)?;return Ok(json!({"transaction":id,"state":if abort{"ABORTED"}else{"COMMITTED"}}));}let id=s.activate(&workspace)?;let conflicts=s.conflict_list(&id)?;if conflicts.is_empty(){s.finish_activation(&id,false)?;}Ok(json!({"transaction":id,"state":if conflicts.is_empty(){"COMMITTED"}else{"CONFLICTED"},"conflicts":conflicts}))},
- Cmd::Conflicts{transaction}=>Ok(json!(s.conflict_list(&transaction)?)),
- Cmd::Resolve{transaction,mount,path,discard}=>{s.resolve_conflict(&transaction,&mount,&path,discard)?;Ok(json!({"resolved":path}))},
- Cmd::Export{workspace,destination}=>s.export(&workspace,&destination),
- Cmd::Import{workspace,export}=>import_export(s,&workspace,&export),
- Cmd::Layout{command}=>{let path=s.root.join("layouts");match command{LayoutCmd::Branch{workspace,name}=>{if !name_ok(&name){return Err(error("invalid layout name"));}s.record_layout(&workspace)?;git(&path,&["branch","-f",&name,"HEAD"])?;Ok(json!({"branch":name}))},LayoutCmd::Switch{workspace,name}=>{if !name_ok(&name){return Err(error("invalid layout name"));}let data=git(&path,&["show",&format!("{name}:VERSION_MAP")])?;let mut map=Map::parse(std::str::from_utf8(&data)?)?;for m in &mut map.mount{if let Some(c)=m.commit.take(){m.revision=c;}}s.set_draft(&workspace,&toml::to_string_pretty(&map)?)?;Ok(json!({"staged_layout":name,"activate_required":true}))}}},
- Cmd::Bundle{export,destination}=>{let manifest:Value=serde_json::from_slice(&std::fs::read(export.join("gitalator-export.json"))?)?;if destination.exists(){return Err(error("bundle destination exists"));}std::fs::create_dir_all(&destination)?;let dest=std::fs::canonicalize(destination)?;for repo in manifest["repositories"].as_array().ok_or_else(||error("invalid manifest"))?{let path=Path::new(repo["path"].as_str().ok_or_else(||error("missing path"))?);let name=repo["mount"].as_str().unwrap();if !name_ok(name){return Err(error("invalid mount"));}git(path,&["bundle","create",dest.join(format!("{name}.bundle")).to_str().unwrap(),"HEAD"])?;git(path,&["bundle","verify",dest.join(format!("{name}.bundle")).to_str().unwrap()])?;}atomic(&dest.join("gitalator-export.json"),&serde_json::to_vec_pretty(&manifest)?)?;Ok(json!({"bundle_directory":dest}))},
- Cmd::Review{..}=>Err(error("review adapter not implemented; use the exported ordinary Git worktrees and your silo's review tool")),
- Cmd::Gc{dry_run,max_bytes}=>s.gc(dry_run,max_bytes),
- Cmd::Mount{..}|Cmd::Unmount{..}=>Err(error("mount commands are handled locally")),
+    match cmd {
+        Cmd::Init => Ok(json!({"state_dir": s.root, "schema": 1})),
+        Cmd::Config {
+            idle_seconds,
+            max_seconds,
+            cache_bytes,
+        } => {
+            let idle = idle_seconds.unwrap_or(s.setting("snapshot_idle_seconds", 2)? as u64);
+            let max = max_seconds.unwrap_or(s.setting("snapshot_max_seconds", 30)? as u64);
+            let cache = cache_bytes.unwrap_or(s.setting("cache_bytes", 1073741824)? as u64);
+            if idle == 0 || max < idle || max > i64::MAX as u64 || cache > i64::MAX as u64 {
+                return Err(error(
+                    "require 0 < idle <= max <= i64::MAX; cache must fit i64",
+                ));
+            }
+            let mut conn = s.conn()?;
+            let tx = conn.transaction()?;
+            for (key, value) in [
+                ("snapshot_idle_seconds", idle),
+                ("snapshot_max_seconds", max),
+                ("cache_bytes", cache),
+            ] {
+                tx.execute(
+                    "INSERT OR REPLACE INTO settings(key,value) VALUES(?1,?2)",
+                    rusqlite::params![key, value],
+                )?;
+            }
+            tx.commit()?;
+            Ok(json!({"idle_seconds": idle, "max_seconds": max, "cache_bytes": cache}))
+        }
+        Cmd::Doctor => {
+            let integrity: String = s
+                .conn()?
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+            let git_version = String::from_utf8(git(&s.root, &["--version"])?)?;
+            Ok(
+                json!({"database": integrity, "git": git_version, "fuse_device": Path::new("/dev/fuse").exists()}),
+            )
+        }
+        Cmd::Repo { command } => match command {
+            RepoCmd::Add { id, origin } => {
+                let origin = if Path::new(&origin).exists() {
+                    std::fs::canonicalize(&origin)?
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    origin
+                };
+                s.repo_add(&id, &origin)?;
+                Ok(json!({"registered": id}))
+            }
+            RepoCmd::Fetch { id } => {
+                s.fetch(&id)?;
+                Ok(json!({"fetched": id}))
+            }
+            RepoCmd::List => {
+                let c = s.conn()?;
+                let mut q = c.prepare("SELECT id FROM repos ORDER BY id")?;
+                let ids = q
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(json!(ids))
+            }
+        },
+        Cmd::Workspace { command } => match command {
+            WorkspaceCmd::List => Ok(json!(s.names()?)),
+            WorkspaceCmd::Create {
+                name,
+                map,
+                from,
+                snapshot,
+            } => {
+                if let Some(source) = from {
+                    let (revision, draft) = if let Some(number) = snapshot {
+                        s.snapshot_revision(&source, number)?
+                    } else {
+                        (s.head(&source)?, s.draft(&source)?)
+                    };
+                    s.create(&name, &draft)?;
+                    s.conn()?.execute(
+                        "UPDATE workspaces SET head=?2 WHERE name=?1",
+                        rusqlite::params![name, revision],
+                    )?;
+                } else {
+                    let draft = if let Some(path) = map {
+                        std::fs::read_to_string(path)?
+                    } else {
+                        "format = 1\n".into()
+                    };
+                    s.create(&name, &draft)?;
+                }
+                Ok(json!({"workspace": name}))
+            }
+        },
+        Cmd::Status { workspace } => {
+            let (mut map, overlay) = s.state(s.head(&workspace)?)?;
+            let draft = Map::parse(&s.draft(&workspace)?);
+            for mount in &mut map.mount {
+                mount.commit = None;
+            }
+            let valid = draft.is_ok();
+            let differs = draft
+                .map(|m| serde_json::to_string(&m).ok() != serde_json::to_string(&map).ok())
+                .unwrap_or(true);
+            Ok(
+                json!({"workspace": workspace, "head": s.head(&workspace)?, "frozen": s.frozen(&workspace)?, "overlay_entries": overlay.len(), "draft_valid": valid, "draft_differs": differs}),
+            )
+        }
+        Cmd::Diff { workspace } => {
+            let (map, overlay) = s.state(s.head(&workspace)?)?;
+            let rows: Vec<_> = overlay.iter().map(|((id,p),entry)| {
+                let path = map.mount.iter().find(|m| &m.id == id).map(|m| join(&m.path,p));
+                json!({"mount": id, "path": path, "operation": if entry.is_some() {"write"} else {"delete"}, "entry": entry})
+            }).collect();
+            Ok(json!(rows))
+        }
+        Cmd::Map { command } => match command {
+            MapCmd::Show { workspace, active } => {
+                let contents = if active {
+                    toml::to_string_pretty(&s.state(s.head(&workspace)?)?.0)?
+                } else {
+                    s.draft(&workspace)?
+                };
+                Ok(json!({"contents": contents}))
+            }
+            MapCmd::Set { workspace, file } => {
+                s.set_draft(&workspace, &std::fs::read_to_string(file)?)?;
+                Ok(json!({"staged": workspace}))
+            }
+            MapCmd::ImportSuperrepo {
+                workspace,
+                path,
+                revision,
+            } => import_super(s, &workspace, &path, &revision),
+        },
+        Cmd::Snapshot { command } => match command {
+            SnapshotCmd::Create { workspace } => Ok(json!({"number": s.snapshot(&workspace)?})),
+            SnapshotCmd::List { workspace } => Ok(json!(s.snapshots(&workspace)?)),
+            SnapshotCmd::Pin { workspace, number } => {
+                let n = s.conn()?.execute(
+                    "UPDATE snapshots SET pinned=1 WHERE workspace=?1 AND number=?2",
+                    rusqlite::params![workspace, number],
+                )?;
+                if n == 0 {
+                    return Err(error("snapshot not found"));
+                }
+                Ok(json!({"pinned": number}))
+            }
+        },
+        Cmd::Restore { workspace, number } => {
+            s.restore(&workspace, number)?;
+            Ok(json!({"restored": number}))
+        }
+        Cmd::Stash { workspace } => {
+            let guard = s.workspace_lock(&workspace)?;
+            if s.frozen(&workspace)? {
+                return Err(error("activation in progress"));
+            }
+            let number = s.snapshot_unlocked(&workspace)?;
+            let (map, _) = s.state(s.head(&workspace)?)?;
+            s.publish(&workspace, None, &map, &[])?;
+            drop(guard);
+            Ok(json!({"stash_snapshot": number}))
+        }
+        Cmd::Activate {
+            workspace,
+            plan,
+            resume,
+            abort,
+        } => {
+            if plan {
+                return Ok(json!({"proposal": s.activate_plan(&workspace)?}));
+            }
+            if resume || abort {
+                let id: Option<String> = s.conn()?.query_row(
+                    "SELECT activation FROM workspaces WHERE name=?1",
+                    [&workspace],
+                    |r| r.get(0),
+                )?;
+                let id = id.ok_or_else(|| error("no activation in progress"))?;
+                s.finish_activation(&id, abort)?;
+                return Ok(
+                    json!({"transaction": id, "state": if abort {"ABORTED"} else {"COMMITTED"}}),
+                );
+            }
+            let id = s.activate(&workspace)?;
+            let conflicts = s.conflict_list(&id)?;
+            if conflicts.is_empty() {
+                s.finish_activation(&id, false)?;
+            }
+            Ok(
+                json!({"transaction": id, "state": if conflicts.is_empty() {"COMMITTED"} else {"CONFLICTED"}, "conflicts": conflicts}),
+            )
+        }
+        Cmd::Conflicts { transaction } => Ok(json!(s.conflict_list(&transaction)?)),
+        Cmd::Resolve {
+            transaction,
+            mount,
+            path,
+            discard,
+        } => {
+            s.resolve_conflict(&transaction, &mount, &path, discard)?;
+            Ok(json!({"resolved": path}))
+        }
+        Cmd::Export {
+            workspace,
+            destination,
+        } => s.export(&workspace, &destination),
+        Cmd::Import { workspace, export } => import_export(s, &workspace, &export),
+        Cmd::Layout { command } => {
+            let path = s.root.join("layouts");
+            match command {
+                LayoutCmd::Branch { workspace, name } => {
+                    if !name_ok(&name) {
+                        return Err(error("invalid layout name"));
+                    }
+                    s.record_layout(&workspace)?;
+                    git(&path, &["branch", "-f", &name, "HEAD"])?;
+                    Ok(json!({"branch": name}))
+                }
+                LayoutCmd::Switch { workspace, name } => {
+                    if !name_ok(&name) {
+                        return Err(error("invalid layout name"));
+                    }
+                    let bytes = git(&path, &["show", &format!("{name}:VERSION_MAP")])?;
+                    let mut map = Map::parse(std::str::from_utf8(&bytes)?)?;
+                    for m in &mut map.mount {
+                        if let Some(commit) = m.commit.take() {
+                            m.revision = commit;
+                        }
+                    }
+                    s.set_draft(&workspace, &toml::to_string_pretty(&map)?)?;
+                    Ok(json!({"staged_layout": name, "activate_required": true}))
+                }
+            }
+        }
+        Cmd::Bundle {
+            export,
+            destination,
+        } => crate::workflow::bundle(&export, &destination),
+        Cmd::Review { export, publish } => crate::workflow::review(s, &export, publish),
+        Cmd::Land {
+            export,
+            verify_only,
+        } => crate::workflow::land(s, &export, verify_only),
+        Cmd::Gc { dry_run, max_bytes } => s.gc(dry_run, max_bytes),
+        Cmd::Mount { .. } | Cmd::Unmount { .. } => Err(error("mount commands are handled locally")),
+    }
 }
-}
+
 fn import_super(s: &Store, name: &str, path: &Path, revision: &str) -> Result<Value> {
     if revision.starts_with('-') {
         return Err(error("invalid revision"));
@@ -376,6 +608,10 @@ pub fn server(
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    if jobs.len() >= 16 {
+                        let _ = stream.write_all(b"{\"error\":\"control queue busy; retry\"}");
+                        continue;
+                    }
                     let s = store.clone();
                     jobs.push(std::thread::spawn(move || {
                         let result = (|| -> Result<Value> {
@@ -406,4 +642,50 @@ pub fn server(
         }
         let _ = std::fs::remove_file(p);
     }))
+}
+impl Cmd {
+    /// Resolve client-side paths before sending requests to a daemon with a different cwd.
+    pub fn absolutize(&mut self) -> Result<()> {
+        let cwd = std::env::current_dir()?;
+        let absolute = |p: &mut PathBuf| {
+            if p.is_relative() {
+                *p = cwd.join(&*p);
+            }
+        };
+        match self {
+            Self::Mount { path } | Self::Unmount { path } => absolute(path),
+            Self::Workspace {
+                command:
+                    WorkspaceCmd::Create {
+                        map: Some(path), ..
+                    },
+            } => absolute(path),
+            Self::Map {
+                command: MapCmd::Set { file, .. },
+            } => absolute(file),
+            Self::Map {
+                command: MapCmd::ImportSuperrepo { path, .. },
+            } => absolute(path),
+            Self::Export { destination, .. } => absolute(destination),
+            Self::Import { export, .. }
+            | Self::Review { export, .. }
+            | Self::Land { export, .. } => absolute(export),
+            Self::Bundle {
+                export,
+                destination,
+            } => {
+                absolute(export);
+                absolute(destination);
+            }
+            Self::Repo {
+                command: RepoCmd::Add { origin, .. },
+            } if Path::new(origin).exists() => {
+                *origin = std::fs::canonicalize(&*origin)?
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }

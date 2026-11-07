@@ -14,6 +14,21 @@ pub fn hash(b: &[u8]) -> String {
 }
 pub struct Lock(File);
 impl Lock {
+    pub fn try_take(path: &Path) -> Result<Self> {
+        if let Some(p) = path.parent() {
+            fs::create_dir_all(p)?;
+        }
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(error("another daemon already owns this state directory"));
+        }
+        Ok(Self(f))
+    }
     pub fn take(path: &Path) -> Result<Self> {
         if let Some(p) = path.parent() {
             fs::create_dir_all(p)?;
@@ -24,8 +39,23 @@ impl Lock {
             .read(true)
             .write(true)
             .open(path)?;
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+        let start = Instant::now();
+        let timeout = std::env::var("GTL_LOCK_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        loop {
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(err.into());
+            }
+            if start.elapsed() >= std::time::Duration::from_secs(timeout) {
+                return Err(error("resource lock timed out"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Ok(Self(f))
     }
@@ -53,6 +83,7 @@ pub fn atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     f.sync_all()?;
     fs::rename(&temp, path)?;
     File::open(parent)?.sync_all()?;
+    crate::failpoint("payload-after-publish");
     Ok(())
 }
 #[derive(Clone)]
@@ -110,7 +141,7 @@ impl Span {
             .append(true)
             .open(self.root.join("operations.jsonl"))
         {
-            let _ = writeln!(f, "{v}");
+            let _ = f.write_all(format!("{v}\n").as_bytes());
         }
     }
 }

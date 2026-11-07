@@ -12,13 +12,13 @@ use std::{
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum Node {
     Dir,
     Control(String, Control),
     Source(View, String),
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum Control {
     Draft,
     Active,
@@ -34,6 +34,7 @@ struct Handle {
     node: Node,
     entry: Entry,
     bytes: Option<Vec<u8>>,
+    generation: Option<String>,
 }
 pub struct Fs {
     store: Store,
@@ -301,6 +302,24 @@ impl Fs {
         result.dedup();
         Ok(result)
     }
+    fn generation(&self, node: &Node) -> Result<Option<String>> {
+        match node {
+            Node::Source(v, _) => Ok(Some(crate::cache::hash(
+                serde_json::to_string(&self.store.view_state(v)?.0)?.as_bytes(),
+            ))),
+            _ => Ok(None),
+        }
+    }
+    fn handle_bytes(&self, h: &Handle) -> Result<Vec<u8>> {
+        if let Some(b) = &h.bytes {
+            return Ok(b.clone());
+        }
+        if self.generation(&h.node)? != h.generation {
+            return self.store.bytes(&h.entry);
+        }
+        self.read_node(&h.node)
+            .or_else(|_| self.store.bytes(&h.entry))
+    }
     fn read_node(&self, node: &Node) -> Result<Vec<u8>> {
         match node {
             Node::Control(n, c) => self.control(n, c),
@@ -335,6 +354,12 @@ fn errno(e: &(dyn std::error::Error + Send + Sync)) -> i32 {
         libc::EROFS
     } else if s.contains("frozen") || s.contains("boundary") {
         libc::EBUSY
+    } else if s.contains("stale generation") {
+        libc::ESTALE
+    } else if s.contains("already exists") {
+        libc::EEXIST
+    } else if s.contains("is a directory") {
+        libc::EISDIR
     } else if s.contains("invalid") {
         libc::EINVAL
     } else {
@@ -410,6 +435,7 @@ impl Filesystem for Fs {
                     node: Node::Control(p, Control::Draft),
                     entry: e,
                     bytes: Some(b.clone()),
+                    generation: None,
                 });
             }
             let node = self.node(&p)?;
@@ -421,6 +447,7 @@ impl Filesystem for Fs {
                 }
             }
             Ok(Handle {
+                generation: self.generation(&node)?,
                 node,
                 entry: e,
                 bytes: None,
@@ -452,11 +479,7 @@ impl Filesystem for Fs {
                 .handles
                 .get(&fh)
                 .ok_or_else(|| error("invalid handle"))?;
-            if let Some(b) = &h.bytes {
-                return Ok(b.clone());
-            }
-            self.read_node(&h.node)
-                .or_else(|_| self.store.bytes(&h.entry))
+            self.handle_bytes(h)
         })();
         match r {
             Ok(b) => {
@@ -493,12 +516,49 @@ impl Filesystem for Fs {
                 .get(&fh)
                 .ok_or_else(|| error("invalid handle"))?
                 .clone();
-            let mut b = self
-                .read_node(&h.node)
-                .or_else(|_| self.store.bytes(&h.entry))?;
+            if h.bytes.is_none() {
+                if let Node::Source(v, p) = &h.node {
+                    let entry = self.store.write_range(
+                        v,
+                        p,
+                        h.generation
+                            .as_deref()
+                            .ok_or_else(|| error("invalid generation"))?,
+                        offset as usize,
+                        data,
+                    )?;
+                    for handle in self.handles.values_mut() {
+                        if handle.node == h.node {
+                            handle.entry = entry.clone();
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+            if self.generation(&h.node)? != h.generation {
+                return Err(error("stale generation: reopen after activation"));
+            }
+            let mut b = self.handle_bytes(&h)?;
             b.resize(b.len().max(offset as usize + data.len()), 0);
             b[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+            if h.bytes.is_some() {
+                if let Some(handle) = self.handles.get_mut(&fh) {
+                    handle.bytes = Some(b);
+                }
+                return Ok(());
+            }
             self.write_node(&h.node, &b, &h.entry)?;
+            let entry = match &h.node {
+                Node::Source(v, p) => Some(self.store.entry(v, p)?),
+                _ => None,
+            };
+            for handle in self.handles.values_mut() {
+                if handle.node == h.node {
+                    if let Some(e) = &entry {
+                        handle.entry = e.clone();
+                    }
+                }
+            }
             Ok(())
         })();
         match r {
@@ -553,6 +613,7 @@ impl Filesystem for Fs {
                             size: 0,
                         },
                         bytes: Some(vec![]),
+                        generation: None,
                     },
                 ));
             }
@@ -567,6 +628,7 @@ impl Filesystem for Fs {
             Ok((
                 p,
                 Handle {
+                    generation: self.generation(&node)?,
                     node,
                     entry: e,
                     bytes: None,
@@ -629,7 +691,7 @@ impl Filesystem for Fs {
                 return Err(error("is a directory"));
             }
             for h in self.handles.values_mut() {
-                if matches!(&h.node,Node::Source(_,hp) if hp==&path) {
+                if h.node == Node::Source(v.clone(), path.clone()) {
                     h.bytes = Some(self.store.bytes(&e)?);
                 }
             }
@@ -679,6 +741,9 @@ impl Filesystem for Fs {
                     self.temps.remove(&from);
                     return Ok(());
                 }
+                if self.node(&to).is_ok() || Path::new(&from).parent() != Path::new(&to).parent() {
+                    return Err(error("protected mount boundary"));
+                }
                 self.temps.remove(&from);
                 self.temps.insert(to, bytes);
                 return Ok(());
@@ -687,9 +752,10 @@ impl Filesystem for Fs {
             else {
                 return Err(error("protected mount boundary"));
             };
-            if format!("{v:?}") != format!("{v2:?}") {
+            if v != v2 {
                 return Err(error("cross mount"));
             }
+            let _guard = self.store.view_lock(&v)?;
             let (m, _) = self.store.view_state(&v)?;
             if m.owner(&a).map(|o| o.0.id.clone()) != m.owner(&b).map(|o| o.0.id.clone()) {
                 return Err(error("cross mount"));
@@ -710,7 +776,7 @@ impl Filesystem for Fs {
                     changes.push((dest, Some(e.clone())));
                 }
             }
-            self.store.mutate_many(&v, changes)?;
+            self.store.mutate_locked(&v, changes)?;
             for h in self.handles.values_mut() {
                 if let Node::Source(_, hp) = &mut h.node {
                     if hp == &a || hp.starts_with(&(a.clone() + "/")) {
@@ -858,14 +924,31 @@ impl Filesystem for Fs {
 }
 pub fn mount(store: Store, path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
+    let path = std::fs::canonicalize(path)?;
+    if path.starts_with(&store.root) || store.root.starts_with(&path) {
+        return Err(error("mount and state directories must not overlap"));
+    }
+    if std::fs::read_dir(&path)?.next().is_some() {
+        return Err(error("mount directory must be empty"));
+    }
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = stop.clone();
     let auto = store.clone();
     let thread = std::thread::spawn(move || {
+        let mut ticks = 0;
         while !flag.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(1));
             if let Err(e) = auto.auto_snapshots() {
                 eprintln!("automatic snapshot failed: {e}");
+            }
+            ticks += 1;
+            if ticks % 10 == 0 {
+                if let Err(e) = auto
+                    .setting("cache_bytes", 1073741824)
+                    .and_then(|max| auto.gc(false, max as u64))
+                {
+                    eprintln!("cache maintenance failed: {e}");
+                }
             }
         }
     });

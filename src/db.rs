@@ -19,6 +19,8 @@ impl Store {
     pub fn open(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root)?;
         let root = std::fs::canonicalize(root)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         let s = Self {
             cache: Cache::new(root.join("content"))?,
             fetched: Cache::new(root.join("fetched"))?,
@@ -38,6 +40,8 @@ impl Store {
  CREATE TABLE IF NOT EXISTS activations(id TEXT PRIMARY KEY,workspace TEXT NOT NULL,source INTEGER NOT NULL,proposal TEXT NOT NULL,candidate TEXT NOT NULL,conflicts TEXT NOT NULL,state TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS exports(id INTEGER PRIMARY KEY,workspace TEXT NOT NULL,revision INTEGER NOT NULL,path TEXT NOT NULL,manifest TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS objects(repo TEXT NOT NULL,oid TEXT NOT NULL,content TEXT NOT NULL,size INTEGER NOT NULL,accessed INTEGER NOT NULL DEFAULT(unixepoch()),PRIMARY KEY(repo,oid));
+ CREATE TABLE IF NOT EXISTS reviews(export_path TEXT NOT NULL,mount TEXT NOT NULL,branch TEXT NOT NULL,head TEXT NOT NULL,url TEXT,state TEXT NOT NULL,PRIMARY KEY(export_path,mount));
+ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS tree_cache(repo TEXT NOT NULL,tree_key TEXT NOT NULL,data TEXT NOT NULL,PRIMARY KEY(repo,tree_key));
  CREATE TABLE IF NOT EXISTS attributes(path TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,stamp INTEGER NOT NULL);
  PRAGMA user_version=1;COMMIT;")?;
@@ -161,6 +165,7 @@ impl Store {
             "UPDATE workspaces SET head=?2,dirty=1,changed=unixepoch() WHERE name=?1",
             params![name, id],
         )?;
+        crate::failpoint("revision-before-commit");
         t.commit()?;
         Ok(id)
     }
@@ -181,6 +186,7 @@ impl Store {
             "UPDATE workspaces SET dirty=0,last_snapshot=unixepoch() WHERE name=?1",
             [name],
         )?;
+        crate::failpoint("snapshot-before-commit");
         t.commit()?;
         Ok(n)
     }
@@ -201,9 +207,15 @@ impl Store {
     }
     pub fn auto_snapshots(&self) -> Result<()> {
         let c = self.conn()?;
-        let mut q=c.prepare("SELECT name FROM workspaces WHERE dirty=1 AND (unixepoch()-changed>=2 OR unixepoch()-last_snapshot>=30)")?;
+        let mut q=c.prepare("SELECT name FROM workspaces WHERE dirty=1 AND (unixepoch()-changed>=?1 OR unixepoch()-last_snapshot>=?2)")?;
         let names = q
-            .query_map([], |r| r.get::<_, String>(0))?
+            .query_map(
+                params![
+                    self.setting("snapshot_idle_seconds", 2)?,
+                    self.setting("snapshot_max_seconds", 30)?
+                ],
+                |r| r.get::<_, String>(0),
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for n in names {
             self.snapshot(&n)?;
@@ -233,5 +245,16 @@ impl Store {
                 r.get(0)
             })?;
         Ok(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(stamp as u64))
+    }
+}
+impl Store {
+    pub fn setting(&self, key: &str, default: i64) -> Result<i64> {
+        Ok(self
+            .conn()?
+            .query_row("SELECT value FROM settings WHERE key=?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .unwrap_or(default))
     }
 }

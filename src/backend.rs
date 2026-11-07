@@ -6,6 +6,8 @@ use crate::{
     Result,
 };
 use rusqlite::{params, OptionalExtension};
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::{
     collections::BTreeMap,
     io::Write,
@@ -33,17 +35,17 @@ pub fn run(path: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> 
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    if let Some(b) = input {
-        child.stdin.take().unwrap().write_all(b)?;
-    }
-    let out = child.wait_with_output()?;
+    let timeout = std::env::var("GTL_BACKEND_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let out = execute_command(&mut cmd, input, std::time::Duration::from_secs(timeout))?;
     if !out.status.success() {
         return Err(error(format!(
             "git {} failed ({}): {}",
             args.first().unwrap_or(&"operation"),
             out.status,
-            String::from_utf8_lossy(&out.stderr)
+            redact(&String::from_utf8_lossy(&out.stderr))
         )));
     }
     Ok(out.stdout)
@@ -263,23 +265,18 @@ impl Store {
                     .ok_or_else(|| error("invalid LFS size"))?
                     .parse()?;
                 let mut cmd = Command::new("git");
-                let mut child = cmd
-                    .arg("-C")
+                cmd.arg("-C")
                     .arg(self.repo_path(repo))
                     .args(["lfs", "smudge"])
                     .env_remove("GIT_LFS_SKIP_SMUDGE")
                     .env("GIT_TERMINAL_PROMPT", "0")
-                    .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()?;
-                child.stdin.take().unwrap().write_all(&b)?;
-                let output = child.wait_with_output()?;
+                    .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+                let output =
+                    execute_command(&mut cmd, Some(&b), std::time::Duration::from_secs(300))?;
                 if !output.status.success() {
                     return Err(error(format!(
                         "LFS retrieval failed for {repo}:{oid}: {}",
-                        String::from_utf8_lossy(&output.stderr)
+                        redact(&String::from_utf8_lossy(&output.stderr))
                     )));
                 }
                 b = output.stdout;
@@ -297,4 +294,81 @@ impl Store {
             self.cache.get(&e.content)
         }
     }
+}
+/// Drain both pipes concurrently; kill the whole subprocess group on deadline.
+pub fn execute_command(
+    cmd: &mut Command,
+    input: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    cmd.process_group(0)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut b = vec![];
+        stdout.read_to_end(&mut b).map(|_| b)
+    });
+    let err = std::thread::spawn(move || {
+        let mut b = vec![];
+        stderr.read_to_end(&mut b).map(|_| b)
+    });
+    let writer = if let Some(b) = input {
+        let b = b.to_vec();
+        let mut stdin = child.stdin.take().unwrap();
+        Some(std::thread::spawn(move || stdin.write_all(&b)))
+    } else {
+        None
+    };
+    let start = std::time::Instant::now();
+    let (status, timedout) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
+        }
+        if start.elapsed() >= timeout {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            break (child.wait()?, true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let stdout = out.join().map_err(|_| error("stdout worker failed"))??;
+    let stderr = err.join().map_err(|_| error("stderr worker failed"))??;
+    if let Some(w) = writer {
+        let r = w.join().map_err(|_| error("stdin worker failed"))?;
+        if status.success() {
+            r?;
+        }
+    }
+    if timedout {
+        return Err(error(format!(
+            "backend command timed out after {} seconds",
+            timeout.as_secs_f64()
+        )));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+pub fn redact(s: &str) -> String {
+    s.split_whitespace()
+        .map(|word| {
+            if word.contains("://") || word.contains("token=") || word.contains("password=") {
+                "[redacted]"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }

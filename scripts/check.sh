@@ -10,5 +10,6 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 if [[ ${1:-} == --fuse ]]; then
     cargo test --locked --test fuse -- --ignored
+    cargo test --locked --test daemon -- --ignored
     scripts/demo.sh
 fi

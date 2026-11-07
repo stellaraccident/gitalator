@@ -2,10 +2,12 @@
 
 ## Status
 
-Standalone Rust repository, binary `gtl`, initial MVP implemented. Last implementation
-commit: `0bb59e3`; main documentation: `209e229`. This handoff is committed after those.
-The working tree was clean before adding this note. No pushes or remote GitHub
-publication were performed. No background development service needs to be retained.
+Standalone Rust repository, binary `gtl`. User-wide ergonomics now use schema 3,
+shared canonical-origin bare repositories, explicit daemon startup, one-command
+super-repository workspaces, and parallel source/control namespaces. Older state
+must be exported with its matching binary and replaced with fresh state; no
+migration is provided. See Git history for validated implementation milestones.
+No remote publication or user login configuration changes were performed.
 
 Read README.md, docs/architecture.md, docs/workflows.md, docs/operations.md and
 BACKLOG.md. These contain the implementation contract, commands, failure recovery,
@@ -59,7 +61,7 @@ this repo and should be provisioned separately.
 
 ```sh
 cargo build --locked
-target/debug/gtl --state-dir .tmp/doctor-state doctor
+target/debug/gtl --offline --state-dir .tmp/doctor-state doctor
 scripts/check.sh --fuse
 cargo build --release --locked
 ```
@@ -73,7 +75,7 @@ need the debug profile. No actual remote publication/landing was tested.
 
 ## Decisions to preserve
 
-- Per-workspace READONLY and writable depot, with deepest directory-cone ownership.
+- Parallel readonly, writable workspace and control trees, with deepest directory-cone ownership.
   No union of competing files, and no editable hardlinks into backend storage.
 - Editable VERSION_MAP is a proposal. Activation is explicit and uses durable
   freeze/candidate/conflict/publication states. Draft edits remain independent.

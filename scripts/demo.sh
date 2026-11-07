@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 cargo build --locked --quiet
 mkdir -p .tmp
 demo=$(mktemp -d "$PWD/.tmp/demo.XXXXXX")
-gtl="$PWD/target/debug/gtl"
+gtl="${CARGO_TARGET_DIR:-$PWD/target}/debug/gtl"
 state="$demo/state"
 mountpoint="$demo/mount"
 mkdir "$demo/origin" "$mountpoint"
@@ -15,7 +15,11 @@ git -C "$demo/origin" config user.email demo@localhost
 printf 'hello from Git\n' > "$demo/origin/hello.txt"
 git -C "$demo/origin" add hello.txt
 git -C "$demo/origin" commit -qm initial
-run() { "$gtl" --state-dir "$state" "$@"; }
+run() {
+    local offline=()
+    [[ -S "$state/control.sock" || ${1:-} == mount ]] || offline=(--offline)
+    "$gtl" --state-dir "$state" "${offline[@]}" "$@"
+}
 run init
 run repo add local "$demo/origin"
 cat > "$demo/map.toml" <<'MAP'
@@ -36,12 +40,12 @@ cleanup() {
 }
 trap cleanup EXIT
 for ((i=0; i<100; i++)); do
-    [[ -f "$mountpoint/workspaces/dev/depot/hello.txt" ]] && break
+    [[ -f "$mountpoint/workspaces/dev/hello.txt" ]] && break
     kill -0 "$daemon" 2>/dev/null || { cat "$demo/daemon.log"; exit 1; }
     sleep 0.05
 done
-base="$mountpoint/workspaces/dev/READONLY/hello.txt"
-file="$mountpoint/workspaces/dev/depot/hello.txt"
+base="$mountpoint/readonly/dev/hello.txt"
+file="$mountpoint/workspaces/dev/hello.txt"
 [[ $(cat "$file") == 'hello from Git' ]]
 printf 'hello from the workspace\n' > "$file"
 [[ $(cat "$base") == 'hello from Git' ]]

@@ -2,13 +2,44 @@
 
 ## Running and observing
 
-`gtl doctor` reports prerequisites. `gtl mount PATH` stays in the foreground;
-redirect stdout/stderr to a private log when backgrounding it. The daemon owns
-one state directory, serves CLI commands on a private Unix socket, and runs
-periodic snapshot/cache maintenance. CLI commands work directly against the same
-storage while no daemon is present. Interprocess locks remain authoritative.
+`gtl daemon start` explicitly starts the per-state systemd user service and waits
+for the FUSE mount and control endpoint to be ready. Repeated calls return the
+existing daemon; normal startup is quiet for use in `.bashrc`. No shell files are
+edited and the unit is not enabled automatically. Each root gets a distinct unit
+name. Without a user manager, startup fails with an explicit `--detached` suggestion.
+Detached mode uses a new session and a stable working directory; foreground
+`daemon run` and expert `mount PATH` are also supported. No ordinary command
+starts a process or silently falls back to offline mutation. Use `--offline` for
+explicit administration; it requires the exclusive daemon ownership lock.
 
-`operations.jsonl` records timestamps, operation IDs, PID, operation, phase/status, elapsed
+`daemon status` reports readiness, PID, UID, executable, version, startup mode,
+state root, mount, protocol and log locations. The private control socket verifies
+same-UID peers and protocol versions. Startup is serialized; the ownership lock
+remains held through accepted commands and worker drainage. `daemon stop` unmounts
+normally and reports a busy mount; `daemon stop --lazy` explicitly detaches one.
+The systemd unit uses lazy detach for service shutdown. SIGINT/SIGTERM also detach
+and drain. Changing the executable on disk does not upgrade a running daemon.
+
+`STATE/config.toml` is authoritative; missing keys use defaults:
+
+```toml
+# mount = "/absolute/alternate/mount"  # restart required; default STATE/mount
+snapshot_idle_seconds = 2
+snapshot_max_seconds = 30
+cache_bytes = 1073741824
+metadata_cache_bytes = 536870912
+backend_timeout_seconds = 300
+```
+
+Edit the file, then `gtl daemon reload`. Unknown fields, invalid limits, and mount
+changes are rejected before any settings apply. Cache, snapshot and Git deadline
+limits apply live to subsequent work. Existing `gtl config` flags atomically update
+this file and derived settings together. Within the state directory, only the
+reserved `STATE/mount` location is mountable; alternate mounts must be outside state. The state root cannot be relocated by
+reload. `--state-dir` selects an independent root at process startup.
+
+`logs/daemon.log` captures lifecycle, reload, activity summaries and errors.
+`logs/operations.jsonl` records timestamps, operation IDs, PID, operation, phase/status, elapsed
 milliseconds, and optional detail. Fetches identify repository aliases; hydration
 identifies object IDs. Commands, fetches and hydration emit explicit succeeded/failed outcomes. Failures
 produce a failed event followed by the span's
@@ -24,10 +55,10 @@ and at most one activity summary every five seconds while work is active (plus a
 completion summary). Summaries show repository IDs and short origins, active counts,
 phases, elapsed time, and completed/failed operations. Warm metadata requests are
 silent. Git transfer progress stays in the detailed log instead of flooding the
-mount console. LFS payload work is also tracked. For this scratch setup:
+mount console. LFS payload work is also tracked. To follow the default store:
 
 ```sh
-tail -F scratch/mount/state/operations.jsonl
+tail -F ~/.gitalator/logs/daemon.log ~/.gitalator/logs/operations.jsonl
 ```
 
 Missing-blob fetches use Git's no-op negotiation, skip recursive submodule fetching
@@ -47,7 +78,7 @@ its binary; existing cached repositories do not need to be deleted.
 | Maximum dirty checkpoint interval | 30 seconds | `config --max-seconds N` |
 | Fetched-payload cache target | 1 GiB | `config --cache-bytes N` |
 | Metadata memory budget | 512 MiB | `config --metadata-cache-bytes N` |
-| Backend Git deadline | 300 seconds | `GTL_BACKEND_TIMEOUT_SECS` |
+| Backend Git deadline | 300 seconds | `backend_timeout_seconds` in config (environment override: `GTL_BACKEND_TIMEOUT_SECS`) |
 | Resource-lock wait deadline | 300 seconds | `GTL_LOCK_TIMEOUT_SECS` |
 | GitHub CLI deadline | 120 seconds | fixed in initial adapter |
 
@@ -65,15 +96,13 @@ durable overlays, metadata and logs are outside it.
 
 ## Recovery
 
-1. Stop competing writers. After a daemon crash, unmount with `fusermount3 -u PATH`
-   (use `-uz` only to detach an already-dead mount). Change out of the old mount
-   first. A disconnected endpoint is detected at startup with an explicit recovery
-   message; cached root attributes can briefly hide the disconnect from stat, so
-   startup also checks directory enumeration. Detaching the dead mount permits an
-   immediate restart; waiting for a socket timeout is not necessary.
-2. Restart `gtl --state-dir STATE mount PATH`. Startup acquires the daemon lock and
-   replaces a stale control socket. Merely finding a socket does not prove a live
-   daemon; offline commands deliberately fail rather than bypass it.
+1. After a crash, `gtl daemon start` verifies a disconnected gitalator mount at
+   the configured mountpoint, detaches it while holding the ownership lock, and
+   restarts. It never takes over a live owner or detaches an unidentified mount.
+   Expert `mount PATH` reports stale mounts for explicit recovery with
+   `fusermount3 -uz PATH`. Leave the old tree before continuing work.
+2. Startup replaces a stale socket only under the ownership lock. A protocol
+   mismatch requires stopping the old daemon with its matching binary first.
 3. Inspect `status WORKSPACE`, transaction STATUS/conflicts, and operation logs.
    READY/CONFLICTED candidates remain available. Resolve and `activate --continue`,
    or `activate --abort`. An interrupted PREPARING/FAILED transaction requires abort
@@ -87,10 +116,10 @@ Do not delete cache/database files to fix an error. Back up the **entire** state
 with the daemon stopped, including Git stores and both content areas. A copy of
 `state.sqlite3` alone while WAL writers run is not a safe backup. Exported ordinary
 Git clones/bundles provide an additional, independently inspectable recovery route.
-Schema v1 is migrated transactionally to v2, with a pre-migration SQLite backup
-at `schema-v1-backup.sqlite3`. Stop the old daemon before upgrading; mounted CLI
-clients route to the owning daemon before opening the database. Offline commands
-and mounts require the exclusive daemon ownership lock. Direct library writers
+Schema 3 requires fresh state: old versions fail before store modification. There
+is no automatic migration. Export needed work with the matching old binary, then
+choose a fresh state directory. Offline commands and mounts require the exclusive
+daemon ownership lock. Direct library writers
 using an independently opened Store while mounted are unsupported.
 
 ## Testing discipline
@@ -100,6 +129,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo test --test fuse -- --ignored
+cargo test --test daemon -- --ignored
 scripts/demo.sh
 cargo build --release --locked
 ```
@@ -125,11 +155,12 @@ smallest resource lock, keep network work outside SQL transactions, and add an
 observable failure/reopen test. Use immutable checkpoint IDs across long-running
 operations. Keep tests focused on externally meaningful invariants.
 
-## Initial validation
+## Validation
 
-Validated locally on 2026-11-07: formatting, Clippy with warnings denied, 23 default
-tests, two explicitly enabled mounted FUSE tests, the documented local demo, and
-an optimized release build. Tools on this host: Rust 1.99.1, Git 2.43, Git LFS 3.4.
+Validated locally on 2026-11-07: formatting, Clippy with warnings denied, 56 default
+tests, 11 explicitly enabled mounted FUSE/daemon tests, the local demo, and an
+optimized release build. The systemd launch test uses a fake manager that executes
+the generated unit command; the real user manager was not changed or exercised. Tools on this host: Rust 1.99.1, Git 2.43, Git LFS 3.4.
 No real-remote GitHub publication or landing was exercised.
 
 ## Directory lookup performance
@@ -175,7 +206,7 @@ gtl warmup dev compiler --recursive  # explicit recursive metadata warmup
 gtl --json metrics
 ```
 
-Warmup paths are depot-relative, without `.` or `..`; it does not follow symlinks.
+Warmup paths are workspace-relative, without `.` or `..`; it does not follow symlinks.
 It captures a revision, streams progress to stderr, and returns counts/failures;
 any failures produce a nonzero exit status. Exact sizes are persisted separately
 from evictable payloads. Missing Git objects are fetched in batches; small blobs
@@ -191,14 +222,13 @@ and mutable control files are uncached. Files use direct I/O (no mmap/writeback)
 and only immutable snapshot directories enable kernel directory caching.
 
 Restart the mount daemon to use a rebuilt binary. Replacing an executable does not
-upgrade a running process. The migration backup is a database backup, not a substitute
-for a full stopped-daemon state backup.
+upgrade a running process. Keep a full stopped-daemon state backup before destructive changes.
 
 `python3 scripts/benchmark-listings.py /path/to/gtl /new/scratch/directory` builds a
 local fixture and measures 100 iterations in one Python process, without shell or
 process-start timing. The destination must not exist; it retains results and logs.
 The release benchmark on this host measured warm p95 of 0.16 ms for 100 names,
-4.36 ms for 10,000 names, and 2.77 ms for 100 names plus stat. Name-only iterations
+4.15 ms for 10,000 names, and 0.46 ms for 100 names plus stat. Name-only iterations
 performed zero SQL/Git/payload work. Periodic maintenance can increment SQL counters
 independently of measured requests; the metadata regression also checks the no-I/O
 invariant with the maintenance thread absent.

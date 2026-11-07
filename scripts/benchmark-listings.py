@@ -21,7 +21,8 @@ def run(args, **kwargs):
     return subprocess.run(args, check=True, capture_output=True, **kwargs).stdout
 
 def gtl(*args):
-    return json.loads(run([str(binary), '--state-dir', str(state), '--json', *args]))
+    offline = [] if (state / 'control.sock').exists() else ['--offline']
+    return json.loads(run([str(binary), '--state-dir', str(state), '--json', *offline, *args]))
 
 run(['git', 'init', '-b', 'main', str(repo)])
 for directory, count in [('small', 100), ('large', 10000)]:

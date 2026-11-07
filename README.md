@@ -16,10 +16,11 @@ its native Linux mount implementation. GitHub publishing additionally requires
 `gh` and your existing Git/SSH and GitHub authentication.
 
 ```sh
-cargo build --locked
+cargo build --release --locked
 cargo test --locked
 cargo clippy --all-targets -- -D warnings
-cargo test --test fuse -- --ignored    # actual mounts; fails if FUSE unavailable
+cargo test --test fuse -- --ignored
+cargo test --test daemon -- --ignored    # actual mounts; fails if FUSE unavailable
 scripts/demo.sh                       # local repos, mount, edit, snapshot, export
 ```
 
@@ -30,56 +31,80 @@ is installed.
 
 ## First workspace
 
-Use an absolute state path consistently. The mount and state directories must be
-separate, and the mount directory must be empty. State contains private source
-and edits; use a local filesystem with working SQLite locks and fsync.
+Gitalator defaults to `~/.gitalator`, with shared backing repositories and one
+explicitly started user daemon. Run this once (it is safe to repeat in `.bashrc`):
 
 ```sh
-GTL="$PWD/target/debug/gtl"
-STATE="$PWD/.gtl"
-"$GTL" --state-dir "$STATE" init
-"$GTL" --state-dir "$STATE" repo add engine git@github.com:example/engine.git
-cat > VERSION_MAP <<'MAP'
-format = 1
-[[mount]]
-id = "engine"
-repo = "engine"
-path = "src/engine"
-revision = "main"
-MAP
-"$GTL" --state-dir "$STATE" workspace create dev --map VERSION_MAP
-"$GTL" --state-dir "$STATE" activate dev
-mkdir mount
-"$GTL" --state-dir "$STATE" mount "$PWD/mount"  # foreground; second terminal below
+gtl daemon start
 ```
+
+This installs/starts a systemd **user** service with an absolute executable and
+state path. It does not enable login startup or edit shell files. If no user
+manager is available, choose `gtl daemon start --detached` explicitly. For a
+foreground process, use `gtl daemon run`. Ordinary commands never start a daemon.
+
+Create a super-repository workspace, including its immediate submodules:
+
+```sh
+gtl new-workspace dev --from https://github.com/ROCm/TheRock.git --name therock
+cd "$(gtl dir top --workspace dev)"
+# Optional: put a convenient symlink outside ~/.gitalator.
+ln -s "$(gtl dir top --workspace dev)" ~/therock-dev
+```
+
+Creation prints the workspace path; fetch progress goes to stderr. It resolves the
+super-repository's default branch (override with `--revision`) and exact committed
+submodule pins. `--no-submodules` creates just the super-repository mount. There
+is no checked-out intermediate clone. Matching canonical origins share one bare
+repository across workspaces; SSH and HTTPS identities remain distinct.
+
+```sh
+gtl new-workspace experiment --like dev   # same active pins, clean edits/draft
+gtl new-workspace replica --clone dev    # same pins, edits and staged draft
+gtl submodules expand --workspace dev    # discover one further level
+gtl submodules expand --workspace dev --recursive
+cd "$(gtl dir parent)"                    # bounded at the current view root
+```
+
+Expansion reads committed metadata at existing pins; it does not refresh branches.
+It refuses pending map changes and conflicting edits. `--like` and `--clone` create
+independent workspaces without copying snapshot history. `--clone` refuses a source
+with an activation in progress.
 
 Mounted layout:
 
 ```text
-mount/
-  workspaces/dev/
-    VERSION_MAP          editable proposal, including temporarily invalid TOML
-    ACTIVE_VERSION_MAP   resolved, immutable until explicit activation
-    STATUS
-    READONLY/            active base layout, without workspace modifications
-    depot/               writable composed source tree
-  snapshots/dev/1/       immutable VERSION_MAP, ACTIVE_VERSION_MAP, READONLY, depot
-  snapshots/dev/2/       …
-  transactions/<id>/     candidate depot and conflict information
+~/.gitalator/mount/
+  workspaces/dev/therock/              writable sources, including nested mounts
+  readonly/dev/therock/                active base without edits
+  snapshots/dev/1/therock/             immutable checkpoint
+  control/workspaces/dev/             VERSION_MAP, ACTIVE_VERSION_MAP, STATUS
+  control/snapshots/dev/1/             maps and readonly checkpoint base
+  control/transactions/<id>/          conflict information and candidate source/
 ```
 
-Edit `mount/workspaces/dev/depot/...` with ordinary tools. There are no hardlinks
-from editable files into Git storage. Unchanged bytes are fetched on demand;
-local changes have their own durable, immutable content objects.
+Source trees contain no generated control files or implicit `depot` directory.
+Edit with ordinary tools; unchanged contents fetch on demand. Snapshots retain
+local edits independently of evictable fetched payloads.
 
 ```sh
-"$GTL" --state-dir "$STATE" status dev
-"$GTL" --state-dir "$STATE" diff dev
-"$GTL" --state-dir "$STATE" snapshot create dev
-"$GTL" --state-dir "$STATE" snapshot list dev
-"$GTL" --state-dir "$STATE" restore dev 1
-"$GTL" --state-dir "$STATE" unmount "$PWD/mount"
+gtl status dev
+gtl diff dev
+gtl snapshot create dev
+gtl daemon status
+gtl daemon reload                     # validate/apply ~/.gitalator/config.toml
+gtl daemon stop                       # reports busy mounts instead of detaching
+# gtl daemon stop --lazy               # explicit detach, including busy cwd
 ```
+
+Use `--state-dir /absolute/isolated/state` on every command for isolated setups.
+`gtl --offline ...` is explicit administration with the daemon stopped. The default
+mount is `STATE/mount`; `gtl mount /elsewhere` remains a foreground expert option.
+State must live on a local filesystem supporting SQLite locks and fsync.
+
+**This version requires fresh schema-3 state.** Older stores are rejected without
+migration. Stop the old binary before replacing it; keep/export any edits you need,
+then use a fresh state directory. Starting the new daemon does not delete old state.
 
 Snapshots also run automatically while mounted (2 seconds idle, 30 seconds maximum
 between dirty checkpoints). Each successful mutation is already persisted;

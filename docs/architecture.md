@@ -9,7 +9,7 @@ overlay deltas linked to their parent. Base changes/restore flatten that chain i
 a new root. A snapshot references a head plus the draft map, without copying files.
 
 The visible tree is the deepest-owner base union plus that workspace's overlay.
-READONLY uses the same resolved map and an empty overlay. Snapshots use their
+The readonly view uses the same resolved map and an empty overlay. Snapshots use their
 captured map/overlay, independent of later refs or draft changes. Transaction
 candidates have their own map and overlay until publication.
 
@@ -25,18 +25,21 @@ STATE/
   state.sqlite3[-wal,-shm]   versioned schema, WAL + synchronous FULL
   content/objects/<sha256>  durable user changes; never evicted by cache GC
   fetched/objects/<sha256>  verified materialized backend payload cache
-  repos/<id>/           bare Git object databases, promisor fetch configuration
+  repos/<origin-sha256>/    shared bare Git stores, promisor fetch configuration
   layouts/                 local Git history of resolved maps
   locks/                   process-shared resource locks
-  operations.jsonl         append-only structured operation events
+  config.toml              authoritative user configuration
+  logs/operations.jsonl    rotated structured operation events
+  logs/daemon.log          rotated lifecycle/activity/error log
+  mount/                   source and parallel control views
   control.sock             mode-0600 daemon control channel
 ```
 
 The state root is mode 0700. SQLite stores repository registry, revisions,
 workspaces, snapshots, activation candidates/conflicts, exports/review receipts,
 Git object-to-payload mappings, immutable tree metadata, stable stat fingerprints,
-and settings. Schema `user_version=1` is the initial format; newer unsupported
-versions fail. Do not edit the database while a daemon is running.
+and settings. Schema `user_version=3` is required; older and newer unsupported
+versions fail without migration. Do not edit the database while a daemon is running.
 
 Payload publication writes a unique temporary file, fsyncs it, renames it, then
 fsyncs the parent directory. SHA-256 is checked on reads and publication. Only then
@@ -79,15 +82,22 @@ workspace lock, then checks that the staged proposal still matches. Candidate
 preparation happens after durable freezing and outside the workspace lock.
 Final map+overlay publication and unfreezing are one database transaction.
 
-The FUSE adapter currently processes callbacks serially: a cold read can delay
-other filesystem calls even though control-plane backend operations run in
-parallel. This is a known MVP performance limit, not a global backend lock.
+The FUSE dispatch thread serves warm metadata directly. Four bounded workers handle
+cold metadata and reads; backend activity does not block unrelated warm callbacks.
+Shutdown drains accepted control requests and workers before releasing ownership.
+`src/namespace.rs` defines the live, readonly, snapshot and parallel control paths.
+
+Workspace creation resolves remote metadata before publishing a destination.
+`--like`/`--clone` capture source state under its workspace lock, then publish a new
+root revision and draft in one transaction. Submodule expansion captures exact
+pins and uses a head/draft comparison before publishing, avoiding lost edits or
+accidental branch refresh during long fetches.
 
 ## Activation recovery
 
 Transactions progress PREPARING → READY/CONFLICTED → COMMITTED, or FAILED/ABORTED.
 The source head, proposed map, candidate overlay, and conflicts are durable.
-A conflicted transaction is editable through its candidate depot. Completion
+A conflicted transaction is editable through its candidate source tree. Completion
 checks the source head and unresolved conflicts before atomic publication.
 Aborting releases the workspace and retains transaction/recovery history.
 

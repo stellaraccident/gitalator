@@ -33,12 +33,16 @@ pub struct Record {
     pub editing: bool,
     #[serde(default)]
     pub edit_token: Option<String>,
+    #[serde(default)]
+    pub initializing: bool,
 }
 pub struct Workspace {
     pub root: PathBuf,
     pub record: Record,
     pub base: BTreeMap<String, Base>,
     pub handles: usize,
+    pub listed: Mutex<std::collections::BTreeSet<String>>,
+    pub present: Mutex<std::collections::HashSet<String>>,
 }
 pub struct Store {
     pub root: PathBuf,
@@ -115,9 +119,25 @@ impl Store {
                 record,
                 base: BTreeMap::new(),
                 handles: 0,
+                listed: Default::default(),
+                present: Default::default(),
             };
             w.recover()?;
             w.base = s.load_base(&w.record.map)?;
+            if w.record.initializing {
+                let recovery = s.materialize_depot(&w).and_then(|_| w.validate());
+                match recovery {
+                    Ok(()) => {
+                        w.record.initializing = false;
+                        w.record.editing = false;
+                        w.record.edit_token = None;
+                    }
+                    Err(e) => eprintln!(
+                        "gtl: workspace {} initialization remains suspended: {e}",
+                        w.record.name
+                    ),
+                }
+            }
             if !w.record.editing {
                 w.validate()?;
             }
@@ -139,6 +159,11 @@ impl Store {
             git::run(&p, &["init", "--bare"])?;
             git::run(&p, &["remote", "add", "origin", url])?;
         }
+        git::run(&p, &["config", "remote.origin.promisor", "true"])?;
+        git::run(
+            &p,
+            &["config", "remote.origin.partialclonefilter", "blob:none"],
+        )?;
         Ok(id)
     }
     pub fn fetch(&self, id: &str, revision: &str) -> Result<String> {
@@ -148,7 +173,12 @@ impl Store {
         let _l = Lock::take(&self.root.join("locks").join(id))?;
         let p = self.root.join("repos").join(id);
         if oid(revision)
-            && git::run(&p, &["cat-file", "-e", &format!("{revision}^{{commit}}")]).is_ok()
+            && git::local(
+                &p,
+                &["cat-file", "-e", &format!("{revision}^{{commit}}")],
+                None,
+            )
+            .is_ok()
         {
             return Ok(revision.into());
         }
@@ -156,6 +186,8 @@ impl Store {
             &p,
             &[
                 "fetch",
+                "--filter=blob:none",
+                "--recurse-submodules=no",
                 "--no-tags",
                 "--no-auto-maintenance",
                 "origin",
@@ -216,7 +248,7 @@ impl Store {
                     }
                     _ => return Err(error("unsupported Git entry")),
                 };
-                if !valid_path(p) || p.split('/').any(|c| RESERVED.contains(&c)) {
+                if !valid_path(p) {
                     return Err(error("reserved/unsupported component path"));
                 }
                 out.insert(
@@ -245,6 +277,21 @@ impl Store {
                 p = parent.parent();
             }
         }
+        for (path, entry) in &out {
+            if map.reserved(path) {
+                return Err(error(
+                    "component collides with generated discovery metadata",
+                ));
+            }
+            if entry.kind != Kind::Directory
+                && map
+                    .mounts
+                    .iter()
+                    .any(|m| m.path != *path && under(&m.path, path))
+            {
+                return Err(error("mount parent is not a directory"));
+            }
+        }
         Ok(out)
     }
     pub fn create(&mut self, name_: &str, url: &str, revision: &str) -> Result<String> {
@@ -263,20 +310,6 @@ impl Store {
         let root = self.root.join("workspaces").join(&id);
         fs::create_dir(&root)?;
         let branch = format!("workspaces/{id}");
-        {
-            let _l = Lock::take(&self.root.join("locks").join(&repo))?;
-            git::run(
-                &bare,
-                &[
-                    "worktree",
-                    "add",
-                    "-b",
-                    &branch,
-                    root.join("depot").to_str().unwrap(),
-                    &commit,
-                ],
-            )?;
-        }
         let mut w = Workspace {
             root,
             record: Record {
@@ -288,12 +321,23 @@ impl Store {
                 active_commit: commit,
                 generation: token(),
                 map,
-                editing: false,
-                edit_token: None,
+                editing: true,
+                edit_token: Some(token()),
+                initializing: true,
             },
             base,
             handles: 0,
+            listed: Default::default(),
+            present: Default::default(),
         };
+        w.save()?;
+        crate::failpoint("workspace-record");
+        if let Err(e) = self.materialize_depot(&w) {
+            self.workspaces
+                .insert(name_.into(), Arc::new(Mutex::new(w)));
+            return Err(e);
+        }
+        crate::failpoint("workspace-materialized");
         fs::create_dir_all(w.upper())?;
         fs::create_dir_all(w.tombs())?;
         if let Err(e) = w.validate() {
@@ -303,16 +347,59 @@ impl Store {
                 .insert(name_.into(), Arc::new(Mutex::new(w)));
             return Err(e);
         }
+        w.record.initializing = false;
+        w.record.editing = false;
+        w.record.edit_token = None;
         w.save()?;
         self.workspaces
             .insert(name_.into(), Arc::new(Mutex::new(w)));
         Ok(self.config.mount.join(name_).display().to_string())
     }
+    fn materialize_depot(&self, w: &Workspace) -> Result<()> {
+        if w.depot().join(".git").is_file() {
+            return Ok(());
+        }
+        let bare = self.root.join("repos").join(&w.record.depot_repo);
+        let _l = Lock::take(&self.root.join("locks").join(&w.record.depot_repo))?;
+        if git::run(
+            &bare,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{}", w.record.branch),
+            ],
+        )
+        .is_ok()
+        {
+            git::run(
+                &bare,
+                &[
+                    "worktree",
+                    "add",
+                    w.depot().to_str().unwrap(),
+                    &w.record.branch,
+                ],
+            )?;
+        } else {
+            git::run(
+                &bare,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &w.record.branch,
+                    w.depot().to_str().unwrap(),
+                    &w.record.active_commit,
+                ],
+            )?;
+        }
+        Ok(())
+    }
     pub fn get(&self, n: &str) -> Result<Arc<Mutex<Workspace>>> {
         self.workspaces
             .get(n)
             .cloned()
-            .ok_or_else(|| error("unknown workspace"))
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT).into())
     }
 }
 impl Workspace {
@@ -352,10 +439,13 @@ impl Workspace {
             }
         }
         for p in walk(&self.upper())? {
-            if !valid_path(&p) || p.split('/').any(|c| RESERVED.contains(&c)) {
+            if !valid_path(&p) || self.record.map.reserved(&p) {
                 return Err(error("invalid overlay path"));
             }
             let m = fs::symlink_metadata(self.upper().join(&p))?;
+            if !m.is_dir() && self.record.map.protected(&p) {
+                return Err(error("overlay would hide a mount root"));
+            }
             if !m.is_file() && !m.is_dir() && !m.file_type().is_symlink() {
                 return Err(error("unsupported upper file type"));
             }

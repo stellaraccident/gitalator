@@ -177,13 +177,44 @@ impl Workspace {
         let _l = Lock::take(&self.state_root().join("locks").join(&b.repo))?;
         if !target.exists() {
             let repo = self.state_root().join("repos").join(&b.repo);
-            let mut bytes = git::run(&repo, &["cat-file", "blob", &b.oid])?;
+            let mut wanted = vec![b.oid.clone()];
+            let parent = Path::new(p)
+                .parent()
+                .unwrap_or(Path::new(""))
+                .to_str()
+                .unwrap();
+            if self.listed.lock().unwrap().contains(parent) {
+                let present = self.present.lock().unwrap();
+                for (path, sibling) in &self.base {
+                    if wanted.len() >= 256 {
+                        break;
+                    }
+                    if sibling.repo == b.repo
+                        && sibling.kind != Kind::Directory
+                        && Path::new(path).parent() == Path::new(p).parent()
+                        && !present.contains(&sibling.oid)
+                        && !wanted.contains(&sibling.oid)
+                    {
+                        wanted.push(sibling.oid.clone());
+                    }
+                }
+            }
+            if let Err(e) = git::ensure_blobs(&repo, &wanted) {
+                if wanted.len() == 1 {
+                    return Err(e);
+                }
+                wanted.truncate(1);
+                git::ensure_blobs(&repo, &wanted)?;
+            }
+            self.present.lock().unwrap().extend(wanted);
+            let mut bytes = git::local(&repo, &["cat-file", "blob", &b.oid], None)?;
             if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
                 let mut cmd = std::process::Command::new("git");
                 cmd.arg("-C")
                     .arg(&repo)
                     .args(["lfs", "smudge"])
                     .env("GIT_TERMINAL_PROMPT", "0")
+                    .env_remove("GIT_LFS_SKIP_SMUDGE")
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
@@ -194,6 +225,21 @@ impl Workspace {
                 )?;
                 if !result.status.success() {
                     return Err(error("LFS hydration failed"));
+                }
+                let pointer = std::str::from_utf8(&bytes)?;
+                let expected = pointer
+                    .lines()
+                    .find_map(|l| l.strip_prefix("oid sha256:"))
+                    .ok_or("invalid LFS pointer")?;
+                let size: u64 = pointer
+                    .lines()
+                    .find_map(|l| l.strip_prefix("size "))
+                    .ok_or("invalid LFS size")?
+                    .parse()?;
+                if result.stdout.len() as u64 != size
+                    || crate::util::hash(&result.stdout) != expected
+                {
+                    return Err(error("LFS payload integrity mismatch"));
                 }
                 bytes = result.stdout;
             }
@@ -241,6 +287,7 @@ impl Workspace {
                 names.insert(n.into());
             }
         }
+        self.listed.lock().unwrap().insert(p.to_owned());
         Ok(names
             .into_iter()
             .filter(|n| self.direct(&join(p, n)).is_ok())
@@ -270,21 +317,32 @@ impl Workspace {
             return Ok(dst);
         }
         self.parents(p)?;
-        match e.kind {
-            Kind::Directory => fs::create_dir(&dst)?,
+        let pending = match e.kind {
+            Kind::Directory => self.stage(Kind::Directory, e.mode, None)?,
             Kind::Symlink => {
-                symlink(String::from_utf8(e.bytes.ok_or("missing symlink")?)?, &dst)?;
+                use std::os::unix::ffi::OsStrExt;
+                let bytes = e.bytes.ok_or("missing symlink")?;
+                self.stage(
+                    Kind::Symlink,
+                    e.mode,
+                    Some(Path::new(std::ffi::OsStr::from_bytes(&bytes))),
+                )?
             }
             Kind::File => {
-                let bytes = if truncate {
-                    vec![]
-                } else {
-                    fs::read(e.physical.ok_or("missing base")?)?
-                };
-                atomic(&dst, &bytes)?;
-                fs::set_permissions(&dst, fs::Permissions::from_mode(e.mode))?;
+                let pending = self.stage(Kind::File, e.mode, None)?;
+                let staged = self.root.join("pending").join(&pending);
+                if !truncate {
+                    fs::copy(e.physical.ok_or("missing base")?, &staged)?;
+                }
+                fs::set_permissions(&staged, fs::Permissions::from_mode(e.mode))?;
+                File::open(staged)?.sync_all()?;
+                pending
             }
-        }
+        };
+        self.transact(Journal {
+            install: Some((pending, p.into())),
+            ..Default::default()
+        })?;
         Ok(dst)
     }
     pub fn open_file(&self, p: &str, flags: i32) -> Result<File> {
@@ -471,6 +529,11 @@ impl Workspace {
     }
     pub fn revert(&self, p: &str) -> Result<()> {
         self.mutable(p)?;
+        if self.hidden(p)? && self.marker(p)?.is_none() {
+            return Err(error(
+                "path is covered by an ancestor tombstone; revert that ancestor first",
+            ));
+        }
         self.transact(Journal {
             remove: vec![p.into()],
             clear: vec![p.into()],

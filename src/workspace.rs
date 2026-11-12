@@ -42,6 +42,7 @@ impl Workspace {
         self.record.active_commit = git::text(&self.depot(), &["rev-parse", "HEAD"])?;
         self.record.generation = token();
         self.record.editing = false;
+        self.record.initializing = false;
         self.record.edit_token = None;
         self.save()
     }
@@ -74,6 +75,8 @@ impl Workspace {
                 record: self.record.clone(),
                 base: self.base.clone(),
                 handles: 0,
+                listed: Default::default(),
+                present: Default::default(),
             };
             let r = w.validate();
             remove_any(&fake)?;
@@ -84,6 +87,17 @@ impl Workspace {
         }
         result?;
         let staged_entries = git::run(&self.depot(), &["ls-files", "--stage", "-z"])?;
+        let staged_tombs: Vec<String> = staged_entries
+            .split(|b| *b == 0)
+            .filter_map(|row| {
+                std::str::from_utf8(row)
+                    .ok()?
+                    .split_once('\t')?
+                    .1
+                    .strip_prefix("tombstones/")
+                    .map(str::to_string)
+            })
+            .collect();
         let mut normalize = vec![];
         for row in staged_entries.split(|b| *b == 0).filter(|b| !b.is_empty()) {
             let row = std::str::from_utf8(row)?;
@@ -93,6 +107,9 @@ impl Workspace {
                 return Err(error("unmerged index"));
             }
             if let Some(p) = path.strip_prefix("overlay/") {
+                if staged_tombs.iter().any(|t| under(p, t)) {
+                    continue;
+                }
                 if let Some(base) = self.base.get(p) {
                     let mode = match base.kind {
                         Kind::File => {
@@ -105,7 +122,11 @@ impl Workspace {
                         Kind::Symlink => "120000",
                         _ => continue,
                     };
-                    if base.oid == f[1] && mode == f[0] {
+                    if mode == f[0]
+                        && (base.oid == f[1]
+                            || git::run(&self.depot(), &["cat-file", "blob", f[1]])?
+                                == fs::read(self.base_file(p)?)?)
+                    {
                         normalize.push((path.to_string(), p.to_string()));
                     }
                 }
@@ -131,7 +152,7 @@ impl Workspace {
             crate::failpoint("checkpoint-committed");
             for (_, p) in &normalize {
                 if let Ok(e) = self.entry_unchecked(p) {
-                    if self.equal_base(p, &e)? {
+                    if !self.hidden(p)? && self.equal_base(p, &e)? {
                         remove_any(&self.upper().join(p))?;
                     }
                 }
@@ -287,7 +308,7 @@ pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
             let w = get(core, &workspace)?;
             let w = w.lock().unwrap();
             Ok(
-                json!({"record":w.record,"worktree":w.depot(),"git_status":git::text(&w.depot(),&["status","--porcelain"])?}),
+                json!({"record":w.record,"worktree":w.depot(),"git_status":git::text(&w.depot(),&["status","--porcelain"]).unwrap_or_else(|e|format!("unavailable: {e}"))}),
             )
         }
         Cmd::Diff { workspace } => get(core, &workspace)?.lock().unwrap().diff(),

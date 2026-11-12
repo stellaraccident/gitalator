@@ -232,3 +232,79 @@ fn chmod_copyup_and_same_inode_reads() {
     reader.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, b"after");
 }
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn detached_lifecycle_restart_and_configured_mount() {
+    let f = Fixture::new();
+    let mut s = f.store();
+    let mount = f.state.with_file_name("custom-mount");
+    s.config.mount = mount.clone();
+    gitalator::store::json_write(&f.state.join("config.json"), &s.config).unwrap();
+    drop(s);
+    let exe = env!("CARGO_BIN_EXE_gtl");
+    let start = || {
+        Command::new(exe)
+            .arg("--state-dir")
+            .arg(&f.state)
+            .args(["daemon", "start", "--detached"])
+            .output()
+            .unwrap()
+    };
+    let out = start();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::write(mount.join("dev/src/hello"), b"durable dirty").unwrap();
+    daemon::request(
+        &f.state,
+        &Cmd::Daemon {
+            command: DaemonCmd::Stop { lazy: false },
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while f.state.join("control.sock").exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = start();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read(mount.join("dev/src/hello")).unwrap(),
+        b"durable dirty"
+    );
+    daemon::request(
+        &f.state,
+        &Cmd::Daemon {
+            command: DaemonCmd::Stop { lazy: true },
+        },
+    )
+    .unwrap();
+}
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn backing_edit_can_change_file_type() {
+    let m = Mounted::new();
+    assert_eq!(fs::read(m.dev().join("src/hello")).unwrap(), b"hello\n");
+    let info = m.request(Cmd::Depot {
+        command: DepotCmd::Begin {
+            workspace: "dev".into(),
+        },
+    });
+    let work = PathBuf::from(info["worktree"].as_str().unwrap());
+    fs::create_dir_all(work.join("overlay/src")).unwrap();
+    symlink("dir/file", work.join("overlay/src/hello")).unwrap();
+    m.request(Cmd::Depot {
+        command: DepotCmd::End {
+            workspace: "dev".into(),
+            token: info["token"].as_str().unwrap().into(),
+        },
+    });
+    assert_eq!(fs::read(m.dev().join("src/hello")).unwrap(), b"nested\n");
+}

@@ -106,10 +106,18 @@ impl Map {
             .filter(|m| under(p, &m.path))
             .max_by_key(|m| m.path.len())
     }
+    pub fn reserved(&self, p: &str) -> bool {
+        [".depotgit", ".depotstate.json"]
+            .iter()
+            .any(|r| under(p, r))
+            || self.mounts.iter().any(|m| {
+                [".mountgit", ".mountcommit", ".mountstate.json"]
+                    .iter()
+                    .any(|r| under(p, &join(&m.path, r)))
+            })
+    }
     pub fn protected(&self, p: &str) -> bool {
-        p.is_empty()
-            || self.mounts.iter().any(|m| under(&m.path, p))
-            || p.split('/').any(|x| RESERVED.contains(&x))
+        p.is_empty() || self.mounts.iter().any(|m| under(&m.path, p)) || self.reserved(p)
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -243,3 +243,160 @@ fn committed_depot_reconstructs_in_fresh_state() {
     assert_eq!(w.entry("extra").unwrap().mode & 0o111, 0o111);
     assert!(w.entry("other/dir/file").is_ok());
 }
+#[test]
+fn repeated_pins_nested_subtree_and_ordinary_dotfiles() {
+    use gitalator::{git, model::Mount};
+    let f = Fixture::new();
+    std::fs::write(f.component.join("hello"), b"new pin").unwrap();
+    std::fs::write(f.component.join("dir/.mountcommit"), b"source dotfile").unwrap();
+    commit(&f.component);
+    let mut map =
+        Map::parse(&std::fs::read_to_string(f.depot.join("depot.toml")).unwrap()).unwrap();
+    map.mounts[1].commit = git::text(&f.component, &["rev-parse", "HEAD"]).unwrap();
+    map.mounts.push(Mount {
+        id: "nested".into(),
+        repository: "code".into(),
+        commit: map.mounts[0].commit.clone(),
+        path: "src/dir".into(),
+        subtree: "dir".into(),
+    });
+    std::fs::write(f.depot.join("depot.toml"), toml::to_string(&map).unwrap()).unwrap();
+    commit(&f.depot);
+    let s = f.store();
+    let w = s.get("dev").unwrap();
+    let w = w.lock().unwrap();
+    assert_ne!(
+        w.entry("src/.mountcommit").unwrap().bytes,
+        w.entry("other/.mountcommit").unwrap().bytes
+    );
+    assert!(w.entry("src/dir/hello").is_err());
+    assert_eq!(
+        std::fs::read(w.entry("other/dir/.mountcommit").unwrap().physical.unwrap()).unwrap(),
+        b"source dotfile"
+    );
+}
+#[test]
+fn type_replacements_are_reproducible() {
+    let f = Fixture::new();
+    let s = f.store();
+    let w = s.get("dev").unwrap();
+    let w = w.lock().unwrap();
+    w.unlink("src/hello", false).unwrap();
+    w.mkdir("src/hello", 0o755).unwrap();
+    w.create_file("src/hello/child", 0o644).unwrap();
+    w.validate().unwrap();
+    w.unlink("src/hello/child", false).unwrap();
+    w.unlink("src/hello", true).unwrap();
+    w.symlink("src/hello", std::path::Path::new("dir/file"))
+        .unwrap();
+    w.validate().unwrap();
+    assert_eq!(
+        std::fs::read_link(w.upper().join("src/hello")).unwrap(),
+        std::path::Path::new("dir/file")
+    );
+}
+#[test]
+fn invalid_staged_tombstone_is_rejected_before_commit() {
+    use gitalator::git;
+    let f = Fixture::new();
+    let s = f.store();
+    let w = s.get("dev").unwrap();
+    let mut w = w.lock().unwrap();
+    w.unlink("src/hello", false).unwrap();
+    git::run(&w.depot(), &["add", "tombstones"]).unwrap();
+    let bad = b"{\"format\":99}";
+    let oid = String::from_utf8(
+        git::input(&w.depot(), &["hash-object", "-w", "--stdin"], Some(bad)).unwrap(),
+    )
+    .unwrap();
+    git::run(
+        &w.depot(),
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("100644,{},tombstones/src/hello", oid.trim()),
+        ],
+    )
+    .unwrap();
+    assert!(w.checkpoint("invalid").is_err());
+    assert!(!w.record.editing);
+}
+#[test]
+fn clone_excludes_ignored_outputs_and_removal_preserves_branch() {
+    use gitalator::git;
+    let f = Fixture::new();
+    let mut s = f.store();
+    {
+        let w = s.get("dev").unwrap();
+        let w = w.lock().unwrap();
+        std::fs::write(w.depot().join(".gitignore"), "overlay/out/\n").unwrap();
+        w.mkdir("out", 0o755).unwrap();
+        w.create_file("out/obj", 0o644).unwrap();
+    }
+    s.fork("copy", "dev", true).unwrap();
+    {
+        let w = s.get("copy").unwrap();
+        let w = w.lock().unwrap();
+        assert!(!w.upper().join("out/obj").exists());
+    }
+    assert!(s.remove("dev").is_err());
+    s.fork("clean", "dev", false).unwrap();
+    let (repo, branch) = {
+        let w = s.get("clean").unwrap();
+        let w = w.lock().unwrap();
+        (w.record.depot_repo.clone(), w.record.branch.clone())
+    };
+    s.remove("clean").unwrap();
+    assert!(git::run(&s.root.join("repos").join(repo), &["rev-parse", &branch]).is_ok());
+}
+#[test]
+fn local_lfs_payload_and_equal_checkpoint() {
+    use gitalator::git;
+    let f = Fixture::new();
+    git::run(&f.component, &["lfs", "install", "--local", "--skip-repo"]).unwrap();
+    git::run(&f.component, &["lfs", "track", "*.dat"]).unwrap();
+    std::fs::write(f.component.join("asset.dat"), b"expanded LFS payload\n").unwrap();
+    commit(&f.component);
+    let pin = git::text(&f.component, &["rev-parse", "HEAD"]).unwrap();
+    let mut map =
+        Map::parse(&std::fs::read_to_string(f.depot.join("depot.toml")).unwrap()).unwrap();
+    for m in &mut map.mounts {
+        m.commit = pin.clone();
+    }
+    std::fs::write(f.depot.join("depot.toml"), toml::to_string(&map).unwrap()).unwrap();
+    commit(&f.depot);
+    let s = f.store();
+    let w = s.get("dev").unwrap();
+    let mut w = w.lock().unwrap();
+    assert_eq!(
+        std::fs::read(w.entry("src/asset.dat").unwrap().physical.unwrap()).unwrap(),
+        b"expanded LFS payload\n"
+    );
+    w.copy_up("src/asset.dat", false).unwrap();
+    git::run(&w.depot(), &["add", "overlay/src/asset.dat"]).unwrap();
+    w.checkpoint("normalize LFS").unwrap();
+    assert!(!w.upper().join("src/asset.dat").exists());
+}
+#[test]
+fn checkpoint_does_not_normalize_away_opaque_children() {
+    use gitalator::git;
+    use std::io::Write;
+    let f = Fixture::new();
+    let s = f.store();
+    let w = s.get("dev").unwrap();
+    let mut w = w.lock().unwrap();
+    w.unlink("src/dir/file", false).unwrap();
+    w.unlink("src/dir", true).unwrap();
+    w.mkdir("src/dir", 0o755).unwrap();
+    w.create_file("src/dir/file", 0o644)
+        .unwrap()
+        .write_all(b"nested\n")
+        .unwrap();
+    git::run(&w.depot(), &["add", "-A"]).unwrap();
+    w.checkpoint("preserve explicit child").unwrap();
+    assert_eq!(
+        git::run(&w.depot(), &["show", "HEAD:overlay/src/dir/file"]).unwrap(),
+        b"nested\n"
+    );
+    assert!(w.entry("src/dir/file").is_ok());
+}

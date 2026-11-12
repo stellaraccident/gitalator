@@ -121,6 +121,12 @@ pub fn run(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
     input(path, args, None)
 }
 pub fn input(path: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
+    execute(path, args, input, false)
+}
+pub fn local(path: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
+    execute(path, args, input, true)
+}
+fn execute(path: &Path, args: &[&str], input: Option<&[u8]>, local_only: bool) -> Result<Vec<u8>> {
     let mut cmd = Command::new("git");
     cmd.args([
         "-c",
@@ -134,6 +140,7 @@ pub fn input(path: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
     .env("GIT_CONFIG_NOSYSTEM", "1")
     .env("GIT_TERMINAL_PROMPT", "0")
     .env("GIT_LFS_SKIP_SMUDGE", "1")
+    .env("GIT_NO_LAZY_FETCH", if local_only { "1" } else { "0" })
     .env("LC_ALL", "C")
     .stdin(if input.is_some() {
         Stdio::piped()
@@ -154,4 +161,131 @@ pub fn input(path: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
 }
 pub fn text(path: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(run(path, args)?)?.trim_end().to_owned())
+}
+
+/// Probe without network access, including older Git's fatal missing-promisor
+/// behavior. A missing object is not corruption or permission failure.
+pub fn blob_sizes_local(repo: &Path, oids: &[String]) -> Result<Vec<Option<u64>>> {
+    if oids.iter().any(|id| !crate::model::oid(id)) {
+        return Err(error("invalid object ID"));
+    }
+    if oids.is_empty() {
+        return Ok(vec![]);
+    }
+    let input = oids.join("\n") + "\n";
+    let out = match local(repo, &["cat-file", "--batch-check"], Some(input.as_bytes())) {
+        Ok(out) => out,
+        Err(e)
+            if e.to_string().contains("lazy fetching disabled")
+                && e.to_string().contains("from promisor remote") =>
+        {
+            let present = local(
+                repo,
+                &[
+                    "cat-file",
+                    "--batch-check",
+                    "--batch-all-objects",
+                    "--unordered",
+                ],
+                None,
+            )?;
+            let text = std::str::from_utf8(&present)?;
+            let wanted: std::collections::HashSet<_> = oids.iter().map(String::as_str).collect();
+            let found: std::collections::HashMap<_, _> = text
+                .lines()
+                .filter_map(|line| {
+                    let (id, _) = line.split_once(' ')?;
+                    wanted.contains(id).then_some((id, line))
+                })
+                .collect();
+            oids.iter()
+                .map(|id| {
+                    found
+                        .get(id.as_str())
+                        .map(|line| format!("{line}\n"))
+                        .unwrap_or_else(|| format!("{id} missing\n"))
+                })
+                .collect::<String>()
+                .into_bytes()
+        }
+        Err(e) => return Err(e),
+    };
+    let text = std::str::from_utf8(&out)?;
+    let lines: Vec<_> = text.lines().collect();
+    if lines.len() != oids.len() {
+        return Err(error("incomplete blob-size response"));
+    }
+    oids.iter()
+        .zip(lines)
+        .map(|(id, line)| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            match fields.as_slice() {
+                [oid, "missing"] if *oid == id => Ok(None),
+                [oid, "blob", size] if *oid == id => Ok(Some(size.parse()?)),
+                _ => Err(error("invalid blob-size response")),
+            }
+        })
+        .collect()
+}
+/// Call under the shared repository lock. Fetch exact missing objects in one
+/// request; never hydrate a whole commit as a side effect of a local probe.
+pub fn ensure_blobs(repo: &Path, oids: &[String]) -> Result<Vec<u64>> {
+    let mut sizes = blob_sizes_local(repo, oids)?;
+    for attempt in 0..2 {
+        let missing: Vec<_> = oids
+            .iter()
+            .zip(&sizes)
+            .filter(|(_, size)| size.is_none())
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if missing.is_empty() {
+            return Ok(sizes.into_iter().map(Option::unwrap).collect());
+        }
+        let input = missing.join("\n") + "\n";
+        let fetch = input_fetch(repo, input.as_bytes());
+        sizes = blob_sizes_local(repo, oids)?;
+        if sizes.iter().all(Option::is_some) {
+            return Ok(sizes.into_iter().map(Option::unwrap).collect());
+        }
+        let e = fetch
+            .err()
+            .unwrap_or_else(|| error("fetch succeeded but requested blobs remain missing"));
+        let message = e.to_string().to_ascii_lowercase();
+        if attempt == 1
+            || ![
+                "timed out",
+                "connection reset",
+                "connection refused",
+                "could not resolve host",
+                "early eof",
+                "http 503",
+                "http 502",
+                "temporary failure",
+            ]
+            .iter()
+            .any(|p| message.contains(p))
+        {
+            return Err(e);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    unreachable!()
+}
+fn input_fetch(repo: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
+    input(
+        repo,
+        &[
+            "-c",
+            "fetch.negotiationAlgorithm=noop",
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--recurse-submodules=no",
+            "--no-auto-maintenance",
+            "--filter=blob:none",
+            "--stdin",
+            "origin",
+        ],
+        Some(bytes),
+    )
 }

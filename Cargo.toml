@@ -20,6 +20,3 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
-
-[patch.crates-io]
-fuser = { path = "vendor/fuser" }

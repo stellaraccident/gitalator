@@ -44,6 +44,8 @@ pub(crate) fn run_git(
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_LFS_SKIP_SMUDGE", "1")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        // Error classification (including the older-Git fallback) is locale independent.
+        .env("LC_ALL", "C")
         .env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes")
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -592,7 +594,50 @@ impl Store {
             Some(input.as_bytes()),
             None,
             true,
-        )?;
+        );
+        let out = match out {
+            Ok(out) => out,
+            // Older Git (including Ubuntu's 2.43) honors NO_LAZY_FETCH but
+            // terminates batch-check instead of reporting a promised object
+            // as missing. Enumerating only present objects never lazy-fetches.
+            // Keep the selective lookup above as the fast path on newer Git.
+            Err(e)
+                if e.to_string().contains("lazy fetching disabled")
+                    && e.to_string().contains("from promisor remote") =>
+            {
+                let present = run_git(
+                    &self.repo_path(repo)?,
+                    &[
+                        "cat-file",
+                        "--batch-check",
+                        "--batch-all-objects",
+                        "--unordered",
+                    ],
+                    None,
+                    None,
+                    true,
+                )?;
+                let text = std::str::from_utf8(&present)?;
+                let wanted: std::collections::HashSet<_> =
+                    oids.iter().map(String::as_str).collect();
+                let mut found = std::collections::HashMap::new();
+                for line in text.lines() {
+                    if let Some((oid, _)) = line.split_once(' ') {
+                        if wanted.contains(oid) {
+                            found.insert(oid, line);
+                        }
+                    }
+                }
+                oids.iter()
+                    .map(|oid| match found.get(oid.as_str()) {
+                        Some(line) => format!("{line}\n"),
+                        None => format!("{oid} missing\n"),
+                    })
+                    .collect::<String>()
+                    .into_bytes()
+            }
+            Err(e) => return Err(e),
+        };
         parse_blob_sizes(oids, &out)
     }
     pub fn bytes(&self, e: &Entry) -> Result<Vec<u8>> {

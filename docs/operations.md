@@ -149,6 +149,13 @@ using an independently opened Store while mounted are unsupported.
 
 ## Testing discipline
 
+Ubuntu's Git 2.43 can terminate `cat-file --batch-check` when lazy fetching is
+disabled and a promised blob is absent. Gitalator falls back to enumerating
+locally present objects for that diagnostic, then fetches missing blobs through
+the normal locked, batched path. The fallback can scan the whole local object
+store; newer Git (tested with 2.51.2) uses the selective batch lookup directly.
+Other Git errors still propagate. No Git upgrade is required for correctness.
+
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings

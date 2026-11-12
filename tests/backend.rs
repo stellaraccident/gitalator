@@ -274,21 +274,16 @@ fn metadata_fetch_repairs_missing_promised_blobs_and_coalesces_with_reads() {
     // These commits are already present, while their blobs are promised/missing.
     for e in &blobs {
         let oid = e.content.rsplit(':').next().unwrap();
+        // Older Git exits fatally for a missing promised object rather than
+        // emitting a batch "missing" response. Both versions must leave it absent.
         let output = std::process::Command::new("git")
             .arg("-C")
             .arg(s.repo_path("source").unwrap())
-            .args(["cat-file", "--batch-check"])
+            .args(["cat-file", "-e", oid])
             .env("GIT_NO_LAZY_FETCH", "1")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                writeln!(child.stdin.take().unwrap(), "{oid}")?;
-                child.wait_with_output()
-            })
+            .output()
             .unwrap();
-        assert!(String::from_utf8_lossy(&output.stdout).contains("missing"));
+        assert!(!output.status.success());
     }
     // Exercise a repository configured for ordinary skipping negotiation.
     git(

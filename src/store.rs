@@ -1,0 +1,494 @@
+use crate::{
+    error, git,
+    model::*,
+    util::{atomic, hash, Lock},
+    Result,
+};
+use serde::{Deserialize, Serialize};
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub format: u32,
+    pub mount: PathBuf,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Record {
+    pub format: u32,
+    pub id: String,
+    pub name: String,
+    pub depot_repo: String,
+    pub branch: String,
+    pub active_commit: String,
+    pub generation: String,
+    pub map: Map,
+    pub editing: bool,
+}
+pub struct Workspace {
+    pub root: PathBuf,
+    pub record: Record,
+    pub base: BTreeMap<String, Base>,
+    pub handles: usize,
+}
+pub struct Store {
+    pub root: PathBuf,
+    pub config: Config,
+    pub workspaces: BTreeMap<String, Arc<Mutex<Workspace>>>,
+}
+pub fn token() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+pub fn default_root() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".gitalator_state")
+}
+pub fn absolute(p: &Path) -> Result<PathBuf> {
+    if p.is_absolute() {
+        Ok(p.into())
+    } else {
+        Ok(std::env::current_dir()?.join(p))
+    }
+}
+pub fn json_write<T: Serialize>(p: &Path, v: &T) -> Result<()> {
+    atomic(p, &serde_json::to_vec_pretty(v)?)
+}
+impl Store {
+    pub fn open(root: &Path) -> Result<Self> {
+        if root.join("state.sqlite3").exists() {
+            return Err(error("legacy SQLite state is unsupported; choose a fresh --state-dir (old data was not modified)"));
+        }
+        fs::create_dir_all(root)?;
+        let root = fs::canonicalize(root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+        let config = if root.join("config.json").exists() {
+            serde_json::from_slice::<Config>(&fs::read(root.join("config.json"))?)?
+        } else {
+            let def = absolute(&default_root())?;
+            let mount = if root == def {
+                def.parent().unwrap().join("ws")
+            } else {
+                root.join("mount")
+            };
+            let c = Config { format: 1, mount };
+            json_write(&root.join("config.json"), &c)?;
+            c
+        };
+        if config.format != 1 || !config.mount.is_absolute() {
+            return Err(error("invalid state configuration"));
+        }
+        for d in ["repos", "workspaces", "locks", "cache", "logs"] {
+            fs::create_dir_all(root.join(d))?;
+        }
+        let mut s = Self {
+            root,
+            config,
+            workspaces: BTreeMap::new(),
+        };
+        for entry in fs::read_dir(s.root.join("workspaces"))? {
+            let p = entry?.path();
+            if !p.join("workspace.json").exists() {
+                continue;
+            }
+            let record: Record = serde_json::from_slice(&fs::read(p.join("workspace.json"))?)?;
+            if record.format != 1 || !name(&record.name) || s.workspaces.contains_key(&record.name)
+            {
+                return Err(error("invalid workspace record"));
+            }
+            let mut w = Workspace {
+                root: p,
+                record,
+                base: BTreeMap::new(),
+                handles: 0,
+            };
+            w.recover()?;
+            w.base = s.load_base(&w.record.map)?;
+            if !w.record.editing {
+                w.validate()?;
+            }
+            w.record.generation = token();
+            w.save()?;
+            s.workspaces
+                .insert(w.record.name.clone(), Arc::new(Mutex::new(w)));
+        }
+        Ok(s)
+    }
+    pub fn repo(&self, url: &str) -> Result<String> {
+        let id = hash(url.as_bytes());
+        let p = self.root.join("repos").join(&id);
+        let _l = Lock::take(&self.root.join("locks").join(&id))?;
+        if !p.exists() {
+            fs::create_dir(&p)?;
+        }
+        if !p.join("HEAD").exists() {
+            git::run(&p, &["init", "--bare"])?;
+            git::run(&p, &["remote", "add", "origin", url])?;
+        }
+        Ok(id)
+    }
+    pub fn fetch(&self, id: &str, revision: &str) -> Result<String> {
+        if revision.starts_with('-') || revision.is_empty() {
+            return Err(error("invalid revision"));
+        }
+        let _l = Lock::take(&self.root.join("locks").join(id))?;
+        let p = self.root.join("repos").join(id);
+        if oid(revision)
+            && git::run(&p, &["cat-file", "-e", &format!("{revision}^{{commit}}")]).is_ok()
+        {
+            return Ok(revision.into());
+        }
+        git::run(
+            &p,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-auto-maintenance",
+                "origin",
+                revision,
+            ],
+        )?;
+        git::text(&p, &["rev-parse", "FETCH_HEAD^{commit}"])
+    }
+    pub fn load_base(&self, map: &Map) -> Result<BTreeMap<String, Base>> {
+        map.validate()?;
+        let mut out: BTreeMap<String, Base> = BTreeMap::new();
+        let mut mounts = map.mounts.clone();
+        mounts.sort_by_key(|m| m.path.len());
+        for m in &mounts {
+            let id = self.repo(&map.repositories[&m.repository].url)?;
+            self.fetch(&id, &m.commit)?;
+            out.retain(|p, _| !under(p, &m.path));
+            let spec = if m.subtree.is_empty() {
+                format!("{}^{{tree}}", m.commit)
+            } else {
+                format!("{}:{}", m.commit, m.subtree)
+            };
+            let path = self.root.join("repos").join(&id);
+            let tree = git::text(&path, &["rev-parse", &spec])?;
+            if git::text(&path, &["cat-file", "-t", &tree])? != "tree" {
+                return Err(error("mount subtree is not a directory"));
+            }
+            out.insert(
+                m.path.clone(),
+                Base {
+                    kind: Kind::Directory,
+                    mode: 0o755,
+                    oid: tree.clone(),
+                    repo: id.clone(),
+                    mount_id: m.id.clone(),
+                },
+            );
+            let bytes = git::run(&path, &["ls-tree", "-r", "-t", "-z", &tree])?;
+            for line in bytes.split(|b| *b == 0).filter(|b| !b.is_empty()) {
+                let line = std::str::from_utf8(line)?;
+                let (meta, p) = line.split_once('\t').ok_or("bad ls-tree")?;
+                let fields: Vec<_> = meta.split(' ').collect();
+                let kind = match fields[0] {
+                    "040000" => Kind::Directory,
+                    "100644" | "100755" => Kind::File,
+                    "120000" => Kind::Symlink,
+                    "160000" => {
+                        return Err(error(
+                            "gitlinks require explicit mounts; import them into depot.toml",
+                        ))
+                    }
+                    _ => return Err(error("unsupported Git entry")),
+                };
+                if !valid_path(p) || p.split('/').any(|c| RESERVED.contains(&c)) {
+                    return Err(error("reserved/unsupported component path"));
+                }
+                out.insert(
+                    join(&m.path, p),
+                    Base {
+                        kind,
+                        mode: if fields[0] == "100755" { 0o755 } else { 0o644 },
+                        oid: fields[2].into(),
+                        repo: id.clone(),
+                        mount_id: m.id.clone(),
+                    },
+                );
+            }
+        }
+        for m in &mounts {
+            let mut p = Path::new(&m.path).parent();
+            while let Some(parent) = p {
+                let name = parent.to_str().unwrap();
+                out.entry(name.into()).or_insert(Base {
+                    kind: Kind::Directory,
+                    mode: 0o755,
+                    oid: String::new(),
+                    repo: String::new(),
+                    mount_id: String::new(),
+                });
+                p = parent.parent();
+            }
+        }
+        Ok(out)
+    }
+    pub fn create(&mut self, name_: &str, url: &str, revision: &str) -> Result<String> {
+        if !name(name_) || self.workspaces.contains_key(name_) {
+            return Err(error("invalid or existing workspace name"));
+        }
+        let repo = self.repo(url)?;
+        let commit = self.fetch(&repo, revision)?;
+        let bare = self.root.join("repos").join(&repo);
+        let map = Map::parse(&String::from_utf8(git::run(
+            &bare,
+            &["show", &format!("{commit}:depot.toml")],
+        )?)?)?;
+        let base = self.load_base(&map)?;
+        let id = token();
+        let root = self.root.join("workspaces").join(&id);
+        fs::create_dir(&root)?;
+        let branch = format!("workspaces/{id}");
+        {
+            let _l = Lock::take(&self.root.join("locks").join(&repo))?;
+            git::run(
+                &bare,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch,
+                    root.join("depot").to_str().unwrap(),
+                    &commit,
+                ],
+            )?;
+        }
+        let mut w = Workspace {
+            root,
+            record: Record {
+                format: 1,
+                id,
+                name: name_.into(),
+                depot_repo: repo,
+                branch,
+                active_commit: commit,
+                generation: token(),
+                map,
+                editing: false,
+            },
+            base,
+            handles: 0,
+        };
+        fs::create_dir_all(w.upper())?;
+        fs::create_dir_all(w.tombs())?;
+        if let Err(e) = w.validate() {
+            w.record.editing = true;
+            w.save()?;
+            self.workspaces
+                .insert(name_.into(), Arc::new(Mutex::new(w)));
+            return Err(e);
+        }
+        w.save()?;
+        self.workspaces
+            .insert(name_.into(), Arc::new(Mutex::new(w)));
+        Ok(self.config.mount.join(name_).display().to_string())
+    }
+    pub fn get(&self, n: &str) -> Result<Arc<Mutex<Workspace>>> {
+        self.workspaces
+            .get(n)
+            .cloned()
+            .ok_or_else(|| error("unknown workspace"))
+    }
+}
+impl Workspace {
+    pub fn depot(&self) -> PathBuf {
+        self.root.join("depot")
+    }
+    pub fn upper(&self) -> PathBuf {
+        self.depot().join("overlay")
+    }
+    pub fn tombs(&self) -> PathBuf {
+        self.depot().join("tombstones")
+    }
+    pub fn save(&self) -> Result<()> {
+        json_write(&self.root.join("workspace.json"), &self.record)
+    }
+    pub fn check(&self) -> Result<()> {
+        if self.record.editing {
+            return Err(std::io::Error::from_raw_os_error(libc::EBUSY).into());
+        }
+        Ok(())
+    }
+    pub fn validate(&self) -> Result<()> {
+        let map = Map::parse(&fs::read_to_string(self.depot().join("depot.toml"))?)?;
+        if map != self.record.map {
+            return Err(error(
+                "pin/layout changes are deferred; restore the active depot.toml before resuming",
+            ));
+        }
+        for p in walk(&self.upper())? {
+            if !valid_path(&p) || p.split('/').any(|c| RESERVED.contains(&c)) {
+                return Err(error("invalid overlay path"));
+            }
+            let m = fs::symlink_metadata(self.upper().join(&p))?;
+            if !m.is_file() && !m.is_dir() && !m.file_type().is_symlink() {
+                return Err(error("unsupported upper file type"));
+            }
+        }
+        for p in walk(&self.tombs())? {
+            let f = self.tombs().join(&p);
+            if fs::symlink_metadata(&f)?.is_dir() {
+                continue;
+            }
+            if !fs::symlink_metadata(&f)?.is_file() || !valid_path(&p) {
+                return Err(error("invalid tombstone path"));
+            }
+            let t: Tombstone = serde_json::from_slice(&fs::read(&f)?)?;
+            let m = self.record.map.owner(&p).ok_or("tombstone outside mount")?;
+            if t.format != 1
+                || t.mount_id != m.id
+                || t.base_commit != m.commit
+                || !matches!(t.kind.as_str(), "delete" | "opaque")
+                || self.record.map.protected(&p)
+            {
+                return Err(error("invalid tombstone provenance"));
+            }
+            if let Ok(meta) = fs::symlink_metadata(self.upper().join(&p)) {
+                if t.kind != "opaque" || !meta.is_dir() {
+                    return Err(error("contradictory payload and tombstone"));
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn recover(&mut self) -> Result<()> {
+        let p = self.root.join("journal.json");
+        if p.exists() {
+            let j: Journal = serde_json::from_slice(&fs::read(&p)?)?;
+            self.apply(&j)?;
+            fs::remove_file(&p)?;
+        }
+        Ok(())
+    }
+    fn apply(&self, j: &Journal) -> Result<()> {
+        // Redo a metadata/namespace operation after a crash. Payloads are real files.
+        for p in &j.remove {
+            let dst = self.safe(&self.upper(), p)?;
+            remove_any(&dst)?;
+        }
+        for p in &j.clear {
+            let dst = self.safe(&self.tombs(), p)?;
+            remove_any(&dst)?;
+        }
+        for (p, t) in &j.mark {
+            let dst = self.safe(&self.tombs(), p)?;
+            remove_any(&dst)?;
+            json_write(&dst, t)?;
+        }
+        if let Some((src, dst)) = &j.rename {
+            let a = self.safe(&self.upper(), src)?;
+            let b = self.safe(&self.upper(), dst)?;
+            if a.symlink_metadata().is_ok() {
+                fs::create_dir_all(b.parent().unwrap())?;
+                fs::rename(a, b)?;
+            }
+        }
+        Ok(())
+    }
+    pub fn transact(&self, j: Journal) -> Result<()> {
+        let p = self.root.join("journal.json");
+        json_write(&p, &j)?;
+        crate::failpoint("journal-published");
+        self.apply(&j)?;
+        crate::failpoint("journal-applied");
+        fs::remove_file(p)?;
+        fs::File::open(&self.root)?.sync_all()?;
+        Ok(())
+    }
+    pub fn safe(&self, root: &Path, p: &str) -> Result<PathBuf> {
+        if !valid_path(p) {
+            return Err(error("invalid path"));
+        }
+        let mut cur = root.to_path_buf();
+        if let Ok(m) = fs::symlink_metadata(root) {
+            if !m.is_dir() {
+                return Err(error("invalid backing tree"));
+            }
+        }
+        let parts: Vec<_> = p.split('/').filter(|x| !x.is_empty()).collect();
+        for (i, c) in parts.iter().enumerate() {
+            cur.push(c);
+            if i + 1 < parts.len() {
+                if let Ok(m) = fs::symlink_metadata(&cur) {
+                    if !m.is_dir() {
+                        return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into());
+                    }
+                }
+            }
+        }
+        Ok(cur)
+    }
+}
+#[derive(Default, Serialize, Deserialize)]
+pub struct Journal {
+    pub remove: Vec<String>,
+    pub clear: Vec<String>,
+    pub mark: Vec<(String, Tombstone)>,
+    pub rename: Option<(String, String)>,
+}
+pub fn remove_any(p: &Path) -> Result<()> {
+    match fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(p)?,
+        Ok(_) => fs::remove_file(p)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+pub fn walk(root: &Path) -> Result<Vec<String>> {
+    fn go(root: &Path, p: &Path, out: &mut Vec<String>) -> Result<()> {
+        for e in fs::read_dir(p)? {
+            let e = e?;
+            let path = e.path();
+            out.push(
+                path.strip_prefix(root)?
+                    .to_str()
+                    .ok_or("non-UTF8 filenames are not supported")?
+                    .into(),
+            );
+            if e.file_type()?.is_dir() {
+                go(root, &path, out)?;
+            }
+        }
+        Ok(())
+    }
+    let mut out = vec![];
+    if root.exists() {
+        go(root, root, &mut out)?;
+    }
+    out.sort();
+    Ok(out)
+}
+pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for p in walk(src)? {
+        let a = src.join(&p);
+        let b = dst.join(&p);
+        let m = fs::symlink_metadata(&a)?;
+        if m.is_dir() {
+            fs::create_dir_all(&b)?;
+        } else if m.file_type().is_symlink() {
+            symlink(fs::read_link(a)?, b)?;
+        } else if m.is_file() {
+            fs::copy(a, b)?;
+        } else {
+            return Err(error("unsupported file"));
+        }
+    }
+    Ok(())
+}

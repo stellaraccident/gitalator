@@ -7,7 +7,7 @@ use gitalator::{
 use std::{
     fs,
     io::{Read, Write},
-    os::unix::fs::{symlink, PermissionsExt},
+    os::unix::fs::symlink,
     path::PathBuf,
     process::{Child, Command},
     time::{Duration, Instant},
@@ -203,4 +203,32 @@ fn edit_lease_excludes_live_handles_and_other_workspaces_continue() {
         fs::read(m.dev().join("src/hello")).unwrap(),
         b"backing edit"
     );
+}
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn chmod_copyup_and_same_inode_reads() {
+    use std::os::unix::fs::PermissionsExt;
+    let m = Mounted::new();
+    let p = m.dev().join("src/hello");
+    let old = fs::File::open(&p).unwrap();
+    old.set_permissions(fs::Permissions::from_mode(0o755))
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&p).unwrap().permissions().mode() & 0o111,
+        0o111
+    );
+    assert_eq!(
+        fs::metadata(m.dev().join("other/hello"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
+    drop(old);
+    let mut reader = fs::File::open(&p).unwrap();
+    fs::write(&p, b"after").unwrap();
+    let mut bytes = vec![];
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"after");
 }

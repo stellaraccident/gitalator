@@ -203,9 +203,16 @@ impl Store {
                     "100644" | "100755" => Kind::File,
                     "120000" => Kind::Symlink,
                     "160000" => {
+                        if map
+                            .mounts
+                            .iter()
+                            .any(|child| child.path == join(&m.path, p))
+                        {
+                            continue;
+                        }
                         return Err(error(
                             "gitlinks require explicit mounts; import them into depot.toml",
-                        ))
+                        ));
                     }
                     _ => return Err(error("unsupported Git entry")),
                 };
@@ -322,17 +329,27 @@ impl Workspace {
         json_write(&self.root.join("workspace.json"), &self.record)
     }
     pub fn check(&self) -> Result<()> {
-        if self.record.editing {
+        if self.record.editing || self.root.join("journal.json").exists() {
             return Err(std::io::Error::from_raw_os_error(libc::EBUSY).into());
         }
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
+        if !fs::symlink_metadata(self.depot().join("depot.toml"))?.is_file() {
+            return Err(error("depot.toml must be a regular file"));
+        }
         let map = Map::parse(&fs::read_to_string(self.depot().join("depot.toml"))?)?;
         if map != self.record.map {
             return Err(error(
                 "pin/layout changes are deferred; restore the active depot.toml before resuming",
             ));
+        }
+        for root in [self.upper(), self.tombs()] {
+            if let Ok(m) = fs::symlink_metadata(root) {
+                if !m.is_dir() {
+                    return Err(error("backing tree must be a physical directory"));
+                }
+            }
         }
         for p in walk(&self.upper())? {
             if !valid_path(&p) || p.split('/').any(|c| RESERVED.contains(&c)) {
@@ -353,6 +370,10 @@ impl Workspace {
             }
             let t: Tombstone = serde_json::from_slice(&fs::read(&f)?)?;
             let m = self.record.map.owner(&p).ok_or("tombstone outside mount")?;
+            let base = self.base.get(&p).ok_or("tombstone has no base entry")?;
+            if t.base_oid != base.oid || t.base_kind != base.kind {
+                return Err(error("tombstone base identity mismatch"));
+            }
             if t.format != 1
                 || t.mount_id != m.id
                 || t.base_commit != m.commit
@@ -380,7 +401,15 @@ impl Workspace {
     }
     fn apply(&self, j: &Journal) -> Result<()> {
         // Redo a metadata/namespace operation after a crash. Payloads are real files.
+        let renamed = if let Some((src, _)) = &j.rename {
+            fs::symlink_metadata(self.safe(&self.upper(), src)?).is_err()
+        } else {
+            false
+        };
         for p in &j.remove {
+            if renamed && j.rename.as_ref().is_some_and(|(_, dst)| dst == p) {
+                continue;
+            }
             let dst = self.safe(&self.upper(), p)?;
             remove_any(&dst)?;
         }
@@ -390,10 +419,7 @@ impl Workspace {
                 Err(e)
                     if e.downcast_ref::<std::io::Error>()
                         .and_then(|e| e.raw_os_error())
-                        == Some(libc::ENOTDIR) =>
-                {
-                    ()
-                }
+                        == Some(libc::ENOTDIR) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -410,10 +436,52 @@ impl Workspace {
                 fs::rename(a, b)?;
             }
         }
+        if let Some((pending, dst)) = &j.install {
+            if !name(pending) {
+                return Err(error("invalid pending payload"));
+            }
+            let src = self.root.join("pending").join(pending);
+            let dst = self.safe(&self.upper(), dst)?;
+            if fs::symlink_metadata(&src).is_ok() {
+                fs::create_dir_all(dst.parent().unwrap())?;
+                fs::rename(src, dst)?;
+            }
+        }
+        // Sync only touched parent chains, not the entire sparse worktree.
+        let paths: Vec<&str> = j
+            .remove
+            .iter()
+            .chain(&j.clear)
+            .map(String::as_str)
+            .chain(j.mark.iter().map(|(p, _)| p.as_str()))
+            .chain(j.rename.iter().flat_map(|(a, b)| [a.as_str(), b.as_str()]))
+            .chain(j.install.iter().map(|(_, p)| p.as_str()))
+            .collect();
+        for root in [self.upper(), self.tombs()] {
+            for p in &paths {
+                let full = root.join(p);
+                let mut current = Some(full.as_path());
+                while let Some(dir) = current {
+                    if dir.starts_with(&root) && fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+                    {
+                        fs::File::open(dir)?.sync_all()?;
+                    }
+                    if dir == root {
+                        break;
+                    }
+                    current = dir.parent();
+                }
+            }
+        }
         Ok(())
     }
     pub fn transact(&self, j: Journal) -> Result<()> {
         let p = self.root.join("journal.json");
+        if p.exists() {
+            return Err(error(
+                "pending recovery; restart the daemon before more mutations",
+            ));
+        }
         json_write(&p, &j)?;
         crate::failpoint("journal-published");
         self.apply(&j)?;
@@ -452,6 +520,8 @@ pub struct Journal {
     pub clear: Vec<String>,
     pub mark: Vec<(String, Tombstone)>,
     pub rename: Option<(String, String)>,
+    #[serde(default)]
+    pub install: Option<(String, String)>,
 }
 pub fn remove_any(p: &Path) -> Result<()> {
     match fs::symlink_metadata(p) {

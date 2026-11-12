@@ -73,7 +73,15 @@ impl Map {
         let mut ids = BTreeSet::new();
         let mut paths = BTreeSet::new();
         for (id, r) in &self.repositories {
-            if !name(id) || r.url.is_empty() || r.url.starts_with('-') {
+            if !name(id)
+                || r.url.is_empty()
+                || r.url.starts_with('-')
+                || r.url.contains('?')
+                || r.url.contains('#')
+                || r.url
+                    .split_once("://")
+                    .is_some_and(|(_, rest)| rest.split('/').next().unwrap_or("").contains('@'))
+            {
                 return Err(error("invalid repository"));
             }
         }

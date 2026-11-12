@@ -25,6 +25,7 @@ struct Handle {
     bytes: Option<Vec<u8>>,
     directory: Option<Vec<(u64, FileType, String)>>,
     writable: bool,
+    generation: Option<String>,
 }
 #[derive(Default)]
 struct Nodes {
@@ -185,9 +186,14 @@ impl Core {
         e.time = m.modified()?;
         Ok(attr(ino, &e))
     }
-    fn add_handle(&self, mut h: Handle) -> u64 {
+    fn add_handle(&self, mut h: Handle) -> Result<u64> {
         if let Some(w) = &h.workspace {
-            w.lock().unwrap().handles += 1;
+            let mut w = w.lock().unwrap();
+            w.check()?;
+            if h.generation.as_ref() != Some(&w.record.generation) {
+                return Err(io(libc::ESTALE));
+            }
+            w.handles += 1;
         }
         let mut n = self.nodes.lock().unwrap();
         let id = n.next_handle;
@@ -205,13 +211,14 @@ impl Core {
             }
         }
         n.handles.insert(id, h);
-        id
+        Ok(id)
     }
     fn open(&self, ino: u64, flags: i32) -> Result<u64> {
         let p = self.path(ino)?;
         let (w, rel) = self.workspace(&p)?;
         let guard = w.lock().unwrap();
         let e = guard.entry(&rel)?;
+        let generation = Some(guard.record.generation.clone());
         if e.kind != Kind::File {
             return Err(io(libc::EISDIR));
         }
@@ -221,25 +228,27 @@ impl Core {
                 return Err(io(libc::EROFS));
             }
             drop(guard);
-            return Ok(self.add_handle(Handle {
+            return self.add_handle(Handle {
                 ino,
                 workspace: Some(w),
                 file: None,
                 bytes: e.bytes,
                 directory: None,
                 writable: false,
-            }));
+                generation,
+            });
         }
         let f = guard.open_file(&rel, flags)?;
         drop(guard);
-        Ok(self.add_handle(Handle {
+        self.add_handle(Handle {
             ino,
             workspace: Some(w),
             file: Some(f),
             bytes: None,
             directory: None,
             writable,
-        }))
+            generation,
+        })
     }
     fn release(&self, fh: u64) {
         let h = self.nodes.lock().unwrap().handles.remove(&fh);
@@ -428,7 +437,7 @@ impl Filesystem for Fs {
     fn opendir(&mut self, _: &Request<'_>, ino: u64, _: i32, reply: ReplyOpen) {
         let r: Result<_> = (|| {
             let p = self.core.path(ino)?;
-            let (workspace, names) = if p.is_empty() {
+            let (workspace, names, generation) = if p.is_empty() {
                 (
                     None,
                     self.core
@@ -439,11 +448,15 @@ impl Filesystem for Fs {
                         .keys()
                         .cloned()
                         .collect(),
+                    None,
                 )
             } else {
                 let (w, rel) = self.core.workspace(&p)?;
-                let names = w.lock().unwrap().children(&rel)?;
-                (Some(w), names)
+                let guard = w.lock().unwrap();
+                let names = guard.children(&rel)?;
+                let generation = Some(guard.record.generation.clone());
+                drop(guard);
+                (Some(w), names, generation)
             };
             let parent = Path::new(&p)
                 .parent()
@@ -482,14 +495,15 @@ impl Filesystem for Fs {
                 };
                 entries.push((self.core.inode(&child), filetype(&kind), name));
             }
-            Ok(self.core.add_handle(Handle {
+            self.core.add_handle(Handle {
                 ino,
                 workspace,
                 file: None,
                 bytes: None,
                 directory: Some(entries),
                 writable: false,
-            }))
+                generation,
+            })
         })();
         match r {
             Ok(h) => reply.opened(h, 0),
@@ -536,6 +550,7 @@ impl Filesystem for Fs {
             let guard = w.lock().unwrap();
             let file = guard.create_file(&rel, mode & !umask)?;
             let e = guard.entry(&rel)?;
+            let generation = Some(guard.record.generation.clone());
             drop(guard);
             let ino = self.core.inode(&p);
             let fh = self.core.add_handle(Handle {
@@ -545,7 +560,8 @@ impl Filesystem for Fs {
                 bytes: None,
                 directory: None,
                 writable: true,
-            });
+                generation,
+            })?;
             Ok((attr(ino, &e), fh))
         })();
         match r {
@@ -664,38 +680,51 @@ impl Filesystem for Fs {
             {
                 return Err(io(libc::EPERM));
             }
-            if let Some(h) = fh {
-                let n = self.core.nodes.lock().unwrap();
-                let h = n.handles.get(&h).ok_or_else(|| io(libc::EBADF))?;
-                if let Some(f) = &h.file {
-                    if size.is_some() && !h.writable {
+            let f = if let Ok(path) = self.core.path(ino) {
+                let (w, rel) = self.core.workspace(&path)?;
+                let w = w.lock().unwrap();
+                if w.entry(&rel)?.kind == Kind::Symlink {
+                    return Err(io(libc::EOPNOTSUPP));
+                }
+                let dst = w.copy_up(&rel, false)?;
+                let mut n = self.core.nodes.lock().unwrap();
+                if let Some(fh) = fh {
+                    if size.is_some() && !n.handles.get(&fh).is_some_and(|h| h.writable) {
                         return Err(io(libc::EBADF));
                     }
-                    if let Some(size) = size {
-                        f.set_len(size)?;
-                    }
-                    if let Some(mode) = mode {
-                        f.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))?;
-                    }
                 }
+                for h in n
+                    .handles
+                    .values_mut()
+                    .filter(|h| h.ino == ino && h.file.is_some())
+                {
+                    h.file = Some(OpenOptions::new().read(true).write(h.writable).open(&dst)?);
+                }
+                OpenOptions::new()
+                    .read(true)
+                    .write(size.is_some())
+                    .open(dst)?
             } else {
-                let p = self.core.path(ino)?;
-                let (w, rel) = self.core.workspace(&p)?;
-                let w = w.lock().unwrap();
-                let dst = w.copy_up(&rel, false)?;
-                if let Some(mode) = mode {
-                    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(mode & 0o777))?;
+                let n = self.core.nodes.lock().unwrap();
+                let h = n
+                    .handles
+                    .get(&fh.ok_or_else(|| io(libc::ESTALE))?)
+                    .ok_or_else(|| io(libc::EBADF))?;
+                if !h.writable {
+                    return Err(io(libc::EBADF));
                 }
-                if let Some(size) = size {
-                    OpenOptions::new().write(true).open(&dst)?.set_len(size)?;
-                }
+                h.file
+                    .as_ref()
+                    .ok_or_else(|| io(libc::EBADF))?
+                    .try_clone()?
+            };
+            if let Some(size) = size {
+                f.set_len(size)?;
+            }
+            if let Some(mode) = mode {
+                f.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))?;
             }
             if atime.is_some() || mtime.is_some() {
-                let p = self.core.path(ino)?;
-                let (w, rel) = self.core.workspace(&p)?;
-                let w = w.lock().unwrap();
-                let dst = w.copy_up(&rel, false)?;
-                let f = File::open(dst)?;
                 let time = |t: TimeOrNow| match t {
                     TimeOrNow::SpecificTime(t) => t,
                     TimeOrNow::Now => SystemTime::now(),

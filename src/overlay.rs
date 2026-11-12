@@ -306,21 +306,45 @@ impl Workspace {
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?)
     }
+    fn stage(&self, kind: Kind, mode: u32, target: Option<&Path>) -> Result<String> {
+        let id = crate::store::token();
+        let pending = self.root.join("pending");
+        fs::create_dir_all(&pending)?;
+        let path = pending.join(&id);
+        match kind {
+            Kind::Directory => {
+                fs::create_dir(&path)?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode & 0o777))?;
+                File::open(&path)?.sync_all()?;
+            }
+            Kind::Symlink => symlink(target.ok_or("missing symlink target")?, &path)?,
+            Kind::File => {
+                let f = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(mode & 0o777)
+                    .open(&path)?;
+                f.sync_all()?;
+            }
+        }
+        File::open(pending)?.sync_all()?;
+        Ok(id)
+    }
     pub fn create_file(&self, p: &str, mode: u32) -> Result<File> {
         self.mutable(p)?;
         if self.direct(p).is_ok() {
             return Err(io(libc::EEXIST));
         }
         self.parents(p)?;
+        let pending = self.stage(Kind::File, mode, None)?;
         self.transact(Journal {
             clear: vec![p.into()],
+            install: Some((pending, p.into())),
             ..Default::default()
         })?;
         Ok(OpenOptions::new()
             .read(true)
             .write(true)
-            .create_new(true)
-            .mode(mode & 0o777)
             .custom_flags(libc::O_NOFOLLOW)
             .open(self.safe(&self.upper(), p)?)?)
     }
@@ -330,17 +354,18 @@ impl Workspace {
             return Err(io(libc::EEXIST));
         }
         self.parents(p)?;
+        let mut mark = vec![];
         if let Some(mut t) = self.marker(p)? {
             t.kind = "opaque".into();
-            self.transact(Journal {
-                mark: vec![(p.into(), t)],
-                ..Default::default()
-            })?;
+            mark.push((p.into(), t));
         }
-        let dst = self.safe(&self.upper(), p)?;
-        fs::create_dir(&dst)?;
-        fs::set_permissions(dst, fs::Permissions::from_mode(mode & 0o777))?;
-        Ok(())
+        let pending = self.stage(Kind::Directory, mode, None)?;
+        self.transact(Journal {
+            clear: vec![p.into()],
+            mark,
+            install: Some((pending, p.into())),
+            ..Default::default()
+        })
     }
     pub fn symlink(&self, p: &str, target: &Path) -> Result<()> {
         self.mutable(p)?;
@@ -348,12 +373,12 @@ impl Workspace {
             return Err(io(libc::EEXIST));
         }
         self.parents(p)?;
+        let pending = self.stage(Kind::Symlink, 0o777, Some(target))?;
         self.transact(Journal {
             clear: vec![p.into()],
+            install: Some((pending, p.into())),
             ..Default::default()
-        })?;
-        symlink(target, self.safe(&self.upper(), p)?)?;
-        Ok(())
+        })
     }
     pub fn tombstone(&self, p: &str, opaque: bool) -> Result<Option<Tombstone>> {
         if self.hidden(p)? && self.marker(p)?.is_none() {
@@ -441,6 +466,7 @@ impl Workspace {
             clear: vec![src.into(), dst.into()],
             mark,
             rename: Some((src.into(), dst.into())),
+            ..Default::default()
         })
     }
     pub fn revert(&self, p: &str) -> Result<()> {

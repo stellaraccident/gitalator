@@ -119,9 +119,14 @@ impl Workspace {
                     &["update-index", "--force-remove", "--", path],
                 )?;
             }
-            if let Err(e) = git::run(&self.depot(), &["commit", "-m", message]) {
-                git::run(&self.depot(), &["read-tree", &tree])?;
-                return Err(e);
+            let normalized = git::text(&self.depot(), &["write-tree"])?;
+            let current = git::text(&self.depot(), &["rev-parse", "HEAD^{tree}"])?;
+            if normalized != current {
+                if let Err(e) = git::run(&self.depot(), &["commit", "-m", message]) {
+                    git::run(&self.depot(), &["read-tree", &tree])?;
+                    self.end(&session)?;
+                    return Err(e);
+                }
             }
             crate::failpoint("checkpoint-committed");
             for (_, p) in &normalize {
@@ -134,8 +139,7 @@ impl Workspace {
             self.end(&session)?;
             git::text(&self.depot(), &["rev-parse", "HEAD"])
         })();
-        if result.is_err() { /* Persisted edit lease prevents exposing partial checkpoint state. */
-        }
+        // Unexpected failures retain the persisted edit lease for explicit repair.
         result
     }
     fn entry_unchecked(&mut self, p: &str) -> Result<crate::overlay::Entry> {

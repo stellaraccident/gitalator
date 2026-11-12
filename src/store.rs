@@ -382,8 +382,17 @@ impl Workspace {
             remove_any(&dst)?;
         }
         for p in &j.clear {
-            let dst = self.safe(&self.tombs(), p)?;
-            remove_any(&dst)?;
+            match self.safe(&self.tombs(), p) {
+                Ok(dst) => remove_any(&dst)?,
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .and_then(|e| e.raw_os_error())
+                        == Some(libc::ENOTDIR) =>
+                {
+                    ()
+                }
+                Err(e) => return Err(e),
+            }
         }
         for (p, t) in &j.mark {
             let dst = self.safe(&self.tombs(), p)?;

@@ -31,6 +31,8 @@ pub struct Record {
     pub generation: String,
     pub map: Map,
     pub editing: bool,
+    #[serde(default)]
+    pub edit_token: Option<String>,
 }
 pub struct Workspace {
     pub root: PathBuf,
@@ -280,6 +282,7 @@ impl Store {
                 generation: token(),
                 map,
                 editing: false,
+                edit_token: None,
             },
             base,
             handles: 0,

@@ -11,4 +11,8 @@ pub fn failpoint(name: &str) {
         std::process::exit(86);
     }
 }
+pub mod cli;
+pub mod daemon;
 pub mod overlay;
+pub mod vfs;
+pub mod workspace;

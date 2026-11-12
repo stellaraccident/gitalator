@@ -117,54 +117,6 @@ pub fn redact(s: &str) -> String {
         .join(" ")
 }
 
-fn is_oid(revision: &str) -> bool {
-    matches!(revision.len(), 40 | 64) && revision.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-// Show repository identity without URL userinfo, query parameters or fragments.
-fn short_origin(origin: &str) -> String {
-    let clean = origin.split(['?', '#']).next().unwrap_or("");
-    let path = if let Some((scheme, rest)) = clean.split_once("://") {
-        if scheme == "file" {
-            rest.rsplit('/').find(|s| !s.is_empty()).unwrap_or("local")
-        } else {
-            // Discard the authority entirely, including credentials and port.
-            rest.split_once('/')
-                .map(|(_, path)| path)
-                .unwrap_or("remote")
-        }
-    } else if !clean.starts_with('/')
-        && !clean.starts_with("./")
-        && !clean.starts_with("../")
-        && clean.contains(':')
-    {
-        clean.split_once(':').map(|(_, path)| path).unwrap_or(clean)
-    } else {
-        clean.rsplit('/').find(|s| !s.is_empty()).unwrap_or("local")
-    };
-    let path = path.trim_matches('/');
-    path.strip_suffix(".git").unwrap_or(path).to_string()
-}
-
-#[cfg(test)]
-mod progress_label_tests {
-    use super::short_origin;
-    #[test]
-    fn origins_are_short_and_omit_credentials() {
-        for origin in [
-            "https://github.com/ROCm/llvm-project.git",
-            "https://user:secret@github.com/ROCm/llvm-project.git?token=secret#private",
-            "ssh://git@github.com:22/ROCm/llvm-project.git",
-            "git@github.com:ROCm/llvm-project.git",
-        ] {
-            assert_eq!(short_origin(origin), "ROCm/llvm-project");
-        }
-        assert_eq!(short_origin("/tmp/local.git"), "local");
-        assert_eq!(short_origin("file:///tmp/local.git"), "local");
-        assert_eq!(short_origin("https://user:secret@host"), "remote");
-    }
-}
-
 pub fn run(path: &Path, args: &[&str]) -> Result<Vec<u8>> {
     input(path, args, None)
 }

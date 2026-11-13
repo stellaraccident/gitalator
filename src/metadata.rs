@@ -184,7 +184,7 @@ fn read_small(repo: &Path, oids: &[String]) -> Result<HashMap<String, Arc<[u8]>>
 }
 
 #[derive(Default)]
-struct Gate {
+pub(crate) struct Gate {
     state: Mutex<GateState>,
     ready: Condvar,
 }
@@ -193,9 +193,9 @@ struct GateState {
     busy: bool,
     demand: usize,
 }
-struct Permit<'a>(&'a Gate);
+pub(crate) struct Permit<'a>(&'a Gate);
 impl Gate {
-    fn acquire(&self, speculative: bool) -> Result<Permit<'_>> {
+    pub(crate) fn acquire(&self, speculative: bool) -> Result<Permit<'_>> {
         let mut state = self.state.lock().unwrap();
         if !speculative {
             state.demand += 1;

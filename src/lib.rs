@@ -23,3 +23,7 @@ pub mod metadata;
 pub mod agents;
 
 pub mod mounts;
+
+pub mod trees;
+
+pub mod namespace;

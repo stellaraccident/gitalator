@@ -49,6 +49,7 @@ pub struct Workspace {
 #[derive(Clone)]
 pub struct Store {
     pub metadata: Arc<crate::metadata::Metadata>,
+    pub trees: Arc<crate::trees::Trees>,
     pub root: PathBuf,
     pub config: Config,
     pub workspaces: BTreeMap<String, Arc<Mutex<Workspace>>>,
@@ -105,6 +106,7 @@ impl Store {
         }
         let mut s = Self {
             metadata: Default::default(),
+            trees: Arc::new(crate::trees::Trees::new()?),
             root,
             config,
             workspaces: BTreeMap::new(),
@@ -906,7 +908,7 @@ fn index_progress(message: &str) {
     crate::activity::event("info", message);
 }
 
-fn index_jobs() -> Result<usize> {
+pub(crate) fn index_jobs() -> Result<usize> {
     match std::env::var("GTL_INDEX_JOBS") {
         Ok(value) => value
             .parse::<usize>()

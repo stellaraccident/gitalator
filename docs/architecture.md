@@ -185,3 +185,20 @@ preparation cancellation changes neither active layout nor manifest. The index
 and HEAD are untouched, so the user explicitly stages/checkpoints the layout.
 Live clones inherit active uncommitted layout; clean forks use committed layout.
 The import limits are 32 nested levels and 4,096 total mounts.
+
+Daemon startup restores composed base indexes from disposable `STATE/indexes/`
+JSON files keyed by a schema version and the complete version map. Workspaces
+with identical maps reuse the same disk index, including after restart. Pin,
+placement, mount identity, repository URL, and submodule-policy changes select a
+new key. Missing or malformed caches rebuild from Git; caches are published
+atomically. This does not cache mutable overlay/tombstone validation, skip journal
+recovery, or hydrate blob payloads. Deleting `STATE/indexes/` is safe when the
+server is stopped. Different maps currently build separate composed indexes.
+
+Cold namespace validation checks metadata paths and mount ancestors directly in
+the ordered index rather than scanning every file against every mount. Startup
+reports recovery, index restoration/building, directory lookup construction,
+overlay validation, FUSE attachment, workspace elapsed times, and total readiness
+time. A five-second heartbeat covers long phases; interactive stderr and the
+usual activity JSON log receive these events. `daemon start` delegates opening
+state to the daemon instead of also doing it in the launching process.

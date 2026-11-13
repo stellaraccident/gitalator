@@ -70,19 +70,20 @@ pub fn run(root: &Path) -> Result<()> {
         libc::signal(libc::SIGTERM, signal as *const () as usize);
         libc::signal(libc::SIGINT, signal as *const () as usize);
     }
+    let started = Instant::now();
     let startup = crate::activity::Task::new("Open workspace state");
-    let store = {
-        let _context = startup.enter();
-        crate::activity::event("info", "Starting foreground filesystem server");
-        Store::open(&root)?
-    };
-    drop(startup);
+    let startup_context = startup.enter();
+    let startup_progress = StartupProgress::new();
+    crate::activity::event("info", "Starting foreground filesystem server");
+    let store = Store::open(&root)?;
     let mount = store.config.mount.clone();
     std::fs::create_dir_all(&mount)?;
     if std::fs::read_dir(&mount)?.next().is_some() {
         return Err(error("mount destination is not empty"));
     }
     let core = Core::new(Arc::new(Mutex::new(store)));
+    crate::activity::stage("Attach FUSE mount");
+    crate::activity::event("info", "Attach FUSE mount");
     let session = fuser::spawn_mount2(
         Fs::new(core.clone()),
         &mount,
@@ -111,11 +112,15 @@ pub fn run(root: &Path) -> Result<()> {
     crate::activity::event(
         "info",
         &format!(
-            "Ready: mount {}; activity log {}",
+            "Ready in {:.2}s: mount {}; activity log {}",
+            started.elapsed().as_secs_f64(),
             mount.display(),
             root.join("logs/activity.jsonl").display()
         ),
     );
+    drop(startup_progress);
+    drop(startup_context);
+    drop(startup);
     while !stopping.load(Ordering::Acquire) && !STOP.load(Ordering::Acquire) {
         if heartbeat.elapsed() >= Duration::from_secs(5) {
             crate::activity::heartbeat();
@@ -294,7 +299,6 @@ pub fn start(root: &Path, detached: bool) -> Result<Value> {
     let _start = Lock::take(&root.join("start.lock"))?;
     {
         let _ownership = Lock::try_take(&root.join("daemon.lock"))?;
-        Store::open(&root)?;
     }
     let exe = std::env::current_exe()?;
     let mut child = None;
@@ -376,5 +380,36 @@ pub fn start(root: &Path, detached: bool) -> Result<Value> {
             return Err(error("daemon readiness timed out"));
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// Wake immediately on success or failure; never leave a startup reporter behind.
+struct StartupProgress {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl StartupProgress {
+    fn new() -> Self {
+        let (stop, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            while matches!(
+                receive.recv_timeout(Duration::from_secs(5)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                crate::activity::heartbeat();
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+impl Drop for StartupProgress {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
     }
 }

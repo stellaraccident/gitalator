@@ -129,10 +129,25 @@ impl Store {
                 directories: Default::default(),
                 metadata: s.metadata.clone(),
             };
+            let started = std::time::Instant::now();
+            index_progress(&format!(
+                "Open workspace {}: recover journals",
+                w.record.name
+            ));
             w.recover()?;
             w.recover_layout()?;
             w.base = s.load_base(&w.record.map)?;
+            index_progress(&format!(
+                "Workspace {}: build directory lookup ({} entries, {:.2}s)",
+                w.record.name,
+                w.base.len(),
+                started.elapsed().as_secs_f64()
+            ));
             w.directories = directory_index(&w.base);
+            index_progress(&format!(
+                "Workspace {}: validate depot overlay and tombstones",
+                w.record.name
+            ));
             if w.record.initializing {
                 let recovery = s.materialize_depot(&w).and_then(|_| w.validate());
                 match recovery {
@@ -152,6 +167,11 @@ impl Store {
             }
             w.record.generation = token();
             w.save()?;
+            index_progress(&format!(
+                "Workspace {} opened in {:.2}s",
+                w.record.name,
+                started.elapsed().as_secs_f64()
+            ));
             s.workspaces
                 .insert(w.record.name.clone(), Arc::new(Mutex::new(w)));
         }
@@ -207,22 +227,49 @@ impl Store {
     }
     pub fn load_base(&self, map: &Map) -> Result<BTreeMap<String, Base>> {
         map.validate()?;
+        // Fully derived, disposable cache. Include the entire map (including policy,
+        // mount IDs and placement), and bump the schema when composition changes.
+        let key = hash(&serde_json::to_vec(&(1u32, map))?);
+        let cache = self.root.join("indexes").join(format!("{key}.json"));
+        if map.repositories.values().all(|r| {
+            self.root
+                .join("repos")
+                .join(hash(r.url.as_bytes()))
+                .join("HEAD")
+                .is_file()
+        }) {
+            if let Ok(bytes) = fs::read(&cache) {
+                if let Ok(base) = serde_json::from_slice::<BTreeMap<String, Base>>(&bytes) {
+                    index_progress(&format!(
+                        "Restore cached layout index: {} entries",
+                        base.len()
+                    ));
+                    crate::activity::check()?;
+                    return Ok(base);
+                }
+                crate::activity::event("warn", "Invalid layout index cache; rebuilding");
+            }
+        }
+        let base = self.build_base(map)?;
+        crate::activity::check()?;
+        index_progress(&format!("Save layout index: {} entries", base.len()));
+        atomic(&cache, &serde_json::to_vec(&base)?)?;
+        Ok(base)
+    }
+    fn build_base(&self, map: &Map) -> Result<BTreeMap<String, Base>> {
         let mut out: BTreeMap<String, Base> = BTreeMap::new();
         let mut mounts = map.mounts.clone();
         mounts.sort_by_key(|m| m.path.len());
         for (index, m) in mounts.iter().enumerate() {
             crate::activity::check()?;
-            crate::activity::event(
-                "info",
-                &format!(
-                    "Index mount {}/{}: {} at {} ({})",
-                    index + 1,
-                    mounts.len(),
-                    m.id,
-                    if m.path.is_empty() { "/" } else { &m.path },
-                    m.commit
-                ),
-            );
+            index_progress(&format!(
+                "Index mount {}/{}: {} at {} ({})",
+                index + 1,
+                mounts.len(),
+                m.id,
+                if m.path.is_empty() { "/" } else { &m.path },
+                m.commit
+            ));
             let id = self.repo(&map.repositories[&m.repository].url)?;
             self.fetch(&id, &m.commit)?;
             out.retain(|p, _| !under(p, &m.path));
@@ -313,19 +360,35 @@ impl Store {
                 p = parent.parent();
             }
         }
-        for (path, entry) in &out {
-            if map.reserved(path) {
+        index_progress("Validate composed mount namespace");
+        let mut reserved = vec![".depotgit".to_owned(), ".depotstate.json".to_owned()];
+        for m in &mounts {
+            for name in [".mountgit", ".mountcommit", ".mountstate.json"] {
+                reserved.push(join(&m.path, name));
+            }
+            // Only ancestors of a mount can violate this constraint.
+            let mut parent = Path::new(&m.path).parent();
+            while let Some(p) = parent {
+                if out
+                    .get(p.to_str().unwrap())
+                    .is_some_and(|b| b.kind != Kind::Directory)
+                {
+                    return Err(error("mount parent is not a directory"));
+                }
+                parent = p.parent();
+            }
+        }
+        for path in reserved {
+            let prefix = format!("{path}/");
+            if out.contains_key(&path)
+                || out
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|(p, _)| p.starts_with(&prefix))
+            {
                 return Err(error(
                     "component collides with generated discovery metadata",
                 ));
-            }
-            if entry.kind != Kind::Directory
-                && map
-                    .mounts
-                    .iter()
-                    .any(|m| m.path != *path && under(&m.path, path))
-            {
-                return Err(error("mount parent is not a directory"));
             }
         }
         Ok(out)
@@ -779,4 +842,9 @@ pub fn directory_index(base: &BTreeMap<String, Base>) -> BTreeMap<String, Vec<St
             .push(path.clone());
     }
     directories
+}
+
+fn index_progress(message: &str) {
+    crate::activity::stage(message);
+    crate::activity::event("info", message);
 }

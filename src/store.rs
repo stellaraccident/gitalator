@@ -260,88 +260,69 @@ impl Store {
         let mut out: BTreeMap<String, Base> = BTreeMap::new();
         let mut mounts = map.mounts.clone();
         mounts.sort_by_key(|m| m.path.len());
-        for (index, m) in mounts.iter().enumerate() {
+        let jobs = index_jobs()?.min(mounts.len().max(1));
+        index_progress(&format!(
+            "Index {} mounts with {jobs} workers",
+            mounts.len()
+        ));
+        // Bounded ordered windows limit resident uncomposed indexes. Git work runs
+        // concurrently; composition always applies parents before descendants.
+        for (batch, window) in mounts.chunks(jobs).enumerate() {
             crate::activity::check()?;
-            index_progress(&format!(
-                "Index mount {}/{}: {} at {} ({})",
-                index + 1,
-                mounts.len(),
-                m.id,
-                if m.path.is_empty() { "/" } else { &m.path },
-                m.commit
-            ));
-            let id = self.repo(&map.repositories[&m.repository].url)?;
-            self.fetch(&id, &m.commit)?;
-            out.retain(|p, _| !under(p, &m.path));
-            let spec = if m.subtree.is_empty() {
-                format!("{}^{{tree}}", m.commit)
-            } else {
-                format!("{}:{}", m.commit, m.subtree)
-            };
-            let path = self.root.join("repos").join(&id);
-            let commit_time: i64 =
-                git::text(&path, &["show", "-s", "--format=%ct", &m.commit])?.parse()?;
-            let tree = git::text(&path, &["rev-parse", &spec])?;
-            if git::text(&path, &["cat-file", "-t", &tree])? != "tree" {
-                return Err(error("mount subtree is not a directory"));
-            }
-            out.insert(
-                m.path.clone(),
-                Base {
-                    commit_time,
-                    kind: Kind::Directory,
-                    mode: 0o755,
-                    oid: tree.clone(),
-                    repo: id.clone(),
-                    mount_id: m.id.clone(),
-                },
-            );
-            let bytes = git::run(&path, &["ls-tree", "-r", "-t", "-z", &tree])?;
-            for (index, line) in bytes
-                .split(|b| *b == 0)
-                .filter(|b| !b.is_empty())
-                .enumerate()
-            {
-                if index % 1024 == 0 {
-                    crate::activity::check()?;
-                }
-                let line = std::str::from_utf8(line)?;
-                let (meta, p) = line.split_once('\t').ok_or("bad ls-tree")?;
-                let fields: Vec<_> = meta.split(' ').collect();
-                let kind = match fields[0] {
-                    "040000" => Kind::Directory,
-                    "100644" | "100755" => Kind::File,
-                    "120000" => Kind::Symlink,
-                    "160000" => {
-                        if map
-                            .mounts
-                            .iter()
-                            .any(|child| child.path == join(&m.path, p))
-                        {
-                            continue;
-                        }
-                        if m.uninitialized_submodules {
-                            Kind::Directory
-                        } else {
-                            return Err(error("gitlinks require explicit mounts or an explicit uninitialized-submodules policy"));
-                        }
+            let scope = crate::activity::capture();
+            let results = std::thread::scope(|threads| {
+                let workers: Vec<_> = window
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, mount)| {
+                        let scope = scope.clone();
+                        threads.spawn(move || {
+                            let _context = scope.enter();
+                            index_progress(&format!(
+                                "Index mount {}/{}: {} at {} ({})",
+                                batch * jobs + offset + 1,
+                                map.mounts.len(),
+                                mount.id,
+                                if mount.path.is_empty() {
+                                    "/"
+                                } else {
+                                    &mount.path
+                                },
+                                mount.commit
+                            ));
+                            self.index_mount(map, mount)
+                        })
+                    })
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        worker
+                            .join()
+                            .unwrap_or_else(|_| Err(error("mount index worker panicked")))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for (mount, result) in window.iter().zip(results) {
+                crate::activity::check()?;
+                let entries = result?;
+                if mount.path.is_empty() {
+                    out.clear();
+                } else {
+                    out.remove(&mount.path);
+                    let prefix = format!("{}/", mount.path);
+                    let hidden: Vec<_> = out
+                        .range(prefix.clone()..)
+                        .take_while(|(path, _)| path.starts_with(&prefix))
+                        .map(|(path, _)| path.clone())
+                        .collect();
+                    for path in hidden {
+                        out.remove(&path);
                     }
-                    _ => return Err(error("unsupported Git entry")),
-                };
-                if !valid_path(p) {
-                    return Err(error("reserved/unsupported component path"));
                 }
-                out.insert(
-                    join(&m.path, p),
-                    Base {
-                        commit_time,
-                        kind,
-                        mode: if fields[0] == "100755" { 0o755 } else { 0o644 },
-                        oid: fields[2].into(),
-                        repo: id.clone(),
-                        mount_id: m.id.clone(),
-                    },
-                );
+                // extend inserts only this mount's entries; BTreeMap::append can
+                // scan the entire accumulated namespace for each small mount.
+                out.extend(entries);
             }
         }
         for m in &mounts {
@@ -390,6 +371,82 @@ impl Store {
                     "component collides with generated discovery metadata",
                 ));
             }
+        }
+        Ok(out)
+    }
+    fn index_mount(&self, map: &Map, m: &Mount) -> Result<BTreeMap<String, Base>> {
+        let mut out = BTreeMap::new();
+        let id = self.repo(&map.repositories[&m.repository].url)?;
+        self.fetch(&id, &m.commit)?;
+        let spec = if m.subtree.is_empty() {
+            format!("{}^{{tree}}", m.commit)
+        } else {
+            format!("{}:{}", m.commit, m.subtree)
+        };
+        let path = self.root.join("repos").join(&id);
+        let commit_time: i64 =
+            git::text(&path, &["show", "-s", "--format=%ct", &m.commit])?.parse()?;
+        let tree = git::text(&path, &["rev-parse", &spec])?;
+        if git::text(&path, &["cat-file", "-t", &tree])? != "tree" {
+            return Err(error("mount subtree is not a directory"));
+        }
+        out.insert(
+            m.path.clone(),
+            Base {
+                commit_time,
+                kind: Kind::Directory,
+                mode: 0o755,
+                oid: tree.clone(),
+                repo: id.clone(),
+                mount_id: m.id.clone(),
+            },
+        );
+        let bytes = git::run(&path, &["ls-tree", "-r", "-t", "-z", &tree])?;
+        for (index, line) in bytes
+            .split(|b| *b == 0)
+            .filter(|b| !b.is_empty())
+            .enumerate()
+        {
+            if index % 1024 == 0 {
+                crate::activity::check()?;
+            }
+            let line = std::str::from_utf8(line)?;
+            let (meta, p) = line.split_once('\t').ok_or("bad ls-tree")?;
+            let fields: Vec<_> = meta.split(' ').collect();
+            let kind = match fields[0] {
+                "040000" => Kind::Directory,
+                "100644" | "100755" => Kind::File,
+                "120000" => Kind::Symlink,
+                "160000" => {
+                    if map
+                        .mounts
+                        .iter()
+                        .any(|child| child.path == join(&m.path, p))
+                    {
+                        continue;
+                    }
+                    if m.uninitialized_submodules {
+                        Kind::Directory
+                    } else {
+                        return Err(error("gitlinks require explicit mounts or an explicit uninitialized-submodules policy"));
+                    }
+                }
+                _ => return Err(error("unsupported Git entry")),
+            };
+            if !valid_path(p) {
+                return Err(error("reserved/unsupported component path"));
+            }
+            out.insert(
+                join(&m.path, p),
+                Base {
+                    commit_time,
+                    kind,
+                    mode: if fields[0] == "100755" { 0o755 } else { 0o644 },
+                    oid: fields[2].into(),
+                    repo: id.clone(),
+                    mount_id: m.id.clone(),
+                },
+            );
         }
         Ok(out)
     }
@@ -847,4 +904,18 @@ pub fn directory_index(base: &BTreeMap<String, Base>) -> BTreeMap<String, Vec<St
 fn index_progress(message: &str) {
     crate::activity::stage(message);
     crate::activity::event("info", message);
+}
+
+fn index_jobs() -> Result<usize> {
+    match std::env::var("GTL_INDEX_JOBS") {
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=64).contains(n))
+            .ok_or_else(|| error("GTL_INDEX_JOBS must be an integer from 1 through 64")),
+        Err(std::env::VarError::NotPresent) => Ok(std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(8)),
+        Err(_) => Err(error("GTL_INDEX_JOBS must be an integer from 1 through 64")),
+    }
 }

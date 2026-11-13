@@ -240,3 +240,15 @@ candidate is still validated and journaled atomically. Cancellation, metadata
 errors, layout conflicts, process/storage errors, and timeouts are not swallowed.
 Skipped results are returned separately from map changes (`complete`, `skipped`);
 repeating expansion retries omissions without repinning successful mounts.
+
+
+Cold index building runs mount preparation in bounded parallel windows, defaulting
+to min(available CPUs, 8), overridable via `GTL_INDEX_JOBS=1..64`. Each worker
+inherits the operation's activity/cancellation scope. Repository creation/fetch
+retains existing per-repository locks. Completed indexes compose in stable
+parent-before-child order, independent of completion order. Composition looks up
+only the overridden path and slash-prefixed subtree instead of scanning every
+accumulated entry per mount. Pending windows stop on cancellation/errors and no
+composed cache is published on failure. Already-running workers finish or observe
+cancellation before their scoped threads are joined; a window is bounded in mount
+count, not in total tree bytes. The persistent composed-cache format is unchanged.

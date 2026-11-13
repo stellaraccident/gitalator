@@ -336,6 +336,26 @@ Metadata JSON is versioned and reports the active generation and exact mappings.
 Component fetches use Git's `blob:none` filter. Startup indexes pinned trees;
 file content is fetched and materialized only as needed. Immutable composed indexes
 are cached under `STATE/indexes/`, keyed by the complete version map and schema.
+Cold indexing runs independent mount Git/tree work concurrently, with up to eight
+workers by default (bounded by available CPUs). To tune it, set the environment
+on the server or offline command:
+
+```sh
+GTL_INDEX_JOBS=8 gtl daemon run
+# Use 1 for serial indexing; supported values are 1 through 64.
+```
+
+Results are composed deterministically with descendants overriding parents;
+workers share cancellation and retain per-repository fetch locks. Bounded windows
+limit the number of uncomposed indexes held at once. Higher concurrency uses more
+memory and Git processes. This controls indexing, not submodule discovery/import.
+
+A synthetic 679-mount fixture (eight local origins, 64 files per mount) took
+57.19 s to create a cold workspace before this change and 9.53 s with the default
+parallel indexing—about 6× faster, with identical indexes. Cached reopening stayed
+at about 0.09 s. This measures small-tree/process overhead, not network performance
+or the cost of indexing a real forest's larger trees.
+
 Identical maps reuse that disk cache across workspaces and restarts. Changed maps
 select a new cache entry; missing or malformed caches rebuild from Git. Mutable
 overlay/tombstone validation and journal recovery still run on each start.

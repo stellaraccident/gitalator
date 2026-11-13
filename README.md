@@ -16,7 +16,10 @@ The physical depot worktree and the FUSE source tree are separate representation
     tombstones/<virtual-path>        deletion/opacity records
   workspaces/<id>/workspace.json      active map, generation, branch, edit lease
   workspaces/<id>/journal.json        present only during namespace recovery
+  workspaces/<id>/layout.json         present only during layout recovery
   cache/                             disposable materialized base payloads
+  indexes/                           disposable composed indexes keyed by version map
+  logs/activity.jsonl                 structured operation and startup activity
   config.json                        service mount location
   control.sock
 ~/ws/dev/                            normalized composed source tree
@@ -46,27 +49,76 @@ scripts/check.sh              # formatting, Clippy, default tests
 scripts/check.sh --fuse       # also mounted tests and a local demo
 ```
 
+The optimized executable is `target/release/gtl`, or
+`$CARGO_TARGET_DIR/release/gtl` when that variable is set. Put it on your `PATH`
+for the commands below. Use the optimized build when evaluating latency, and
+restart a running server after rebuilding to pick up changes.
+
 Set `CARGO_TARGET_DIR` to keep build outputs outside the checkout if desired.
 Test fixtures and demo artifacts live in ignored `.tmp/`. Tests use local Git
 repositories and never publish to remote services. Mounted tests require actual
 mount permission as well as the FUSE device. Git 2.43 is supported.
 
-## Agent task guides
+## Quick start: empty workspace to TheRock
 
-`gtl agents` lists the embedded task guide. Start with
-`gtl agents workspace-create`; these commands need no server or state directory.
+If a server already owns your state, reuse it. Otherwise, start a foreground
+server in one terminal (no service installation):
 
-With the server running, initialize an empty workspace and a new local depot:
+```sh
+gtl daemon run
+```
+
+Keep it running and use another terminal in the same mount namespace:
 
 ```sh
 gtl workspace init example
+cd ~/ws/example
+gtl mount add https://github.com/ROCm/TheRock.git --at . --submodules none
+ls
+
+# Expand direct submodules now, or choose recursive for all levels.
+gtl mount submodules --at . --depth first-level
 ```
 
-The result reports the composed path, depot checkout, bare repository, and branch.
-No remote or Git author setup is needed for the bootstrap commit. The new depot
-contains only an empty layout manifest; its FUSE view initially has only discovery
-metadata. Use `--offline workspace init example` if the server is stopped, then
-mount later with `daemon run`. Existing workspace names are never overwritten.
+These examples use the default state and mount location. For a custom state, use
+`--state-dir /absolute/path/to/state` consistently in both terminals and use the
+workspace path reported by `workspace init`. See the service configuration below.
+
+Initialization creates a managed bare depot, an empty `depot.toml` commit, and a
+linked workspace checkout on its own branch. No remote, network fetch, or Git
+author setup is needed for that bootstrap commit. The initial FUSE view contains
+only discovery metadata; existing workspace names are never overwritten.
+
+Mount changes activate immediately but remain uncommitted in the depot. Inspect
+and checkpoint the layout when ready:
+
+```sh
+gtl status example
+git -C .depotgit diff -- depot.toml
+git -C .depotgit diff --cached
+gtl depot edit example -- git add depot.toml
+gtl checkpoint example -m 'Add TheRock layout'
+```
+
+Checkpoint needs your Git author identity and includes all staged changes, so
+inspect the index first. `gtl diff example` describes source-overlay changes;
+use the backing Git diff above to inspect the version map itself.
+
+With the server stopped, `gtl --offline workspace init example` creates the
+persistent state for mounting later. `--offline` bypasses the server; it does not
+promise no network access, and it cannot run while the daemon owns that state.
+
+## Agent task guides
+
+The guides are embedded in the executable and need no server or state directory:
+
+```sh
+gtl agents                           # list task chapters
+gtl agents workspace-create
+gtl agents mount-add
+gtl agents mount-remove
+gtl agents mount-submodules
+```
 
 ## Add a repository mount
 
@@ -82,7 +134,12 @@ All imported repositories are pinned to exact commits. Use `--revision` to
 choose the root revision instead of remote HEAD.
 
 The command discovers the current workspace/state, or accepts `--workspace NAME`
-with an explicitly selected state. It activates the validated layout and modifies
+with an explicitly selected state. `--at` is always workspace-relative, even when
+run from a subdirectory; `.` means the workspace root. Only mount commands infer
+state from the current directory: retain your `--state-dir` flag or shell wrapper
+for status, checkpoint, and other commands.
+
+It activates the validated layout and modifies
 `depot.toml` without staging or committing. Existing overlay files stay on top.
 Read `gtl agents mount-add` for verification, checkpointing, and cancellation.
 
@@ -129,7 +186,8 @@ subtree = ""
 under `overlay/` at their virtual paths. Repository URLs must be credential-free;
 authentication belongs to Git's external credential/SSH configuration. Local
 component paths must be absolute. Nested mounts require explicit map entries;
-gitlinks require an explicit mount or the mount's `uninitialized_submodules = true` policy, which exposes them as empty directories.
+gitlinks require an explicit mount or the mount's
+`uninitialized_submodules = true` policy, which exposes them as empty directories.
 
 ```sh
 gtl daemon start                     # one systemd user service for all workspaces
@@ -166,6 +224,10 @@ gtl cancel 42                        # cancel an operation by its reported ID
 tail -f /path/to/state/logs/activity.jsonl
 ```
 
+Startup reports journal recovery, index restoration/building, directory lookup
+construction, overlay validation, FUSE attachment, and total time to readiness.
+Long startup phases emit five-second heartbeats.
+
 Activity includes mount indexing, repository fetches, Git transfer progress,
 payload/LFS hydration, elapsed-time heartbeats, failures and cancellation.
 Raw `GIT_TRACE2_EVENT` remains available for deeper Git diagnostics.
@@ -173,7 +235,7 @@ Raw `GIT_TRACE2_EVENT` remains available for deeper Git diagnostics.
 Ctrl-C on a blocked filesystem client propagates FUSE interruption through queued
 work, lock waits, and backend subprocess groups. Ctrl-C on a CLI command closes its
 control connection and cancels the corresponding server operation. Offline commands
-and server shutdown also cancel backend work. A published namespace journal is
+and server shutdown also cancel backend work. A published namespace or layout journal is
 finished before cancellation takes effect, preserving recoverability; cancellation
 does not roll back already completed changes or delete successfully fetched objects.
 A cancelled backing-Git edit/checkpoint may leave an edit lease requiring repair.
@@ -186,6 +248,8 @@ files retain their real worktree timestamps.
 
 ```sh
 gtl status dev
+gtl validate dev                     # check current depot/overlay invariants
+gtl dir dev                          # report the composed workspace path
 gtl diff dev                         # semantic changes relative to component pins
 git -C ~/ws/dev/.depotgit status      # actual sparse depot Git status
 gtl revert dev src/file.cc           # remove override/tombstone and reveal base
@@ -212,8 +276,11 @@ For multi-command tools, `gtl depot begin dev` returns a token and physical work
 finish with `gtl depot end dev TOKEN`. Failed commands or validation leave the
 workspace suspended. `gtl status dev` reports the token for repair after a crash.
 Do not perform raw checkout/reset/rebase or modify physical payloads concurrently
-with FUSE access. Manual pin/layout changes and workspace branch changes are rejected: restore
-those before ending the edit session. Use `mount add`, `mount remove`, and `mount submodules` for supported layout changes.
+with FUSE access. Manual pin/layout changes and workspace branch changes are
+rejected: restore those before ending the edit session. Use `mount add`,
+`mount remove`, and `mount submodules` for supported layout changes.
+
+## Fork, clone, and remove workspaces
 
 ```sh
 gtl workspace fork clean --from dev   # committed state only, new branch/index
@@ -221,15 +288,41 @@ gtl workspace clone experiment --from dev
 # Live clone preserves staged, unstaged and nonignored untracked source files.
 # Ignored build outputs are excluded; neither workspace is committed implicitly.
 gtl workspace list
+cd ~                                 # leave the workspace before removing it
 gtl workspace remove clean           # refuses dirty/untracked/ignored files
 ```
 
-Removal deregisters the worktree but retains its branch/history. Normal workspaces
+Workspace removal requires a quiescent workspace with no active edit lease or
+open file/directory handles or mappings. It refuses staged or unstaged changes,
+untracked files, and ignored outputs. Checkpoint changes you want to retain and
+remove unwanted outputs explicitly; there is no force-removal option. Mount
+operations dirty `depot.toml`, so a workspace with newly changed mounts must be
+checkpointed before removal.
+
+Removal deletes the workspace checkout/registration but retains its depot branch,
+history, and shared repository stores. It does not stop the shared daemon or
+remove other workspaces. This differs from `mount remove`, which keeps the
+workspace and its overlay files.
+
+Normal workspaces
 use separate local `workspaces/<id>` branches; fetching cannot overwrite them.
 All generated discovery symlinks are absolute and work through workspace aliases.
 Metadata JSON is versioned and reports the active generation and exact mappings.
 
-## Attribute batching and latency
+## Startup, hydration, and latency
+
+Component fetches use Git's `blob:none` filter. Startup indexes pinned trees;
+file content is fetched and materialized only as needed. Immutable composed indexes
+are cached under `STATE/indexes/`, keyed by the complete version map and schema.
+Identical maps reuse that disk cache across workspaces and restarts. Changed maps
+select a new cache entry; missing or malformed caches rebuild from Git. Mutable
+overlay/tombstone validation and journal recovery still run on each start.
+
+On a 61-mount TheRock layout with 460,982 indexed entries, an optimized build
+measured 6.75 s to build the index and 0.63 s to restore it from cache. These are
+indexing times, not total daemon startup times or network-fetch estimates. Different
+maps currently have separate composed indexes. The index cache is disposable;
+with the server stopped, deleting `STATE/indexes/` causes a rebuild on next use.
 
 Name-only enumeration does not fetch blobs. Attribute lookups (`ls -l`, build
 scanners) resolve sizes in batches, without creating extracted payload files.
@@ -266,9 +359,10 @@ retains stores, traces and results under the output directory.
 
 ## Foundation boundaries
 
-The old SQLite storage, snapshots, activation/resolution, export/import, and
-review/landing workflows have been removed. Old state is rejected without being
-deleted or migrated. Use a fresh state root. Pin advancement, branch switching,
+The old POC's SQLite storage, snapshots, activation/resolution, export/import,
+and review/landing workflows have been removed. The current layout commands
+support addition, removal, and expansion at existing pins. Old state is rejected
+without being deleted or migrated. Use a fresh state root. Pin advancement, branch switching,
 semantic merging, and component submission will be implemented as new workflows.
 
 See [filesystem and recovery contracts](docs/architecture.md) for supported

@@ -178,6 +178,19 @@ child. It exits successfully; scripts requiring a complete import must inspect
 be retried by repeating expansion. Cancellation, layout conflicts, invalid
 metadata, local failures/timeouts, and root fetch failures remain fatal.
 
+Discovery follows paths declared in the pinned repository-root `.gitmodules`;
+undeclared gitlinks are not imported and stale declarations without a gitlink
+are ignored. Workers enqueue children as soon as their parent is inspected.
+Successful inventories (including empty leaves) persist in the shared state cache,
+so repeated expansion needs no per-mount Git probes. Directory probes are batched.
+
+With `--skip-unavailable`, definitive authentication, host-key, or repository
+access failures stop further network attempts to that remote for this invocation.
+Already cached pins remain usable. Missing-ref errors are cached only for the
+failed pin. Failures are retried on the next invocation. Logs summarize affected
+paths; the JSON result retains every path's diagnostic and interactive command.
+Progress reports discovered/completed, active/queued, skipped, and cache hits.
+
 ## Create a depot
 
 Create an ordinary Git repository containing a committed `depot.toml`:
@@ -352,7 +365,9 @@ GTL_TREE_CACHE_MB=256 GTL_INDEX_JOBS=8 gtl daemon run
 
 `GTL_TREE_CACHE_MB` accepts 1–65536 MiB. `GTL_INDEX_JOBS` accepts 1–64, defaulting
 to at most eight available CPUs, and controls parallel root preparation and full
-validation. It does not make submodule import parallel. `gtl status NAME` includes
+validation. Submodule import uses a separate `GTL_SUBMODULE_JOBS` budget
+(default 32, range 1–128), shared across concurrent imports in a daemon. Set it
+in the daemon environment, or on an offline command. `gtl status NAME` includes
 shared tree-cache load/hit counts and resident/budget bytes.
 
 Normal validation is targeted. An unsupported entry in an untouched directory
@@ -430,6 +445,31 @@ python3 scripts/bench-attributes.py --before /path/to/previous/gtl \
 
 The script starts temporary foreground FUSE servers, stops them afterwards, and
 retains stores, traces and results under the output directory.
+
+## Recursive import benchmark
+
+`scripts/bench-imports.py` compares one and 32 discovery workers using isolated
+local repositories, a 679-mount recursive forest, and 678 distinct denied remotes
+with an injected 50 ms failure delay. An optimized build measured:
+
+| Operation | 1 worker | 32 workers |
+|---|---:|---:|
+| Cold recursive import | 14.68 s | 1.61 s |
+| Cached expansion | 0.10 s | 0.08 s |
+| Failure-heavy import | 87.79 s | 8.97 s |
+
+The complete layouts matched. Cached expansion launched zero Git processes;
+failed remotes in this fixture are all distinct, so each needs one probe. Repeated
+failures from the same origin are additionally coalesced within each invocation.
+These local measurements isolate scheduling overhead, not internet latency.
+
+```sh
+python3 scripts/bench-imports.py --binary /path/to/release/gtl \
+  --output /workspace/scratch/import-bench
+```
+
+The script retains fixtures, Git traces, subprocess counts, peak Git concurrency,
+maximum process RSS, and results. It uses offline commands and no daemon or FUSE.
 
 ## Foundation boundaries
 

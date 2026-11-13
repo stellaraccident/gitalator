@@ -254,9 +254,9 @@ Gitalator does not change host-key trust settings. Fetch errors retain a
 shell-quoted interactive retry command for the managed bare repository.
 
 Opt-in `--skip-unavailable` applies to child fetch process failures during import
-and expansion. Each child's map/recursion-stack preparation is a savepoint. A
-failed fetch restores that savepoint, records its diagnostic/retry command, and
-continues siblings. Nested skipped children keep their successful parents. The
+and expansion. Workers return immutable results; only the coordinator changes
+the candidate map. Failed child preparation records its diagnostic/retry command
+without adding a mount, then continues siblings. Nested skipped children keep their successful parents. The
 owning mount permits uninitialized gitlinks for omitted children. The final
 candidate is still validated and journaled atomically. Cancellation, metadata
 errors, layout conflicts, process/storage errors, and timeouts are not swallowed.
@@ -268,5 +268,32 @@ Root preparation and explicit full validation use bounded parallel windows,
 defaulting to min(available CPUs, 8), overridable with `GTL_INDEX_JOBS=1..64`.
 Workers inherit activity/cancellation, and repository creation/fetch retains its
 existing locks. Cancellation or failure prevents candidate layout activation;
-complete immutable directory caches may remain reusable. Submodule discovery and
-explicit recursive materialization retain their existing traversal semantics.
+complete immutable directory caches may remain reusable. Explicit recursive
+materialization retains its existing traversal semantics.
+
+Submodule discovery uses a dynamic queue and a process-wide worker budget,
+`GTL_SUBMODULE_JOBS=1..128` (default 32), independent of root preparation.
+Repository exclusion is acquired before scheduling so workers do not wait behind
+another import of the same origin. Children become eligible immediately; a slow
+sibling does not create a level barrier. Only the coordinator edits the candidate.
+Existing mounts retain ordering and IDs; new mounts and skip reports sort by path.
+An operation-local stop flag cancels sibling Git process groups after a fatal
+error, retaining the original error and leaving unrelated operations running.
+
+Discovery reads all `.gitmodules` keys in one Git-config invocation with includes
+disabled, then probes only declared paths through batched immediate tree reads.
+Missing/non-gitlink declarations are ignored; malformed declarations fail.
+Undeclared gitlinks remain subject to the mount's uninitialized policy on access
+and full validation. Root `.gitmodules` still governs subtree mounts.
+Successful inventories (including empty leaves) are persisted atomically at
+`STATE/submodule-cache/v1/<repo>/<hash(commit:subtree)>.json`. Identity, version,
+and content checksum are checked on read; corrupt entries are rebuilt. Inventories
+contain relative paths, raw URLs, and exact pins, independent of mount placement.
+
+Failures are cached only within an invocation. Identical failed origin/pin pairs
+coalesce; definitive authentication, host-key, and repository access errors open
+a remote circuit when skipping is enabled. Cached inventories and available local
+pins are checked before rejecting other pins from that remote. Missing-ref and
+unclassified errors remain pin-specific. Per-path JSON diagnostics retain quoted
+interactive retry commands, while warnings summarize affected origins and counts.
+Progress reports discovered, completed, active/queued, skipped and cache hits.

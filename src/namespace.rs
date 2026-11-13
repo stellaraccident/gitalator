@@ -16,11 +16,11 @@ use std::{
 };
 
 #[derive(Clone, Serialize, Deserialize)]
-struct Commit {
+pub(crate) struct Commit {
     format: u32,
     repo: String,
     commit: String,
-    tree: String,
+    pub(crate) tree: String,
     time: i64,
 }
 #[derive(Default)]
@@ -127,7 +127,11 @@ impl Store {
         );
         Ok(Arc::new(namespace))
     }
-    fn prepare_commits(&self, url: &str, pins: &BTreeSet<String>) -> Result<Vec<Commit>> {
+    pub(crate) fn prepare_commits(
+        &self,
+        url: &str,
+        pins: &BTreeSet<String>,
+    ) -> Result<Vec<Commit>> {
         let repo = hash(url.as_bytes());
         let directory = self.root.join("tree-cache/v1/commits").join(&repo);
         let mut result = vec![];

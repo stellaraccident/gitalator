@@ -3,24 +3,23 @@
 use crate::{
     activity,
     cli::Submodules,
-    error, git,
+    error,
     model::*,
     store::{json_write, token, Record, Store, Workspace},
-    util::{atomic, hash},
+    util::atomic,
     Result,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
 
 #[derive(Default)]
-struct ImportOptions {
-    skip_unavailable: bool,
-    skipped: Vec<Value>,
+pub(crate) struct ImportOptions {
+    pub(crate) skip_unavailable: bool,
+    pub(crate) skipped: Vec<Value>,
 }
 impl ImportOptions {
     fn report(self, mut result: Value) -> Value {
@@ -125,14 +124,13 @@ impl Store {
             skip_unavailable,
             ..Default::default()
         };
-        self.import_mount(
+        self.import_forest(
             &mut map,
             url,
             revision,
             at,
+            "",
             submodules,
-            &mut BTreeSet::new(),
-            0,
             false,
             &mut options,
         )?;
@@ -219,12 +217,15 @@ impl Store {
             skip_unavailable,
             ..Default::default()
         };
-        self.expand_mount(
+        let mount = map.mounts[index].clone();
+        let url = map.repositories[&mount.repository].url.clone();
+        self.import_forest(
             &mut map,
-            index,
+            &url,
+            &mount.commit,
+            at,
+            &mount.subtree,
             depth,
-            &mut BTreeSet::new(),
-            0,
             true,
             &mut options,
         )?;
@@ -300,247 +301,6 @@ impl Store {
             json!({"workspace":name,"added":added,"removed":removed,"updated":updated,"changed":changed,"manifest":w.depot().join("depot.toml"),"staged":false,"state_dir":self.root}),
         )
     }
-
-    #[allow(clippy::too_many_arguments)]
-    fn import_mount(
-        &self,
-        map: &mut Map,
-        url: &str,
-        revision: &str,
-        path: &str,
-        mode: Submodules,
-        stack: &mut BTreeSet<(String, String)>,
-        depth: usize,
-        reuse: bool,
-        options: &mut ImportOptions,
-    ) -> Result<()> {
-        activity::check()?;
-        if depth > 32 || map.mounts.len() >= 4096 {
-            return Err(error("submodule import exceeds depth/mount limit"));
-        }
-        if map.mounts.iter().any(|m| m.path == path) {
-            return Err(error(format!("mount path already exists: {path}")));
-        }
-        let key = map
-            .repositories
-            .iter()
-            .find(|(_, r)| r.url == url)
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| format!("repo-{}", &hash(url.as_bytes())[..16]));
-        if map.repositories.get(&key).is_some_and(|r| r.url != url) {
-            return Err(error("repository ID collision"));
-        }
-        map.repositories
-            .insert(key.clone(), Repository { url: url.into() });
-        map.validate()?; // Validate remote syntax before contacting it.
-        let repo = self.repo(url)?;
-        let commit = self.fetch(&repo, revision)?;
-        let id = if path.is_empty() {
-            "root".into()
-        } else {
-            format!("mount-{}", &hash(path.as_bytes())[..16])
-        };
-        map.mounts.push(Mount {
-            id,
-            repository: key,
-            commit: commit.clone(),
-            path: path.into(),
-            subtree: String::new(),
-            uninitialized_submodules: mode == Submodules::None,
-        });
-        map.validate()?;
-        activity::event(
-            "info",
-            &format!(
-                "Import mount {} at {commit}; submodules {mode:?}",
-                if path.is_empty() { "/" } else { path }
-            ),
-        );
-        self.expand_mount(
-            map,
-            map.mounts.len() - 1,
-            mode,
-            stack,
-            depth,
-            reuse,
-            options,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn expand_mount(
-        &self,
-        map: &mut Map,
-        index: usize,
-        mode: Submodules,
-        stack: &mut BTreeSet<(String, String)>,
-        depth: usize,
-        reuse: bool,
-        options: &mut ImportOptions,
-    ) -> Result<()> {
-        activity::check()?;
-        if mode == Submodules::None {
-            return Ok(());
-        }
-        if depth > 32 {
-            return Err(error("submodule import exceeds depth/mount limit"));
-        }
-        let mount = map.mounts[index].clone();
-        let path = mount.path.as_str();
-        let commit = mount.commit.clone();
-        let url = map.repositories[&mount.repository].url.clone();
-        if !stack.insert((url.clone(), commit.clone())) {
-            return Err(error("recursive submodule cycle"));
-        }
-        let repo = self.repo(&url)?;
-        self.fetch(&repo, &commit)?;
-        activity::event(
-            "info",
-            &format!(
-                "Expand submodules at {} ({commit}): {mode:?}",
-                if path.is_empty() { "/" } else { path }
-            ),
-        );
-        let mut missing_children = false;
-        {
-            let bare = self.root.join("repos").join(repo);
-            let tree_spec = if mount.subtree.is_empty() {
-                commit.clone()
-            } else {
-                format!("{commit}:{}", mount.subtree)
-            };
-            let tree = git::run(&bare, &["ls-tree", "-r", "-z", &tree_spec])?;
-            let mut links = vec![];
-            for entry in tree.split(|b| *b == 0).filter(|e| !e.is_empty()) {
-                activity::check()?;
-                let (meta, name) = std::str::from_utf8(entry)?
-                    .split_once('\t')
-                    .ok_or("invalid tree entry")?;
-                let fields: Vec<_> = meta.split_whitespace().collect();
-                if fields[0] == "160000" {
-                    links.push((name.to_owned(), fields[2].to_owned()));
-                }
-            }
-            if !links.is_empty() {
-                let config = format!("{commit}:.gitmodules");
-                let pairs = git::run(
-                    &bare,
-                    &[
-                        "config",
-                        "--null",
-                        "--blob",
-                        &config,
-                        "--get-regexp",
-                        r"^submodule\..*\.path$",
-                    ],
-                )?;
-                let mut names = BTreeMap::new();
-                for pair in pairs.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-                    let (key, path) = std::str::from_utf8(pair)?
-                        .split_once('\n')
-                        .ok_or("invalid submodule config")?;
-                    if names
-                        .insert(
-                            path.to_string(),
-                            key.strip_suffix(".path")
-                                .ok_or("invalid submodule key")?
-                                .to_string(),
-                        )
-                        .is_some()
-                    {
-                        return Err(error("duplicate submodule path"));
-                    }
-                }
-                for (child, pin) in links {
-                    if !valid_path(&child) {
-                        return Err(error("invalid submodule path"));
-                    }
-                    let key = names
-                        .get(&join(&mount.subtree, &child))
-                        .ok_or("gitlink missing from .gitmodules")?;
-                    let child_url = git::text(
-                        &bare,
-                        &["config", "--blob", &config, "--get", &format!("{key}.url")],
-                    )?;
-                    let child_url = resolve_url(&url, &child_url)?;
-                    let child_path = join(path, &child);
-                    let child_mode = if mode == Submodules::Recursive {
-                        Submodules::Recursive
-                    } else {
-                        Submodules::None
-                    };
-                    // Roll back only this child's preparation on an access failure.
-                    // Successfully expanded siblings and ancestors stay in the candidate.
-                    let saved = options
-                        .skip_unavailable
-                        .then(|| (map.clone(), stack.clone(), options.skipped.len()));
-                    let result = if let Some(existing) =
-                        map.mounts.iter().position(|m| m.path == child_path)
-                    {
-                        let m = &map.mounts[existing];
-                        if !reuse
-                            || map.repositories[&m.repository].url != child_url
-                            || m.commit != pin
-                            || !m.subtree.is_empty()
-                        {
-                            return Err(error(format!("submodule mount conflict at {child_path}: existing origin/pin/subtree differs or path is occupied; use an explicit resolve workflow (no mounts changed)")));
-                        }
-                        self.expand_mount(
-                            map,
-                            existing,
-                            child_mode,
-                            stack,
-                            depth + 1,
-                            reuse,
-                            options,
-                        )
-                    } else {
-                        self.import_mount(
-                            map,
-                            &child_url,
-                            &pin,
-                            &child_path,
-                            child_mode,
-                            stack,
-                            depth + 1,
-                            reuse,
-                            options,
-                        )
-                    };
-                    if let Err(e) = result {
-                        activity::check()?; // Cancellation always aborts the whole plan.
-                        let unavailable = e
-                            .downcast_ref::<git::CommandFailure>()
-                            .is_some_and(|e| e.command == "fetch");
-                        if !options.skip_unavailable || !unavailable {
-                            return Err(e);
-                        }
-                        let (saved_map, saved_stack, skipped_len) = saved.unwrap();
-                        *map = saved_map;
-                        *stack = saved_stack;
-                        options.skipped.truncate(skipped_len);
-                        missing_children |= !map.mounts.iter().any(|m| m.path == child_path);
-                        let failure = e.downcast_ref::<git::CommandFailure>().unwrap();
-                        let message = format!("git {}: {}", failure.command, failure.message);
-                        activity::event(
-                            "warn",
-                            &format!("Skipped submodule {child_path}: {message}"),
-                        );
-                        if let Some(command) = &failure.retry_command {
-                            activity::event(
-                                "warn",
-                                &format!("Interactive retry for {child_path}: {command}"),
-                            );
-                        }
-                        options.skipped.push(json!({"path":child_path,"url":git::public_origin(&child_url),"commit":pin,"error":message,"retry_command":failure.retry_command}));
-                    }
-                }
-            }
-        }
-        map.mounts[index].uninitialized_submodules = missing_children;
-        stack.remove(&(url, commit));
-        Ok(())
-    }
 }
 
 fn mount_path(at: &str) -> Result<&str> {
@@ -552,7 +312,7 @@ fn mount_path(at: &str) -> Result<&str> {
 }
 
 /// Git resolves ./ and ../ submodule URLs relative to the repository URL itself.
-fn resolve_url(parent: &str, child: &str) -> Result<String> {
+pub(crate) fn resolve_url(parent: &str, child: &str) -> Result<String> {
     if !child.starts_with("./") && !child.starts_with("../") {
         return Ok(child.into());
     }

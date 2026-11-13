@@ -21,6 +21,7 @@ static ACTIVE: OnceLock<Mutex<BTreeMap<u64, Arc<State>>>> = OnceLock::new();
 static LOGGER: OnceLock<Mutex<Logger>> = OnceLock::new();
 thread_local! {
     static CURRENT: RefCell<Option<Arc<State>>> = const { RefCell::new(None) };
+    static STOP: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
     static CRITICAL: Cell<usize> = const { Cell::new(0) };
 }
 struct State {
@@ -71,7 +72,7 @@ impl Task {
     pub fn enter(&self) -> Context {
         let old = CURRENT.with(|c| c.replace(Some(self.state.clone())));
         *self.state.stage.lock().unwrap() = "running".into();
-        Context(old)
+        Context(old, STOP.with(|c| c.borrow().clone()))
     }
 }
 impl Drop for Task {
@@ -79,17 +80,22 @@ impl Drop for Task {
         active().lock().unwrap().remove(&self.state.id);
     }
 }
-pub struct Context(Option<Arc<State>>);
+pub struct Context(Option<Arc<State>>, Option<Arc<AtomicBool>>);
 impl Drop for Context {
     fn drop(&mut self) {
         CURRENT.with(|c| c.replace(self.0.take()));
+        STOP.with(|c| c.replace(self.1.take()));
     }
 }
 pub fn check() -> Result<()> {
     if CRITICAL.with(Cell::get) > 0 {
         return Ok(());
     }
-    if SHUTDOWN.load(Ordering::Acquire)
+    if STOP.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::Acquire))
+    }) || SHUTDOWN.load(Ordering::Acquire)
         || CURRENT.with(|c| {
             c.borrow()
                 .as_ref()
@@ -263,12 +269,22 @@ pub fn heartbeat() {
 }
 
 #[derive(Clone)]
-pub struct Scope(Option<Arc<State>>);
+pub struct Scope(Option<Arc<State>>, Option<Arc<AtomicBool>>);
 pub fn capture() -> Scope {
-    Scope(CURRENT.with(|c| c.borrow().clone()))
+    Scope(
+        CURRENT.with(|c| c.borrow().clone()),
+        STOP.with(|c| c.borrow().clone()),
+    )
 }
 impl Scope {
+    pub(crate) fn with_stop(mut self, stop: Arc<AtomicBool>) -> Self {
+        self.1 = Some(stop);
+        self
+    }
     pub fn enter(&self) -> Context {
-        Context(CURRENT.with(|c| c.replace(self.0.clone())))
+        Context(
+            CURRENT.with(|c| c.replace(self.0.clone())),
+            STOP.with(|c| c.replace(self.1.clone())),
+        )
     }
 }

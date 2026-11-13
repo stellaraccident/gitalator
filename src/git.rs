@@ -529,7 +529,7 @@ pub(crate) fn public_origin(url: &str) -> String {
 
 /// A Git process that ran and returned failure, distinct from cancellation,
 /// process-launch failures, and local I/O errors.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CommandFailure {
     pub command: String,
     pub message: String,
@@ -546,6 +546,6 @@ impl std::fmt::Display for CommandFailure {
 }
 impl std::error::Error for CommandFailure {}
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

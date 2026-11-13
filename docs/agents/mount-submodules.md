@@ -86,4 +86,19 @@ Untouched directory errors surface when accessed, with mount/path diagnostics in
 activity logs. Use `gtl validate NAME --full` for a cancellable whole-base check;
 normal `gtl validate NAME` is targeted. Full validation warms directory caches
 without hydrating payloads. `gtl status NAME` reports shared `tree_cache` counters.
-Explicit submodule discovery still explores the requested submodule graph.
+Discovery follows declared paths in the pinned `.gitmodules`; undeclared gitlinks
+are not imported, and stale declarations without matching gitlinks are ignored.
+Undeclared links still follow the mount's uninitialized-submodule policy on access
+and full validation. Malformed declarations remain errors.
+
+Discovery uses 32 workers by default, with children queued immediately. Set
+`GTL_SUBMODULE_JOBS=1..128` in the daemon environment (or on an offline command)
+to tune the process-wide import budget. Cached successful inventories, including
+empty leaves, avoid per-mount Git commands on repeated expansion.
+
+With `--skip-unavailable`, an authentication, host-key, or repository access failure
+suppresses further network attempts to that origin during this invocation.
+Cached commits remain usable. Missing-ref and unclassified fetch failures affect
+only that pin. Failures are never persisted: the next expansion retries them.
+Warnings summarize affected paths; JSON retains every path's interactive retry.
+Activity reports completed/queued/active work, skips, and cache hits.

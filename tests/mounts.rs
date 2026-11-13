@@ -505,3 +505,173 @@ fn expansion_of_subtree_mount_uses_repository_root_gitmodules() {
     assert_eq!(w.record.map.mounts[0].id, "code");
     assert!(w.entry("src/child/vendor/leaf/file").is_ok());
 }
+
+#[test]
+fn skip_unavailable_keeps_siblings_and_provides_working_retry_command() {
+    let (f, child, _) = graph();
+    let leaf = f.component.parent().unwrap().join("leaf");
+    let pin = git::text(&leaf, &["rev-parse", "HEAD"]).unwrap();
+    git::run(
+        &f.component,
+        &[
+            "config",
+            "--file",
+            ".gitmodules",
+            "submodule.good.path",
+            "zz-good",
+        ],
+    )
+    .unwrap();
+    git::run(
+        &f.component,
+        &[
+            "config",
+            "--file",
+            ".gitmodules",
+            "submodule.good.url",
+            "../leaf",
+        ],
+    )
+    .unwrap();
+    git::run(&f.component, &["add", ".gitmodules"]).unwrap();
+    git::run(
+        &f.component,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{pin},zz-good"),
+        ],
+    )
+    .unwrap();
+    git::run(&f.component, &["commit", "-m", "sibling"]).unwrap();
+    let offline = child.with_extension("offline");
+    fs::rename(&child, &offline).unwrap();
+    let mut s = Store::open(&f.state).unwrap();
+    s.init("example").unwrap();
+    let result = s
+        .add_mount_with_options(
+            "example",
+            None,
+            f.component.to_str().unwrap(),
+            ".",
+            "HEAD",
+            Submodules::Recursive,
+            true,
+        )
+        .unwrap();
+    assert_eq!(result["complete"], false);
+    assert_eq!(result["skipped"].as_array().unwrap().len(), 1);
+    assert_eq!(result["skipped"][0]["path"], "deps/child");
+    assert!(result["skipped"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("git fetch"));
+    {
+        let arc = s.get("example").unwrap();
+        let w = arc.lock().unwrap();
+        assert_eq!(w.record.map.mounts.len(), 2);
+        assert!(w.record.map.mounts[0].uninitialized_submodules);
+        assert!(w.entry("zz-good/file").is_ok());
+        assert!(w.children("deps/child").unwrap().is_empty());
+        w.validate().unwrap();
+    }
+    fs::rename(&offline, &child).unwrap();
+    let retry = result["skipped"][0]["retry_command"].as_str().unwrap();
+    let out = Command::new("sh").args(["-c", retry]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result = s
+        .expand_submodules_with_options("example", None, ".", Submodules::Recursive, true)
+        .unwrap();
+    assert_eq!(result["complete"], true);
+    assert!(result["skipped"].as_array().unwrap().is_empty());
+    assert_eq!(
+        s.get("example")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .record
+            .map
+            .mounts
+            .len(),
+        4
+    );
+}
+
+#[test]
+fn skipped_grandchild_retains_parent_and_is_retried_after_restart() {
+    let (f, s) = flat_graph();
+    let leaf = f.component.parent().unwrap().join("leaf");
+    let offline = leaf.with_extension("offline");
+    fs::rename(&leaf, &offline).unwrap();
+    let result = s
+        .expand_submodules_with_options("example", None, ".", Submodules::Recursive, true)
+        .unwrap();
+    assert_eq!(result["skipped"][0]["path"], "deps/child/vendor/leaf");
+    {
+        let arc = s.get("example").unwrap();
+        let w = arc.lock().unwrap();
+        assert_eq!(w.record.map.mounts.len(), 2);
+        assert!(!w.record.map.mounts[0].uninitialized_submodules);
+        assert!(w.record.map.mounts[1].uninitialized_submodules);
+        assert!(w.entry("deps/child/file").is_ok());
+    }
+    drop(s);
+    let s = Store::open(&f.state).unwrap();
+    let result = s
+        .expand_submodules_with_options("example", None, ".", Submodules::Recursive, true)
+        .unwrap();
+    assert_eq!(result["changed"], false);
+    assert_eq!(result["complete"], false);
+    fs::rename(&offline, &leaf).unwrap();
+    let result = s
+        .expand_submodules("example", None, ".", Submodules::Recursive)
+        .unwrap();
+    assert_eq!(result["complete"], true);
+    assert_eq!(
+        s.get("example")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .record
+            .map
+            .mounts
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn skip_unavailable_does_not_mask_pin_conflicts_or_root_failure() {
+    let (f, s) = flat_graph();
+    let child = f.component.parent().unwrap().join("child");
+    s.add_mount(
+        "example",
+        None,
+        child.to_str().unwrap(),
+        "deps/child",
+        "HEAD",
+        Submodules::None,
+    )
+    .unwrap();
+    let err = s
+        .expand_submodules_with_options("example", None, ".", Submodules::Recursive, true)
+        .unwrap_err();
+    assert!(err.to_string().contains("conflict at deps/child"));
+    let missing = f.component.parent().unwrap().join("missing");
+    assert!(s
+        .add_mount_with_options(
+            "example",
+            None,
+            missing.to_str().unwrap(),
+            "another",
+            "HEAD",
+            Submodules::Recursive,
+            true
+        )
+        .is_err());
+}

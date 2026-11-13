@@ -164,6 +164,20 @@ prunes existing descendants. Both commands activate an uncommitted layout using
 the same workspace discovery and cancellation behavior as `mount add`.
 See `gtl agents mount-remove` and `gtl agents mount-submodules`.
 
+To keep accessible submodules when another child's fetch fails:
+
+```sh
+gtl mount submodules --at . --depth recursive --skip-unavailable
+# Also accepted by mount add with --submodules first-level or recursive.
+```
+
+Partial success returns `complete: false` and a `skipped` array containing the
+path, origin, commit, error, and a copy/paste `retry_command` for every skipped
+child. It exits successfully; scripts requiring a complete import must inspect
+`complete`. Successful parents and siblings remain mounted; missing children can
+be retried by repeating expansion. Cancellation, layout conflicts, invalid
+metadata, local failures/timeouts, and root fetch failures remain fatal.
+
 ## Create a depot
 
 Create an ordinary Git repository containing a committed `depot.toml`:
@@ -231,6 +245,14 @@ Long startup phases emit five-second heartbeats.
 Activity includes mount indexing, repository fetches, Git transfer progress,
 payload/LFS hydration, elapsed-time heartbeats, failures and cancellation.
 Raw `GIT_TRACE2_EVENT` remains available for deeper Git diagnostics.
+
+Background Git commands run without a controlling terminal and with Git/SSH
+askpass prompts disabled. Unknown SSH hosts and missing credentials therefore
+fail instead of waiting for input; configured SSH commands and host-key policies
+are preserved. Failed fetches print a shell-quoted interactive retry command.
+Run it in your own terminal after the operation finishes, handle host verification
+or authentication there, then retry Gitalator. No host keys are automatically
+accepted or verification checks disabled.
 
 Ctrl-C on a blocked filesystem client propagates FUSE interruption through queued
 work, lock waits, and backend subprocess groups. Ctrl-C on a CLI command closes its

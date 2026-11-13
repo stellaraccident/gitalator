@@ -791,7 +791,15 @@ fn expand_cancel_retry_and_remove_from_workspace_cwd() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_gtl"));
     command
         .current_dir(&root)
-        .args(["mount", "submodules", "--at", ".", "--depth", "recursive"])
+        .args([
+            "mount",
+            "submodules",
+            "--at",
+            ".",
+            "--depth",
+            "recursive",
+            "--skip-unavailable",
+        ])
         .stdout(std::process::Stdio::null());
     let mut client = command.spawn().unwrap();
     wait_for(&pid);

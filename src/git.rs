@@ -12,23 +12,37 @@ pub fn execute_command(
     input: Option<&[u8]>,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output> {
-    execute_command_progress(cmd, input, timeout, None)
+    execute_command_progress(cmd, input, timeout, None, false)
 }
 fn execute_command_progress(
     cmd: &mut Command,
     input: Option<&[u8]>,
     timeout: std::time::Duration,
     progress: Option<Progress>,
+    background_git: bool,
 ) -> Result<std::process::Output> {
     crate::activity::check()?;
-    cmd.process_group(0)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    if background_git {
+        // stdin=null alone does not stop SSH opening the daemon's /dev/tty.
+        // A new session removes that terminal while retaining a cancellable group.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
+        cmd.process_group(0);
+    }
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let mut stdout = child.stdout.take().unwrap();
     let mut stderr = child.stderr.take().unwrap();
@@ -215,6 +229,9 @@ fn execute(path: &Path, args: &[&str], input: Option<&[u8]>, local_only: bool) -
     .args(args)
     .env("GIT_CONFIG_NOSYSTEM", "1")
     .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_ASKPASS", "/bin/false")
+    .env("SSH_ASKPASS", "/bin/false")
+    .env("SSH_ASKPASS_REQUIRE", "never")
     .env("GIT_LFS_SKIP_SMUDGE", "1")
     .env("GIT_NO_LAZY_FETCH", if local_only { "1" } else { "0" })
     .env("LC_ALL", "C")
@@ -241,6 +258,7 @@ fn execute(path: &Path, args: &[&str], input: Option<&[u8]>, local_only: bool) -
         input,
         std::time::Duration::from_secs(300),
         progress,
+        true,
     );
     if fetch {
         let status = match &result {
@@ -257,11 +275,19 @@ fn execute(path: &Path, args: &[&str], input: Option<&[u8]>, local_only: bool) -
     }
     let out = result?;
     if !out.status.success() {
-        return Err(error(format!(
-            "git {}: {}",
-            args.first().unwrap_or(&""),
-            redact(&String::from_utf8_lossy(&out.stderr))
-        )));
+        return Err(Box::new(CommandFailure {
+            command: args.first().unwrap_or(&"").to_string(),
+            message: redact(&String::from_utf8_lossy(&out.stderr)),
+            retry_command: fetch.then(|| {
+                let mut words = vec![
+                    "git".to_owned(),
+                    "-C".into(),
+                    shell_quote(&path.to_string_lossy()),
+                ];
+                words.extend(args.iter().map(|arg| shell_quote(arg)));
+                words.join(" ")
+            }),
+        }));
     }
     Ok(out.stdout)
 }
@@ -489,7 +515,7 @@ fn input_fetch(repo: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Keep repository names useful without logging embedded credentials.
-fn public_origin(url: &str) -> String {
+pub(crate) fn public_origin(url: &str) -> String {
     let value = url.split_once("://").map(|(_, tail)| tail).unwrap_or(url);
     value
         .rsplit('@')
@@ -499,4 +525,27 @@ fn public_origin(url: &str) -> String {
         .next()
         .unwrap_or("")
         .to_owned()
+}
+
+/// A Git process that ran and returned failure, distinct from cancellation,
+/// process-launch failures, and local I/O errors.
+#[derive(Debug)]
+pub struct CommandFailure {
+    pub command: String,
+    pub message: String,
+    pub retry_command: Option<String>,
+}
+impl std::fmt::Display for CommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "git {}: {}", self.command, self.message)?;
+        if let Some(command) = &self.retry_command {
+            write!(f, "\nRetry interactively from a terminal:\n  {command}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for CommandFailure {}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }

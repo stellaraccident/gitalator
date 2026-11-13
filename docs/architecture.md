@@ -221,3 +221,22 @@ pins; conflicting URLs, pins, or subtrees reject the complete operation. Depth
 is additive: first-level never de-expands children. Unchanged maps do not rewrite
 manifest or generation. No local overlay configuration, revision updates, pruning,
 or patch rebasing are inferred from expansion.
+
+
+Background Git subprocesses create a new session (also their cancellable process
+group), preventing SSH from reopening the daemon's controlling terminal.
+`GIT_TERMINAL_PROMPT=0`, disabled Git/SSH askpass helpers, and
+`SSH_ASKPASS_REQUIRE=never` prevent background credential dialogs. Custom
+`GIT_SSH_COMMAND`, `GIT_SSH`, and `core.sshCommand` selection remains Git's own;
+Gitalator does not change host-key trust settings. Fetch errors retain a
+shell-quoted interactive retry command for the managed bare repository.
+
+Opt-in `--skip-unavailable` applies to child fetch process failures during import
+and expansion. Each child's map/recursion-stack preparation is a savepoint. A
+failed fetch restores that savepoint, records its diagnostic/retry command, and
+continues siblings. Nested skipped children keep their successful parents. The
+owning mount permits uninitialized gitlinks for omitted children. The final
+candidate is still validated and journaled atomically. Cancellation, metadata
+errors, layout conflicts, process/storage errors, and timeouts are not swallowed.
+Skipped results are returned separately from map changes (`complete`, `skipped`);
+repeating expansion retries omissions without repinning successful mounts.

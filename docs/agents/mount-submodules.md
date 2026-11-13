@@ -47,3 +47,33 @@ gtl checkpoint example -m 'Expand pinned submodules'
 
 Keep your server's state selection for those commands. Checkpoint includes all
 staged changes and needs your Git author identity.
+
+## Inaccessible submodules
+
+Add `--skip-unavailable` to import accessible children even if another child's
+fetch fails. Without this flag, a failed fetch aborts the layout operation.
+
+```sh
+gtl mount submodules --at . --depth recursive --skip-unavailable
+```
+
+The same flag is available on `mount add --submodules first-level|recursive`.
+A skipped child remains unexpanded (normally an empty gitlink directory); existing
+mounts and overlay files are preserved. Successful parents and siblings are kept.
+The result uses `complete: false` and a `skipped` array with each workspace-relative
+`path`, sanitized origin, exact `commit`, Git `error`, and shell-quoted
+`retry_command`. A partial import exits successfully; scripts must inspect
+`complete` to require full population. Errors are also logged as warnings.
+
+Paste a reported `retry_command` into a normal interactive terminal after the
+operation finishes to resolve SSH host verification or credentials. Then rerun
+the expansion command: matching mounts are reused and missing children are retried.
+The retry fetch only populates the shared bare repository; rerunning Gitalator
+activates the missing mount. SSH/Git background operations have no controlling
+terminal and disable askpass prompts; host-key verification is never bypassed.
+
+Only failed child fetches are skipped. A failed root fetch, cancellation,
+conflicting existing pins/origins/subtrees, malformed submodule metadata, or
+invalid overlay/tombstone state still aborts activation. Timeouts and local
+process/storage failures also remain fatal. Preparation can leave downloaded
+objects in the cache even when activation is aborted.

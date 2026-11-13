@@ -179,6 +179,10 @@ pub enum MountCmd {
         revision: String,
         #[arg(long, value_enum, default_value = "none")]
         submodules: Submodules,
+        /// Skip child repositories whose fetch fails and report each error.
+        #[arg(long)]
+        #[serde(default)]
+        skip_unavailable: bool,
         /// Defaults to the workspace containing the current directory.
         #[arg(long)]
         workspace: Option<String>,
@@ -203,6 +207,10 @@ pub enum MountCmd {
         at: String,
         #[arg(long, value_enum, default_value = "first-level")]
         depth: SubmoduleDepth,
+        /// Keep successful imports when a child repository cannot be fetched.
+        #[arg(long)]
+        #[serde(default)]
+        skip_unavailable: bool,
         #[arg(long)]
         workspace: Option<String>,
         #[arg(skip)]

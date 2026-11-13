@@ -282,15 +282,17 @@ pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
                     at,
                     revision,
                     submodules,
+                    skip_unavailable,
                     workspace_id,
                     ..
-                } => store.add_mount(
+                } => store.add_mount_with_options(
                     &name,
                     workspace_id.as_deref(),
                     &url,
                     &at,
                     &revision,
                     submodules,
+                    skip_unavailable,
                 ),
                 MountCmd::Remove {
                     at,
@@ -301,9 +303,16 @@ pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
                 MountCmd::Submodules {
                     at,
                     depth,
+                    skip_unavailable,
                     workspace_id,
                     ..
-                } => store.expand_submodules(&name, workspace_id.as_deref(), &at, depth.into()),
+                } => store.expand_submodules_with_options(
+                    &name,
+                    workspace_id.as_deref(),
+                    &at,
+                    depth.into(),
+                    skip_unavailable,
+                ),
             }?;
             core.invalidate(&name)?;
             Ok(result)

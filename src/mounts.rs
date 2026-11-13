@@ -17,6 +17,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Default)]
+struct ImportOptions {
+    skip_unavailable: bool,
+    skipped: Vec<Value>,
+}
+impl ImportOptions {
+    fn report(self, mut result: Value) -> Value {
+        result["complete"] = json!(self.skipped.is_empty());
+        result["skipped"] = json!(self.skipped);
+        result
+    }
+}
+
 pub struct Discovery {
     pub state: PathBuf,
     pub name: String,
@@ -69,6 +82,19 @@ impl Store {
         revision: &str,
         submodules: Submodules,
     ) -> Result<Value> {
+        self.add_mount_with_options(name, expected_id, url, at, revision, submodules, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_mount_with_options(
+        &self,
+        name: &str,
+        expected_id: Option<&str>,
+        url: &str,
+        at: &str,
+        revision: &str,
+        submodules: Submodules,
+        skip_unavailable: bool,
+    ) -> Result<Value> {
         let at = if at == "." { "" } else { at };
         if !valid_path(at) {
             return Err(error("--at must be workspace-relative; use . for the root"));
@@ -90,6 +116,10 @@ impl Store {
             (w.record.map.clone(), w.record.generation.clone())
         };
         let mut map = original.clone();
+        let mut options = ImportOptions {
+            skip_unavailable,
+            ..Default::default()
+        };
         self.import_mount(
             &mut map,
             url,
@@ -99,8 +129,9 @@ impl Store {
             &mut BTreeSet::new(),
             0,
             false,
+            &mut options,
         )?;
-        self.finish_layout(name, &original, &generation, map)
+        Ok(options.report(self.finish_layout(name, &original, &generation, map)?))
     }
 
     fn layout_snapshot(&self, name: &str, expected_id: Option<&str>) -> Result<(Map, String)> {
@@ -158,6 +189,16 @@ impl Store {
         at: &str,
         depth: Submodules,
     ) -> Result<Value> {
+        self.expand_submodules_with_options(name, expected_id, at, depth, false)
+    }
+    pub fn expand_submodules_with_options(
+        &self,
+        name: &str,
+        expected_id: Option<&str>,
+        at: &str,
+        depth: Submodules,
+        skip_unavailable: bool,
+    ) -> Result<Value> {
         let at = mount_path(at)?;
         if depth == Submodules::None {
             return Err(error("expansion depth must be first-level or recursive"));
@@ -169,8 +210,20 @@ impl Store {
             .iter()
             .position(|m| m.path == at)
             .ok_or("no mount at the requested path")?;
-        self.expand_mount(&mut map, index, depth, &mut BTreeSet::new(), 0, true)?;
-        self.finish_layout(name, &original, &generation, map)
+        let mut options = ImportOptions {
+            skip_unavailable,
+            ..Default::default()
+        };
+        self.expand_mount(
+            &mut map,
+            index,
+            depth,
+            &mut BTreeSet::new(),
+            0,
+            true,
+            &mut options,
+        )?;
+        Ok(options.report(self.finish_layout(name, &original, &generation, map)?))
     }
 
     fn finish_layout(
@@ -255,6 +308,7 @@ impl Store {
         stack: &mut BTreeSet<(String, String)>,
         depth: usize,
         reuse: bool,
+        options: &mut ImportOptions,
     ) -> Result<()> {
         activity::check()?;
         if depth > 32 || map.mounts.len() >= 4096 {
@@ -298,7 +352,15 @@ impl Store {
                 if path.is_empty() { "/" } else { path }
             ),
         );
-        self.expand_mount(map, map.mounts.len() - 1, mode, stack, depth, reuse)
+        self.expand_mount(
+            map,
+            map.mounts.len() - 1,
+            mode,
+            stack,
+            depth,
+            reuse,
+            options,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -310,6 +372,7 @@ impl Store {
         stack: &mut BTreeSet<(String, String)>,
         depth: usize,
         reuse: bool,
+        options: &mut ImportOptions,
     ) -> Result<()> {
         activity::check()?;
         if mode == Submodules::None {
@@ -334,6 +397,7 @@ impl Store {
                 if path.is_empty() { "/" } else { path }
             ),
         );
+        let mut missing_children = false;
         {
             let bare = self.root.join("repos").join(repo);
             let tree_spec = if mount.subtree.is_empty() {
@@ -401,7 +465,14 @@ impl Store {
                     } else {
                         Submodules::None
                     };
-                    if let Some(existing) = map.mounts.iter().position(|m| m.path == child_path) {
+                    // Roll back only this child's preparation on an access failure.
+                    // Successfully expanded siblings and ancestors stay in the candidate.
+                    let saved = options
+                        .skip_unavailable
+                        .then(|| (map.clone(), stack.clone(), options.skipped.len()));
+                    let result = if let Some(existing) =
+                        map.mounts.iter().position(|m| m.path == child_path)
+                    {
                         let m = &map.mounts[existing];
                         if !reuse
                             || map.repositories[&m.repository].url != child_url
@@ -410,7 +481,15 @@ impl Store {
                         {
                             return Err(error(format!("submodule mount conflict at {child_path}: existing origin/pin/subtree differs or path is occupied; use an explicit resolve workflow (no mounts changed)")));
                         }
-                        self.expand_mount(map, existing, child_mode, stack, depth + 1, reuse)?;
+                        self.expand_mount(
+                            map,
+                            existing,
+                            child_mode,
+                            stack,
+                            depth + 1,
+                            reuse,
+                            options,
+                        )
                     } else {
                         self.import_mount(
                             map,
@@ -421,12 +500,40 @@ impl Store {
                             stack,
                             depth + 1,
                             reuse,
-                        )?;
+                            options,
+                        )
+                    };
+                    if let Err(e) = result {
+                        activity::check()?; // Cancellation always aborts the whole plan.
+                        let unavailable = e
+                            .downcast_ref::<git::CommandFailure>()
+                            .is_some_and(|e| e.command == "fetch");
+                        if !options.skip_unavailable || !unavailable {
+                            return Err(e);
+                        }
+                        let (saved_map, saved_stack, skipped_len) = saved.unwrap();
+                        *map = saved_map;
+                        *stack = saved_stack;
+                        options.skipped.truncate(skipped_len);
+                        missing_children |= !map.mounts.iter().any(|m| m.path == child_path);
+                        let failure = e.downcast_ref::<git::CommandFailure>().unwrap();
+                        let message = format!("git {}: {}", failure.command, failure.message);
+                        activity::event(
+                            "warn",
+                            &format!("Skipped submodule {child_path}: {message}"),
+                        );
+                        if let Some(command) = &failure.retry_command {
+                            activity::event(
+                                "warn",
+                                &format!("Interactive retry for {child_path}: {command}"),
+                            );
+                        }
+                        options.skipped.push(json!({"path":child_path,"url":git::public_origin(&child_url),"commit":pin,"error":message,"retry_command":failure.retry_command}));
                     }
                 }
             }
         }
-        map.mounts[index].uninitialized_submodules = false;
+        map.mounts[index].uninitialized_submodules = missing_children;
         stack.remove(&(url, commit));
         Ok(())
     }

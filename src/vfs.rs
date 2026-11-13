@@ -43,29 +43,68 @@ pub struct Core {
 pub struct Fs {
     pub core: Arc<Core>,
     pool: Pool,
+    pending: Arc<Mutex<BTreeMap<u64, Arc<RequestWork>>>>,
 }
 struct Pool {
-    send: std::sync::mpsc::SyncSender<Box<dyn FnOnce() + Send>>,
+    cleanup: Option<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>>,
+    send: Option<std::sync::mpsc::SyncSender<Box<dyn FnOnce() + Send>>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
 }
 impl Pool {
     fn new() -> Self {
         let (send, recv) = std::sync::mpsc::sync_channel::<Box<dyn FnOnce() + Send>>(128);
         let recv = Arc::new(Mutex::new(recv));
+        let mut workers = vec![];
         for _ in 0..8 {
             let r = recv.clone();
-            std::thread::spawn(move || loop {
+            workers.push(std::thread::spawn(move || loop {
                 let job = r.lock().unwrap().recv();
                 match job {
                     Ok(job) => job(),
                     Err(_) => break,
                 }
-            });
+            }));
         }
-        Self { send }
+        let (cleanup, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        workers.push(std::thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                job();
+            }
+        }));
+        Self {
+            send: Some(send),
+            cleanup: Some(cleanup),
+            workers,
+        }
     }
-    fn submit(&self, job: impl FnOnce() + Send + 'static) {
-        if let Err(std::sync::mpsc::TrySendError::Full(job)) = self.send.try_send(Box::new(job)) {
-            job();
+    fn submit(
+        &self,
+        job: Box<dyn FnOnce() + Send>,
+    ) -> std::result::Result<(), Box<dyn FnOnce() + Send>> {
+        self.send
+            .as_ref()
+            .unwrap()
+            .try_send(job)
+            .map_err(|e| match e {
+                std::sync::mpsc::TrySendError::Full(job)
+                | std::sync::mpsc::TrySendError::Disconnected(job) => job,
+            })
+    }
+}
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.send.take();
+        self.cleanup.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+impl Drop for Fs {
+    fn drop(&mut self) {
+        let pending: Vec<_> = self.pending.lock().unwrap().values().cloned().collect();
+        for request in pending {
+            request.task.cancel();
         }
     }
 }
@@ -153,7 +192,8 @@ impl Core {
     }
     fn workspace(&self, p: &str) -> Result<(Arc<Mutex<Workspace>>, String)> {
         let (name, rel) = p.split_once('/').unwrap_or((p, ""));
-        let w = self.store.lock().unwrap().get(name)?;
+        crate::activity::stage(&format!("Workspace {name}: {rel}"));
+        let w = crate::activity::lock(&self.store)?.get(name)?;
         Ok((w, rel.into()))
     }
     fn entry(&self, p: &str) -> Result<Entry> {
@@ -161,7 +201,7 @@ impl Core {
             return Ok(dir());
         }
         let (w, rel) = self.workspace(p)?;
-        let e = w.lock().unwrap().entry(&rel)?;
+        let e = crate::activity::lock(&w)?.entry(&rel)?;
         Ok(e)
     }
     fn stat(&self, ino: u64) -> Result<FileAttr> {
@@ -188,7 +228,7 @@ impl Core {
     }
     fn add_handle(&self, mut h: Handle) -> Result<u64> {
         if let Some(w) = &h.workspace {
-            let mut w = w.lock().unwrap();
+            let mut w = crate::activity::lock(w)?;
             w.check()?;
             if h.generation.as_ref() != Some(&w.record.generation) {
                 return Err(io(libc::ESTALE));
@@ -216,7 +256,7 @@ impl Core {
     fn open(&self, ino: u64, flags: i32) -> Result<u64> {
         let p = self.path(ino)?;
         let (w, rel) = self.workspace(&p)?;
-        let guard = w.lock().unwrap();
+        let guard = crate::activity::lock(&w)?;
         let e = guard.entry(&rel)?;
         let generation = Some(guard.record.generation.clone());
         if e.kind != Kind::File {
@@ -284,19 +324,86 @@ impl Core {
         Ok(())
     }
 }
+type RequestCallback = Box<dyn FnOnce(bool) + Send>;
+struct RequestWork {
+    task: Arc<crate::activity::Task>,
+    work: Mutex<Option<RequestCallback>>,
+    rejected: std::sync::atomic::AtomicBool,
+    cleanup: bool,
+}
+impl RequestWork {
+    fn run(&self) {
+        let work = self.work.lock().unwrap().take();
+        if let Some(work) = work {
+            work(self.rejected.load(std::sync::atomic::Ordering::Acquire));
+        }
+    }
+}
+impl Fs {
+    fn schedule(
+        &self,
+        unique: u64,
+        kind: &str,
+        work: impl FnOnce(Arc<Core>, bool) + Send + 'static,
+    ) {
+        let task = Arc::new(crate::activity::Task::new(format!(
+            "FUSE {kind} request {unique}"
+        )));
+        let pending = self.pending.clone();
+        let core = self.core.clone();
+        let worker_task = task.clone();
+        let cleanup = matches!(kind, "release" | "releasedir");
+        let request = Arc::new(RequestWork {
+            task,
+            cleanup,
+            rejected: std::sync::atomic::AtomicBool::new(false),
+            work: Mutex::new(Some(Box::new(move |rejected| {
+                let _context = worker_task.enter();
+                work(core, rejected);
+                pending.lock().unwrap().remove(&unique);
+                worker_task.finish();
+            }))),
+        });
+        self.pending.lock().unwrap().insert(unique, request.clone());
+        if !cleanup {
+            let weak = Arc::downgrade(&request);
+            request.task.on_cancel(move || {
+                if let Some(request) = weak.upgrade() {
+                    request.run();
+                }
+            });
+        }
+        let queued = request.clone();
+        let job = Box::new(move || queued.run());
+        if cleanup {
+            let _ = self.pool.cleanup.as_ref().unwrap().send(job);
+        } else if let Err(job) = self.pool.submit(job) {
+            request
+                .rejected
+                .store(true, std::sync::atomic::Ordering::Release);
+            job(); // Rejected work only replies EAGAIN; no filesystem operation.
+        }
+    }
+}
 impl Fs {
     pub fn new(core: Arc<Core>) -> Self {
         Self {
             core,
             pool: Pool::new(),
+            pending: Default::default(),
         }
     }
 }
-impl Filesystem for Fs {
-    fn lookup(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+struct Operations {
+    core: Arc<Core>,
+}
+// These signatures mirror FUSE operations while owning request data.
+#[allow(clippy::too_many_arguments)]
+impl Operations {
+    fn lookup(&mut self, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let c = self.core.clone();
         let p = c.child(parent, name);
-        self.pool.submit(move || {
+        {
             let r = p.and_then(|p| {
                 let e = c.entry(&p)?;
                 Ok(attr(c.inode(&p), &e))
@@ -305,16 +412,16 @@ impl Filesystem for Fs {
                 Ok(a) => reply.entry(&TTL, &a, 0),
                 Err(e) => reply.error(errno(&*e)),
             }
-        });
+        }
     }
-    fn getattr(&mut self, _: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, ino: u64, reply: ReplyAttr) {
         let c = self.core.clone();
-        self.pool.submit(move || match c.stat(ino) {
+        match c.stat(ino) {
             Ok(a) => reply.attr(&TTL, &a),
             Err(e) => reply.error(errno(&*e)),
-        });
+        }
     }
-    fn readlink(&mut self, _: &Request<'_>, ino: u64, reply: ReplyData) {
+    fn readlink(&mut self, ino: u64, reply: ReplyData) {
         let r: Result<_> = (|| {
             let e = self.core.entry(&self.core.path(ino)?)?;
             if e.kind != Kind::Symlink {
@@ -334,7 +441,7 @@ impl Filesystem for Fs {
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn open(&mut self, _: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, ino: u64, flags: i32, reply: ReplyOpen) {
         match self.core.open(ino, flags) {
             Ok(h) => reply.opened(h, 0),
             Err(e) => reply.error(errno(&*e)),
@@ -342,7 +449,6 @@ impl Filesystem for Fs {
     }
     fn read(
         &mut self,
-        _: &Request<'_>,
         _: u64,
         fh: u64,
         offset: i64,
@@ -352,7 +458,7 @@ impl Filesystem for Fs {
         reply: ReplyData,
     ) {
         let c = self.core.clone();
-        self.pool.submit(move || {
+        {
             let r: Result<_> = (|| {
                 if offset < 0 {
                     return Err(io(libc::EINVAL));
@@ -376,11 +482,10 @@ impl Filesystem for Fs {
                 Ok(b) => reply.data(&b),
                 Err(e) => reply.error(errno(&*e)),
             }
-        });
+        }
     }
     fn write(
         &mut self,
-        _: &Request<'_>,
         _: u64,
         fh: u64,
         offset: i64,
@@ -408,7 +513,7 @@ impl Filesystem for Fs {
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn flush(&mut self, _: &Request<'_>, _: u64, fh: u64, _: u64, reply: ReplyEmpty) {
+    fn flush(&mut self, _: u64, fh: u64, _: u64, reply: ReplyEmpty) {
         let r: Result<_> = (|| {
             let n = self.core.nodes.lock().unwrap();
             if let Some(f) = n.handles.get(&fh).and_then(|h| h.file.as_ref()) {
@@ -418,32 +523,20 @@ impl Filesystem for Fs {
         })();
         respond(reply, r)
     }
-    fn fsync(&mut self, req: &Request<'_>, ino: u64, fh: u64, _: bool, reply: ReplyEmpty) {
-        self.flush(req, ino, fh, 0, reply)
+    fn fsync(&mut self, ino: u64, fh: u64, _: bool, reply: ReplyEmpty) {
+        self.flush(ino, fh, 0, reply)
     }
-    fn release(
-        &mut self,
-        _: &Request<'_>,
-        _: u64,
-        fh: u64,
-        _: i32,
-        _: Option<u64>,
-        _: bool,
-        reply: ReplyEmpty,
-    ) {
+    fn release(&mut self, _: u64, fh: u64, _: i32, _: Option<u64>, _: bool, reply: ReplyEmpty) {
         self.core.release(fh);
         reply.ok();
     }
-    fn opendir(&mut self, _: &Request<'_>, ino: u64, _: i32, reply: ReplyOpen) {
+    fn opendir(&mut self, ino: u64, _: i32, reply: ReplyOpen) {
         let r: Result<_> = (|| {
             let p = self.core.path(ino)?;
             let (workspace, names, generation) = if p.is_empty() {
                 (
                     None,
-                    self.core
-                        .store
-                        .lock()
-                        .unwrap()
+                    crate::activity::lock(&self.core.store)?
                         .workspaces
                         .keys()
                         .cloned()
@@ -452,7 +545,7 @@ impl Filesystem for Fs {
                 )
             } else {
                 let (w, rel) = self.core.workspace(&p)?;
-                let guard = w.lock().unwrap();
+                let guard = crate::activity::lock(&w)?;
                 let names = guard.children(&rel)?;
                 let generation = Some(guard.record.generation.clone());
                 drop(guard);
@@ -472,11 +565,11 @@ impl Filesystem for Fs {
                     Kind::Directory
                 } else {
                     let (w, rel) = self.core.workspace(&child)?;
-                    let e = w.lock().unwrap().metadata(&rel)?;
+                    let e = crate::activity::lock(&w)?.metadata(&rel)?;
                     if let Some(e) = e {
                         e.kind
                     } else {
-                        let w = w.lock().unwrap();
+                        let w = crate::activity::lock(&w)?;
                         if let Ok(m) = std::fs::symlink_metadata(w.upper().join(&rel)) {
                             if m.is_dir() {
                                 Kind::Directory
@@ -510,14 +603,7 @@ impl Filesystem for Fs {
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn readdir(
-        &mut self,
-        _: &Request<'_>,
-        _: u64,
-        fh: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
+    fn readdir(&mut self, _: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
         let n = self.core.nodes.lock().unwrap();
         if let Some(entries) = n.handles.get(&fh).and_then(|h| h.directory.as_ref()) {
             for (i, (ino, kind, name)) in entries.iter().enumerate().skip(offset.max(0) as usize) {
@@ -530,13 +616,12 @@ impl Filesystem for Fs {
             reply.error(libc::EBADF);
         }
     }
-    fn releasedir(&mut self, _: &Request<'_>, _: u64, fh: u64, _: i32, reply: ReplyEmpty) {
+    fn releasedir(&mut self, _: u64, fh: u64, _: i32, reply: ReplyEmpty) {
         self.core.release(fh);
         reply.ok();
     }
     fn create(
         &mut self,
-        _: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -547,7 +632,7 @@ impl Filesystem for Fs {
         let r: Result<_> = (|| {
             let p = self.core.child(parent, name)?;
             let (w, rel) = self.core.workspace(&p)?;
-            let guard = w.lock().unwrap();
+            let guard = crate::activity::lock(&w)?;
             let file = guard.create_file(&rel, mode & !umask)?;
             let e = guard.entry(&rel)?;
             let generation = Some(guard.record.generation.clone());
@@ -569,19 +654,11 @@ impl Filesystem for Fs {
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn mkdir(
-        &mut self,
-        _: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        mode: u32,
-        umask: u32,
-        reply: ReplyEntry,
-    ) {
+    fn mkdir(&mut self, parent: u64, name: &OsStr, mode: u32, umask: u32, reply: ReplyEntry) {
         let r: Result<_> = (|| {
             let p = self.core.child(parent, name)?;
             let (w, rel) = self.core.workspace(&p)?;
-            let w = w.lock().unwrap();
+            let w = crate::activity::lock(&w)?;
             w.mkdir(&rel, mode & !umask)?;
             Ok(attr(self.core.inode(&p), &w.entry(&rel)?))
         })();
@@ -590,18 +667,11 @@ impl Filesystem for Fs {
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn symlink(
-        &mut self,
-        _: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        target: &Path,
-        reply: ReplyEntry,
-    ) {
+    fn symlink(&mut self, parent: u64, name: &OsStr, target: &Path, reply: ReplyEntry) {
         let r: Result<_> = (|| {
             let p = self.core.child(parent, name)?;
             let (w, rel) = self.core.workspace(&p)?;
-            let w = w.lock().unwrap();
+            let w = crate::activity::lock(&w)?;
             w.symlink(&rel, target)?;
             Ok(attr(self.core.inode(&p), &w.entry(&rel)?))
         })();
@@ -610,15 +680,14 @@ impl Filesystem for Fs {
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn unlink(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         respond(reply, self.remove(parent, name, false));
     }
-    fn rmdir(&mut self, _: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&mut self, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         respond(reply, self.remove(parent, name, true));
     }
     fn rename(
         &mut self,
-        _: &Request<'_>,
         parent: u64,
         name: &OsStr,
         newparent: u64,
@@ -637,7 +706,7 @@ impl Filesystem for Fs {
             if !Arc::ptr_eq(&a, &b) {
                 return Err(io(libc::EXDEV));
             }
-            a.lock().unwrap().rename(&rel, &newrel)?;
+            crate::activity::lock(&a)?.rename(&rel, &newrel)?;
             self.core.unlink_nodes(&dst);
             let mut n = self.core.nodes.lock().unwrap();
             let old: Vec<_> = n
@@ -658,7 +727,6 @@ impl Filesystem for Fs {
     }
     fn setattr(
         &mut self,
-        _: &Request<'_>,
         ino: u64,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -682,7 +750,7 @@ impl Filesystem for Fs {
             }
             let f = if let Ok(path) = self.core.path(ino) {
                 let (w, rel) = self.core.workspace(&path)?;
-                let w = w.lock().unwrap();
+                let w = crate::activity::lock(&w)?;
                 if w.entry(&rel)?.kind == Kind::Symlink {
                     return Err(io(libc::EOPNOTSUPP));
                 }
@@ -745,9 +813,9 @@ impl Filesystem for Fs {
             Err(e) => reply.error(errno(&*e)),
         }
     }
-    fn statfs(&mut self, _: &Request<'_>, _: u64, reply: ReplyStatfs) {
-        let root = self.core.store.lock().unwrap().root.clone();
+    fn statfs(&mut self, _: u64, reply: ReplyStatfs) {
         let r: Result<_> = (|| {
+            let root = crate::activity::lock(&self.core.store)?.root.clone();
             let f = File::open(root)?;
             let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
             if unsafe { libc::fstatvfs(f.as_raw_fd(), &mut stat) } != 0 {
@@ -770,11 +838,382 @@ impl Filesystem for Fs {
         }
     }
 }
-impl Fs {
+impl Filesystem for Fs {
+    fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let name = name.to_owned();
+        self.schedule(req.unique(), "lookup", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.lookup(parent, &name, reply);
+        });
+    }
+    fn getattr(&mut self, req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        self.schedule(req.unique(), "getattr", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.getattr(ino, reply);
+        });
+    }
+    fn readlink(&mut self, req: &Request<'_>, ino: u64, reply: ReplyData) {
+        self.schedule(req.unique(), "readlink", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.readlink(ino, reply);
+        });
+    }
+    fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        self.schedule(req.unique(), "open", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.open(ino, flags, reply);
+        });
+    }
+    fn read(
+        &mut self,
+        req: &Request<'_>,
+        arg2: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        arg6: i32,
+        arg7: Option<u64>,
+        reply: ReplyData,
+    ) {
+        self.schedule(req.unique(), "read", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.read(arg2, fh, offset, size, arg6, arg7, reply);
+        });
+    }
+    fn write(
+        &mut self,
+        req: &Request<'_>,
+        arg2: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        arg6: u32,
+        arg7: i32,
+        arg8: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        let data = data.to_owned();
+        self.schedule(req.unique(), "write", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.write(arg2, fh, offset, &data, arg6, arg7, arg8, reply);
+        });
+    }
+    fn flush(&mut self, req: &Request<'_>, arg2: u64, fh: u64, arg4: u64, reply: ReplyEmpty) {
+        self.schedule(req.unique(), "flush", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.flush(arg2, fh, arg4, reply);
+        });
+    }
+    fn fsync(&mut self, req: &Request<'_>, ino: u64, fh: u64, arg4: bool, reply: ReplyEmpty) {
+        self.schedule(req.unique(), "fsync", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.fsync(ino, fh, arg4, reply);
+        });
+    }
+    fn release(
+        &mut self,
+        req: &Request<'_>,
+        arg2: u64,
+        fh: u64,
+        arg4: i32,
+        arg5: Option<u64>,
+        arg6: bool,
+        reply: ReplyEmpty,
+    ) {
+        self.schedule(req.unique(), "release", move |core, rejected| {
+            let _cleanup = crate::activity::critical();
+            let _ = rejected;
+            Operations { core }.release(arg2, fh, arg4, arg5, arg6, reply);
+        });
+    }
+    fn opendir(&mut self, req: &Request<'_>, ino: u64, arg3: i32, reply: ReplyOpen) {
+        self.schedule(req.unique(), "opendir", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.opendir(ino, arg3, reply);
+        });
+    }
+    fn readdir(
+        &mut self,
+        req: &Request<'_>,
+        arg2: u64,
+        fh: u64,
+        offset: i64,
+        reply: ReplyDirectory,
+    ) {
+        self.schedule(req.unique(), "readdir", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.readdir(arg2, fh, offset, reply);
+        });
+    }
+    fn releasedir(&mut self, req: &Request<'_>, arg2: u64, fh: u64, arg4: i32, reply: ReplyEmpty) {
+        self.schedule(req.unique(), "releasedir", move |core, rejected| {
+            let _cleanup = crate::activity::critical();
+            let _ = rejected;
+            Operations { core }.releasedir(arg2, fh, arg4, reply);
+        });
+    }
+    fn create(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        arg6: i32,
+        reply: ReplyCreate,
+    ) {
+        let name = name.to_owned();
+        self.schedule(req.unique(), "create", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.create(parent, &name, mode, umask, arg6, reply);
+        });
+    }
+    fn mkdir(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let name = name.to_owned();
+        self.schedule(req.unique(), "mkdir", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.mkdir(parent, &name, mode, umask, reply);
+        });
+    }
+    fn symlink(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let name = name.to_owned();
+        let target = target.to_owned();
+        self.schedule(req.unique(), "symlink", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.symlink(parent, &name, &target, reply);
+        });
+    }
+    fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let name = name.to_owned();
+        self.schedule(req.unique(), "unlink", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.unlink(parent, &name, reply);
+        });
+    }
+    fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let name = name.to_owned();
+        self.schedule(req.unique(), "rmdir", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.rmdir(parent, &name, reply);
+        });
+    }
+    fn rename(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let name = name.to_owned();
+        let newname = newname.to_owned();
+        self.schedule(req.unique(), "rename", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.rename(parent, &name, newparent, &newname, flags, reply);
+        });
+    }
+    fn setattr(
+        &mut self,
+        req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        arg9: Option<SystemTime>,
+        fh: Option<u64>,
+        arg11: Option<SystemTime>,
+        arg12: Option<SystemTime>,
+        arg13: Option<SystemTime>,
+        arg14: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        self.schedule(req.unique(), "setattr", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.setattr(
+                ino, mode, uid, gid, size, atime, mtime, arg9, fh, arg11, arg12, arg13, arg14,
+                reply,
+            );
+        });
+    }
+    fn statfs(&mut self, req: &Request<'_>, arg2: u64, reply: ReplyStatfs) {
+        self.schedule(req.unique(), "statfs", move |core, rejected| {
+            if rejected {
+                reply.error(libc::EAGAIN);
+                return;
+            }
+            if let Err(e) = crate::activity::check() {
+                reply.error(errno(&*e));
+                return;
+            }
+            Operations { core }.statfs(arg2, reply);
+        });
+    }
+    fn interrupt(&mut self, _: &Request<'_>, unique: u64) -> std::result::Result<(), libc::c_int> {
+        let request = self.pending.lock().unwrap().get(&unique).cloned();
+        if let Some(request) = request {
+            request.task.cancel();
+            crate::activity::event(
+                "info",
+                &format!(
+                    "FUSE interrupt for request {unique}, operation {}",
+                    request.task.id()
+                ),
+            );
+            // If still queued, take reply ownership here and return EINTR now.
+            // Running requests have already taken work and observe their token.
+            if !request.cleanup {
+                request.run();
+            }
+            Ok(())
+        } else {
+            Err(libc::EAGAIN)
+        }
+    }
+}
+impl Operations {
     fn remove(&self, parent: u64, name: &OsStr, directory: bool) -> Result<()> {
         let p = self.core.child(parent, name)?;
         let (w, rel) = self.core.workspace(&p)?;
-        w.lock().unwrap().unlink(&rel, directory)?;
+        crate::activity::lock(&w)?.unlink(&rel, directory)?;
         self.core.unlink_nodes(&p);
         Ok(())
     }
@@ -783,5 +1222,48 @@ fn respond(reply: ReplyEmpty, result: Result<()>) {
     match result {
         Ok(()) => reply.ok(),
         Err(e) => reply.error(errno(&*e)),
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn queued_cancellation_and_saturation_never_block_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let fs = Fs::new(Core::new(Arc::new(Mutex::new(store))));
+        let (ready, receive) = std::sync::mpsc::channel();
+        for i in 0..8 {
+            let ready = ready.clone();
+            fs.schedule(i, "blocked", move |_, _| {
+                ready.send(()).unwrap();
+                while crate::activity::check().is_ok() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+        }
+        for _ in 0..8 {
+            receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let (done, receive) = std::sync::mpsc::channel();
+        fs.schedule(9, "queued", move |_, _| {
+            done.send(crate::activity::check().is_err()).unwrap();
+        });
+        let id = fs.pending.lock().unwrap().get(&9).unwrap().task.id();
+        assert!(crate::activity::cancel(id));
+        assert!(receive.recv_timeout(Duration::from_millis(500)).unwrap());
+        assert!(!fs.pending.lock().unwrap().contains_key(&9));
+        // The cancelled closure still occupies one queue slot until drained.
+        for i in 10..137 {
+            fs.schedule(i, "queued", |_, _| {});
+        }
+        let (done, receive) = std::sync::mpsc::channel();
+        fs.schedule(200, "overflow", move |_, rejected| {
+            done.send(rejected).unwrap();
+        });
+        assert!(receive.recv_timeout(Duration::from_millis(500)).unwrap());
+        // Fs::drop cancels and joins all workers before releasing the state.
+        drop(fs);
     }
 }

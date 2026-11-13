@@ -48,13 +48,18 @@ impl Workspace {
         }
         Ok(false)
     }
+    fn state_time(&self) -> SystemTime {
+        fs::metadata(self.root.join("workspace.json"))
+            .and_then(|m| m.modified())
+            .unwrap_or_else(|_| SystemTime::now())
+    }
     pub fn metadata(&self, p: &str) -> Result<Option<Entry>> {
         let file = |b: Vec<u8>| {
             Some(Entry {
                 kind: Kind::File,
                 mode: 0o444,
                 size: b.len() as u64,
-                time: SystemTime::UNIX_EPOCH,
+                time: self.state_time(),
                 physical: None,
                 bytes: Some(b),
             })
@@ -64,7 +69,7 @@ impl Workspace {
                 kind: Kind::Symlink,
                 mode: 0o777,
                 size: path.as_os_str().len() as u64,
-                time: SystemTime::UNIX_EPOCH,
+                time: self.state_time(),
                 physical: None,
                 bytes: Some(path.as_os_str().as_encoded_bytes().to_vec()),
             })
@@ -101,7 +106,11 @@ impl Workspace {
                 kind: Kind::Directory,
                 mode: 0o755,
                 size: 0,
-                time: SystemTime::UNIX_EPOCH,
+                time: self
+                    .base
+                    .get("")
+                    .map(base_time)
+                    .unwrap_or_else(|| self.state_time()),
                 physical: None,
                 bytes: None,
             });
@@ -136,7 +145,7 @@ impl Workspace {
                 b.mode
             },
             size: 0,
-            time: SystemTime::UNIX_EPOCH,
+            time: base_time(b),
             physical: None,
             bytes: None,
         })
@@ -176,6 +185,9 @@ impl Workspace {
         }
         let _l = Lock::take(&self.state_root().join("locks").join(&b.repo))?;
         if !target.exists() {
+            crate::activity::check()?;
+            crate::activity::stage(&format!("Hydrate {}: {p}", self.record.name));
+            crate::activity::event("info", &format!("Hydrate {}: {p}", self.record.name));
             let repo = self.state_root().join("repos").join(&b.repo);
             let mut wanted = vec![b.oid.clone()];
             let parent = Path::new(p)
@@ -185,7 +197,10 @@ impl Workspace {
                 .unwrap();
             if self.listed.lock().unwrap().contains(parent) {
                 let present = self.present.lock().unwrap();
-                for (path, sibling) in &self.base {
+                for (index, (path, sibling)) in self.base.iter().enumerate() {
+                    if index % 1024 == 0 {
+                        crate::activity::check()?;
+                    }
                     if wanted.len() >= 256 {
                         break;
                     }
@@ -200,6 +215,7 @@ impl Workspace {
                 }
             }
             if let Err(e) = git::ensure_blobs(&repo, &wanted) {
+                crate::activity::check()?;
                 if wanted.len() == 1 {
                     return Err(e);
                 }
@@ -209,6 +225,8 @@ impl Workspace {
             self.present.lock().unwrap().extend(wanted);
             let mut bytes = git::local(&repo, &["cat-file", "blob", &b.oid], None)?;
             if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
+                crate::activity::stage(&format!("LFS hydrate {}: {p}", self.record.name));
+                crate::activity::event("info", &format!("LFS hydrate {}: {p}", self.record.name));
                 let mut cmd = std::process::Command::new("git");
                 cmd.arg("-C")
                     .arg(&repo)
@@ -245,6 +263,10 @@ impl Workspace {
             }
             atomic(&target, &bytes)?;
             fs::set_permissions(&target, fs::Permissions::from_mode(0o444))?;
+            crate::activity::event(
+                "info",
+                &format!("Hydrated {}: {p} ({} bytes)", self.record.name, bytes.len()),
+            );
         }
         Ok(target)
     }
@@ -259,7 +281,10 @@ impl Workspace {
         } else {
             format!("{p}/")
         };
-        for key in self.base.keys() {
+        for (index, key) in self.base.keys().enumerate() {
+            if index % 1024 == 0 {
+                crate::activity::check()?;
+            }
             if let Some(tail) = key.strip_prefix(&prefix) {
                 if let Some(first) = tail.split('/').next() {
                     if !first.is_empty() {
@@ -580,4 +605,14 @@ impl Workspace {
         };
         Ok(data == fs::read(self.base_file(p)?)?)
     }
+}
+
+fn base_time(base: &crate::model::Base) -> SystemTime {
+    let delta = std::time::Duration::from_secs(base.commit_time.unsigned_abs());
+    if base.commit_time < 0 {
+        SystemTime::UNIX_EPOCH.checked_sub(delta)
+    } else {
+        SystemTime::UNIX_EPOCH.checked_add(delta)
+    }
+    .unwrap_or(SystemTime::UNIX_EPOCH)
 }

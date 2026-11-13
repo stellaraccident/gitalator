@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod git;
 pub mod model;
 pub mod store;

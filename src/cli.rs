@@ -13,6 +13,12 @@ pub struct Cli {
 }
 #[derive(Subcommand, Serialize, Deserialize, Debug)]
 pub enum Cmd {
+    /// Show active operations without waiting for workspace locks.
+    Activity,
+    /// Cancel an operation reported by activity.
+    Cancel {
+        id: u64,
+    },
     Daemon {
         #[command(subcommand)]
         command: DaemonCmd,
@@ -102,4 +108,29 @@ pub enum DepotCmd {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+}
+
+impl Cmd {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Workspace { command } => match command {
+                WorkspaceCmd::Create { name, .. } => format!("workspace create {name}"),
+                WorkspaceCmd::Fork { name, .. } => format!("workspace fork {name}"),
+                WorkspaceCmd::Clone { name, .. } => format!("workspace clone {name}"),
+                WorkspaceCmd::Remove { name } => format!("workspace remove {name}"),
+                WorkspaceCmd::List => "workspace list".into(),
+            },
+            Self::Status { workspace } => format!("status {workspace}"),
+            Self::Diff { workspace } => format!("diff {workspace}"),
+            Self::Dir { workspace } => format!("dir {workspace}"),
+            Self::Revert { workspace, path } => format!("revert {workspace}: {path}"),
+            Self::Validate { workspace } => format!("validate {workspace}"),
+            Self::Checkpoint { workspace, .. } => format!("checkpoint {workspace}"),
+            Self::Depot { .. } => "depot edit session".into(),
+            Self::Daemon { .. } => "daemon lifecycle".into(),
+            Self::Config { .. } => "config".into(),
+            Self::Activity => "activity".into(),
+            Self::Cancel { id } => format!("cancel {id}"),
+        }
+    }
 }

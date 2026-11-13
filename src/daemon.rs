@@ -9,7 +9,7 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, IsTerminal, Write},
     os::{
         fd::AsRawFd,
         unix::{
@@ -29,25 +29,54 @@ use std::{
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn signal(_: i32) {
     STOP.store(true, Ordering::Release);
+    crate::activity::SHUTDOWN.store(true, Ordering::Release);
 }
 pub fn request(root: &Path, cmd: &Cmd) -> Result<Value> {
     let mut s = UnixStream::connect(root.join("control.sock"))?;
     s.set_read_timeout(Some(Duration::from_secs(600)))?;
     s.write_all(&serde_json::to_vec(cmd)?)?;
     s.write_all(b"\n")?;
-    let mut line = String::new();
-    BufReader::new(s).read_line(&mut line)?;
-    let v: Value = serde_json::from_str(&line)?;
-    if let Some(e) = v.get("error") {
-        return Err(error(e.as_str().unwrap_or("service failure")));
+    let mut reader = BufReader::new(s);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(error("server disconnected before replying"));
+        }
+        let v: Value = serde_json::from_str(&line)?;
+        if let Some(progress) = v.get("progress") {
+            if std::io::stderr().is_terminal() {
+                eprintln!(
+                    "gtl [{}] {}: {} ({:.1}s)",
+                    progress["id"],
+                    progress["operation"].as_str().unwrap_or("operation"),
+                    progress["stage"].as_str().unwrap_or("running"),
+                    progress["elapsed_seconds"].as_f64().unwrap_or(0.0)
+                );
+            }
+            continue;
+        }
+        if let Some(e) = v.get("error") {
+            return Err(error(e.as_str().unwrap_or("service failure")));
+        }
+        return Ok(v["ok"].clone());
     }
-    Ok(v["ok"].clone())
 }
 pub fn run(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root)?;
     let root = std::fs::canonicalize(root)?;
     let _lock = Lock::try_take(&root.join("daemon.lock"))?;
-    let store = Store::open(&root)?;
+    crate::activity::init(&root)?;
+    unsafe {
+        libc::signal(libc::SIGTERM, signal as *const () as usize);
+        libc::signal(libc::SIGINT, signal as *const () as usize);
+    }
+    let startup = crate::activity::Task::new("Open workspace state");
+    let store = {
+        let _context = startup.enter();
+        crate::activity::event("info", "Starting foreground filesystem server");
+        Store::open(&root)?
+    };
+    drop(startup);
     let mount = store.config.mount.clone();
     std::fs::create_dir_all(&mount)?;
     if std::fs::read_dir(&mount)?.next().is_some() {
@@ -78,7 +107,20 @@ pub fn run(root: &Path) -> Result<()> {
     }
     let stopping = Arc::new(AtomicBool::new(false));
     let mut clients = vec![];
+    let mut heartbeat = Instant::now();
+    crate::activity::event(
+        "info",
+        &format!(
+            "Ready: mount {}; activity log {}",
+            mount.display(),
+            root.join("logs/activity.jsonl").display()
+        ),
+    );
     while !stopping.load(Ordering::Acquire) && !STOP.load(Ordering::Acquire) {
+        if heartbeat.elapsed() >= Duration::from_secs(5) {
+            crate::activity::heartbeat();
+            heartbeat = Instant::now();
+        }
         match listener.accept() {
             Ok((s, _)) => {
                 let core = core.clone();
@@ -109,6 +151,8 @@ pub fn run(root: &Path) -> Result<()> {
             }
         }
     }
+    crate::activity::cancel_all();
+    crate::activity::event("info", "Stopping: cancelling outstanding work");
     for client in clients {
         let _ = client.join();
     }
@@ -117,6 +161,7 @@ pub fn run(root: &Path) -> Result<()> {
     }
     drop(session);
     let _ = std::fs::remove_file(socket);
+    crate::activity::event("info", "Filesystem server stopped");
     Ok(())
 }
 fn serve(stream: &UnixStream, core: Arc<Core>, mount: &Path, stop: &AtomicBool) -> Result<Value> {
@@ -148,10 +193,12 @@ fn serve(stream: &UnixStream, core: Arc<Core>, mount: &Path, stop: &AtomicBool) 
     }
     let cmd: Cmd = serde_json::from_slice(&line)?;
     match cmd {
+        Cmd::Activity => Ok(crate::activity::snapshot()),
+        Cmd::Cancel { id } => Ok(json!({"id":id,"cancelled":crate::activity::cancel(id)})),
         Cmd::Daemon {
             command: DaemonCmd::Status,
         } => Ok(
-            json!({"running":true,"ready":true,"pid":std::process::id(),"mount":mount,"protocol":4}),
+            json!({"running":true,"ready":true,"pid":std::process::id(),"mount":mount,"protocol":5}),
         ),
         Cmd::Daemon {
             command: DaemonCmd::Stop { lazy },
@@ -170,7 +217,53 @@ fn serve(stream: &UnixStream, core: Arc<Core>, mount: &Path, stop: &AtomicBool) 
             Ok(json!({"stopping":true}))
         }
         Cmd::Daemon { .. } => Err(error("lifecycle command must run in client")),
-        cmd => dispatch(&core, cmd),
+        cmd => {
+            let task = Arc::new(crate::activity::Task::new(cmd.label()));
+            let _context = task.enter();
+            crate::activity::event("info", &format!("Begin {}", cmd.label()));
+            let done = Arc::new(AtomicBool::new(false));
+            let watch_done = done.clone();
+            let watch_task = task.clone();
+            let mut peer = stream.try_clone()?;
+            peer.set_write_timeout(Some(Duration::from_secs(2)))?;
+            writeln!(peer, "{}", json!({"progress":task.status()}))?;
+            // A CLI killed by Ctrl-C closes its socket: cancel its server work.
+            let watcher = std::thread::spawn(move || {
+                let mut poll = libc::pollfd {
+                    fd: peer.as_raw_fd(),
+                    events: libc::POLLRDHUP,
+                    revents: 0,
+                };
+                let mut progress = Instant::now();
+                while !watch_done.load(Ordering::Acquire) {
+                    if progress.elapsed() >= Duration::from_secs(1) {
+                        if writeln!(peer, "{}", json!({"progress":watch_task.status()})).is_err() {
+                            watch_task.cancel();
+                            break;
+                        }
+                        progress = Instant::now();
+                    }
+                    let result = unsafe { libc::poll(&mut poll, 1, 50) };
+                    if result > 0
+                        && poll.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
+                    {
+                        watch_task.cancel();
+                        break;
+                    }
+                }
+            });
+            let result = dispatch(&core, cmd);
+            done.store(true, Ordering::Release);
+            let _ = watcher.join();
+            match &result {
+                Ok(_) => crate::activity::event("info", "Completed"),
+                Err(e) if crate::activity::interrupted(&**e) => {
+                    crate::activity::event("info", "Cancelled")
+                }
+                Err(e) => crate::activity::event("error", &format!("Failed: {e}")),
+            }
+            result
+        }
     }
 }
 pub fn unit_text(exe: &Path, root: &Path) -> String {

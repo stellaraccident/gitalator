@@ -201,7 +201,19 @@ impl Store {
         let mut out: BTreeMap<String, Base> = BTreeMap::new();
         let mut mounts = map.mounts.clone();
         mounts.sort_by_key(|m| m.path.len());
-        for m in &mounts {
+        for (index, m) in mounts.iter().enumerate() {
+            crate::activity::check()?;
+            crate::activity::event(
+                "info",
+                &format!(
+                    "Index mount {}/{}: {} at {} ({})",
+                    index + 1,
+                    mounts.len(),
+                    m.id,
+                    if m.path.is_empty() { "/" } else { &m.path },
+                    m.commit
+                ),
+            );
             let id = self.repo(&map.repositories[&m.repository].url)?;
             self.fetch(&id, &m.commit)?;
             out.retain(|p, _| !under(p, &m.path));
@@ -211,6 +223,8 @@ impl Store {
                 format!("{}:{}", m.commit, m.subtree)
             };
             let path = self.root.join("repos").join(&id);
+            let commit_time: i64 =
+                git::text(&path, &["show", "-s", "--format=%ct", &m.commit])?.parse()?;
             let tree = git::text(&path, &["rev-parse", &spec])?;
             if git::text(&path, &["cat-file", "-t", &tree])? != "tree" {
                 return Err(error("mount subtree is not a directory"));
@@ -218,6 +232,7 @@ impl Store {
             out.insert(
                 m.path.clone(),
                 Base {
+                    commit_time,
                     kind: Kind::Directory,
                     mode: 0o755,
                     oid: tree.clone(),
@@ -226,7 +241,14 @@ impl Store {
                 },
             );
             let bytes = git::run(&path, &["ls-tree", "-r", "-t", "-z", &tree])?;
-            for line in bytes.split(|b| *b == 0).filter(|b| !b.is_empty()) {
+            for (index, line) in bytes
+                .split(|b| *b == 0)
+                .filter(|b| !b.is_empty())
+                .enumerate()
+            {
+                if index % 1024 == 0 {
+                    crate::activity::check()?;
+                }
                 let line = std::str::from_utf8(line)?;
                 let (meta, p) = line.split_once('\t').ok_or("bad ls-tree")?;
                 let fields: Vec<_> = meta.split(' ').collect();
@@ -254,6 +276,7 @@ impl Store {
                 out.insert(
                     join(&m.path, p),
                     Base {
+                        commit_time,
                         kind,
                         mode: if fields[0] == "100755" { 0o755 } else { 0o644 },
                         oid: fields[2].into(),
@@ -264,10 +287,12 @@ impl Store {
             }
         }
         for m in &mounts {
+            let out_time = out.get(&m.path).map(|b| b.commit_time).unwrap_or(0);
             let mut p = Path::new(&m.path).parent();
             while let Some(parent) = p {
                 let name = parent.to_str().unwrap();
                 out.entry(name.into()).or_insert(Base {
+                    commit_time: out_time,
                     kind: Kind::Directory,
                     mode: 0o755,
                     oid: String::new(),
@@ -572,6 +597,8 @@ impl Workspace {
                 "pending recovery; restart the daemon before more mutations",
             ));
         }
+        crate::activity::check()?;
+        let _critical = crate::activity::critical();
         json_write(&p, &j)?;
         crate::failpoint("journal-published");
         self.apply(&j)?;

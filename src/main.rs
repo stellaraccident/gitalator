@@ -14,10 +14,24 @@ use std::{
 };
 fn invoke(root: &Path, offline: bool, cmd: Cmd) -> Result<serde_json::Value> {
     if offline {
+        gitalator::activity::init(root)?;
+        let task = gitalator::activity::Task::new(cmd.label());
+        let _context = task.enter();
         std::fs::create_dir_all(root)?;
         let _lock = Lock::try_take(&root.join("daemon.lock"))?;
-        let store = Store::open(root)?;
-        dispatch(&Core::new(Arc::new(Mutex::new(store))), cmd)
+        gitalator::activity::event("info", &format!("Begin {}", cmd.label()));
+        let result = (|| {
+            let store = Store::open(root)?;
+            dispatch(&Core::new(Arc::new(Mutex::new(store))), cmd)
+        })();
+        match &result {
+            Ok(_) => gitalator::activity::event("info", "Completed"),
+            Err(e) if gitalator::activity::interrupted(&**e) => {
+                gitalator::activity::event("info", "Cancelled")
+            }
+            Err(e) => gitalator::activity::event("error", &format!("Failed: {e}")),
+        }
+        result
     } else {
         daemon::request(root, &cmd)
     }
@@ -25,6 +39,15 @@ fn invoke(root: &Path, offline: bool, cmd: Cmd) -> Result<serde_json::Value> {
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
     let root = absolute(&cli.state_dir)?;
+    if cli.offline {
+        extern "C" fn interrupt(_: i32) {
+            gitalator::activity::SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+        }
+        unsafe {
+            libc::signal(libc::SIGINT, interrupt as *const () as usize);
+            libc::signal(libc::SIGTERM, interrupt as *const () as usize);
+        }
+    }
     if let Cmd::Workspace {
         command: gitalator::cli::WorkspaceCmd::Create { from, .. },
     } = &mut cli.command

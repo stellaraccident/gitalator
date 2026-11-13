@@ -174,7 +174,7 @@ impl Workspace {
 impl Store {
     pub fn fork(&mut self, name: &str, source: &str, live: bool) -> Result<String> {
         let w = self.get(source)?;
-        let w = w.lock().unwrap();
+        let w = crate::activity::lock(&w)?;
         w.quiescent()?;
         w.validate()?;
         let bare = self.root.join("repos").join(&w.record.depot_repo);
@@ -184,7 +184,7 @@ impl Store {
         let path = self.create(name, &url, &head)?;
         if live {
             let target = self.get(name)?;
-            let mut target = target.lock().unwrap();
+            let mut target = crate::activity::lock(&target)?;
             target.record.editing = true;
             target.record.edit_token = Some(token());
             target.save()?;
@@ -234,7 +234,7 @@ impl Store {
     }
     pub fn remove(&mut self, name: &str) -> Result<()> {
         let w = self.get(name)?;
-        let w = w.lock().unwrap();
+        let w = crate::activity::lock(&w)?;
         w.quiescent()?;
         if !git::run(
             &w.depot(),
@@ -266,7 +266,7 @@ impl Store {
 pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
     match cmd {
         Cmd::Workspace { command } => {
-            let mut s = core.store.lock().unwrap();
+            let mut s = crate::activity::lock(&core.store)?;
             match command {
                 WorkspaceCmd::Create {
                     name,
@@ -287,7 +287,7 @@ pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
             }
         }
         Cmd::Config { mount } => {
-            let mut s = core.store.lock().unwrap();
+            let mut s = crate::activity::lock(&core.store)?;
             if core.notifier.lock().unwrap().is_some() {
                 return Err(error(
                     "mount configuration requires stopped daemon and --offline",
@@ -302,23 +302,23 @@ pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
             Ok(json!(s.config))
         }
         Cmd::Dir { workspace } => {
-            Ok(json!({"path":core.store.lock().unwrap().config.mount.join(workspace)}))
+            Ok(json!({"path":crate::activity::lock(&core.store)?.config.mount.join(workspace)}))
         }
         Cmd::Status { workspace } => {
             let w = get(core, &workspace)?;
-            let w = w.lock().unwrap();
+            let w = crate::activity::lock(&w)?;
             Ok(
                 json!({"record":w.record,"worktree":w.depot(),"git_status":git::text(&w.depot(),&["status","--porcelain"]).unwrap_or_else(|e|format!("unavailable: {e}"))}),
             )
         }
-        Cmd::Diff { workspace } => get(core, &workspace)?.lock().unwrap().diff(),
+        Cmd::Diff { workspace } => crate::activity::lock(&*get(core, &workspace)?)?.diff(),
         Cmd::Validate { workspace } => {
-            get(core, &workspace)?.lock().unwrap().validate()?;
+            crate::activity::lock(&*get(core, &workspace)?)?.validate()?;
             Ok(json!({"valid":true}))
         }
         Cmd::Revert { workspace, path } => {
             let w = get(core, &workspace)?;
-            let w = w.lock().unwrap();
+            let w = crate::activity::lock(&w)?;
             w.quiescent()?;
             w.revert(&path)?;
             drop(w);
@@ -326,22 +326,19 @@ pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
             Ok(json!({"reverted":path}))
         }
         Cmd::Checkpoint { workspace, message } => {
-            let commit = get(core, &workspace)?
-                .lock()
-                .unwrap()
-                .checkpoint(&message)?;
+            let commit = crate::activity::lock(&*get(core, &workspace)?)?.checkpoint(&message)?;
             core.invalidate(&workspace)?;
             Ok(json!({"commit":commit}))
         }
         Cmd::Depot { command } => match command {
             DepotCmd::Begin { workspace } => {
                 let w = get(core, &workspace)?;
-                let mut w = w.lock().unwrap();
+                let mut w = crate::activity::lock(&w)?;
                 let t = w.begin()?;
                 Ok(json!({"token":t,"worktree":w.depot()}))
             }
             DepotCmd::End { workspace, token } => {
-                get(core, &workspace)?.lock().unwrap().end(&token)?;
+                crate::activity::lock(&*get(core, &workspace)?)?.end(&token)?;
                 core.invalidate(&workspace)?;
                 Ok(json!({"resumed":true}))
             }
@@ -351,5 +348,5 @@ pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
     }
 }
 fn get(core: &Core, name: &str) -> Result<Arc<Mutex<Workspace>>> {
-    core.store.lock().unwrap().get(name)
+    crate::activity::lock(&core.store)?.get(name)
 }

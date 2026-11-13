@@ -45,6 +45,7 @@ impl Lock {
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
         loop {
+            crate::activity::check()?;
             if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 break;
             }

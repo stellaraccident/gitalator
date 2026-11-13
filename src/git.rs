@@ -1,4 +1,5 @@
 use crate::{error, Result};
+use std::time::Instant;
 use std::{
     io::{Read, Write},
     os::unix::process::CommandExt,
@@ -19,6 +20,7 @@ fn execute_command_progress(
     timeout: std::time::Duration,
     progress: Option<Progress>,
 ) -> Result<std::process::Output> {
+    crate::activity::check()?;
     cmd.process_group(0)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -34,7 +36,9 @@ fn execute_command_progress(
         let mut b = vec![];
         stdout.read_to_end(&mut b).map(|_| b)
     });
+    let scope = crate::activity::capture();
     let err = std::thread::spawn(move || {
+        let _context = scope.enter();
         let mut b = vec![];
         let mut chunk = [0u8; 4096];
         let mut line = Vec::new();
@@ -72,7 +76,37 @@ fn execute_command_progress(
         None
     };
     let start = std::time::Instant::now();
-    let (status, timedout) = loop {
+    let mut cancelled = false;
+    let mut heartbeat = Instant::now();
+    let (status, mut timedout) = loop {
+        if crate::activity::check().is_err() {
+            cancelled = true;
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            }
+            let grace = Instant::now();
+            while grace.elapsed() < std::time::Duration::from_millis(200) {
+                if child.try_wait()?.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            break (child.wait()?, false);
+        }
+        if heartbeat.elapsed() >= std::time::Duration::from_secs(5) {
+            crate::activity::event(
+                "info",
+                &format!(
+                    "Backend pid {} still running ({:.1}s)",
+                    child.id(),
+                    start.elapsed().as_secs_f64()
+                ),
+            );
+            heartbeat = Instant::now();
+        }
         if let Some(status) = child.try_wait()? {
             break (status, false);
         }
@@ -84,6 +118,25 @@ fn execute_command_progress(
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
+    // A helper can exit while descendants still own its pipes. Keep enforcing
+    // cancellation/deadlines until the entire captured process group drains.
+    while !out.is_finished()
+        || !err.is_finished()
+        || writer.as_ref().is_some_and(|w| !w.is_finished())
+    {
+        if crate::activity::check().is_err() {
+            cancelled = true;
+        }
+        if start.elapsed() >= timeout {
+            timedout = true;
+        }
+        if cancelled || timedout {
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let stdout = out.join().map_err(|_| error("stdout worker failed"))??;
     let stderr = err.join().map_err(|_| error("stderr worker failed"))??;
     if let Some(w) = writer {
@@ -91,6 +144,17 @@ fn execute_command_progress(
         if status.success() {
             r?;
         }
+    }
+    if cancelled {
+        crate::activity::event(
+            "info",
+            &format!(
+                "Cancelled backend process group {} after {:.2}s",
+                child.id(),
+                start.elapsed().as_secs_f64()
+            ),
+        );
+        return Err(std::io::Error::from_raw_os_error(libc::EINTR).into());
     }
     if timedout {
         return Err(error(format!(
@@ -127,6 +191,18 @@ pub fn local(path: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>
     execute(path, args, input, true)
 }
 fn execute(path: &Path, args: &[&str], input: Option<&[u8]>, local_only: bool) -> Result<Vec<u8>> {
+    let fetch = args.contains(&"fetch");
+    let started = Instant::now();
+    let fetch_label = if fetch {
+        let origin = text(path, &["remote", "get-url", "origin"])
+            .unwrap_or_else(|_| path.display().to_string());
+        let label = format!("Fetch {} ({})", public_origin(&origin), path.display());
+        crate::activity::stage(&label);
+        crate::activity::event("info", &label);
+        label
+    } else {
+        String::new()
+    };
     let mut cmd = Command::new("git");
     cmd.args([
         "-c",
@@ -149,7 +225,37 @@ fn execute(path: &Path, args: &[&str], input: Option<&[u8]>, local_only: bool) -
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-    let out = execute_command(&mut cmd, input, std::time::Duration::from_secs(300))?;
+    if fetch {
+        cmd.arg("--progress");
+    }
+    let progress: Option<Progress> = if fetch {
+        Some(std::sync::Arc::new(move |line| {
+            crate::activity::stage(&format!("{fetch_label}: {line}"));
+            crate::activity::event("info", line)
+        }))
+    } else {
+        None
+    };
+    let result = execute_command_progress(
+        &mut cmd,
+        input,
+        std::time::Duration::from_secs(300),
+        progress,
+    );
+    if fetch {
+        let status = match &result {
+            Ok(out) if out.status.success() => "completed",
+            Ok(_) => "failed",
+            Err(e) if crate::activity::interrupted(&**e) => "cancelled",
+            Err(_) => "failed",
+        };
+        crate::activity::event(
+            if status == "failed" { "error" } else { "info" },
+            &format!("Fetch {status} in {:.2}s", started.elapsed().as_secs_f64()),
+        );
+        crate::activity::stage(status);
+    }
+    let out = result?;
     if !out.status.success() {
         return Err(error(format!(
             "git {}: {}",
@@ -234,6 +340,7 @@ fn object_presence(
         return Ok(());
     }
     for (id, found) in oids.iter().zip(present.iter_mut()) {
+        crate::activity::check()?;
         let id = id.to_ascii_lowercase();
         match std::fs::metadata(objects.join(&id[..2]).join(&id[2..])) {
             Ok(m) => *found |= m.is_file(),
@@ -244,6 +351,7 @@ fn object_presence(
     let packs = objects.join("pack");
     if packs.exists() {
         for entry in std::fs::read_dir(packs)? {
+            crate::activity::check()?;
             let path = entry?.path();
             if path.extension().is_none_or(|ext| ext != "idx") {
                 continue;
@@ -327,7 +435,12 @@ pub fn ensure_blobs(repo: &Path, oids: &[String]) -> Result<Vec<u64>> {
             return Ok(sizes.into_iter().map(Option::unwrap).collect());
         }
         let input = missing.join("\n") + "\n";
+        crate::activity::event(
+            "info",
+            &format!("Demand fetch: {} missing blobs", missing.len()),
+        );
         let fetch = input_fetch(repo, input.as_bytes());
+        crate::activity::check()?;
         sizes = blob_sizes_local(repo, oids)?;
         if sizes.iter().all(Option::is_some) {
             return Ok(sizes.into_iter().map(Option::unwrap).collect());
@@ -373,4 +486,17 @@ fn input_fetch(repo: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
         ],
         Some(bytes),
     )
+}
+
+/// Keep repository names useful without logging embedded credentials.
+fn public_origin(url: &str) -> String {
+    let value = url.split_once("://").map(|(_, tail)| tail).unwrap_or(url);
+    value
+        .rsplit('@')
+        .next()
+        .unwrap_or(value)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_owned()
 }

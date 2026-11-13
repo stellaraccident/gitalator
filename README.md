@@ -94,6 +94,38 @@ gtl --offline config --mount "$HOME/ws"
 Changing the path requires a restart. Normal `daemon stop` reports busy mounts;
 `daemon stop --lazy` explicitly detaches. Backing state is not relocated.
 
+## Activity and cancellation
+
+Foreground `gtl daemon run` prints timestamped activity to stderr when attached
+to a terminal. Interactive CLI commands also show operation progress while waiting.
+Redirected commands keep stdout as JSON and do not print progress to stderr.
+The server and offline commands always record activity in
+`STATE/logs/activity.jsonl` (10 MiB per file, three rotated archives). Detached
+startup diagnostics remain in `STATE/logs/daemon.log`; systemd captures stderr
+in its journal.
+
+```sh
+gtl activity                         # IDs, stages, elapsed times; no workspace lock
+gtl cancel 42                        # cancel an operation by its reported ID
+tail -f /path/to/state/logs/activity.jsonl
+```
+
+Activity includes mount indexing, repository fetches, Git transfer progress,
+payload/LFS hydration, elapsed-time heartbeats, failures and cancellation.
+Raw `GIT_TRACE2_EVENT` remains available for deeper Git diagnostics.
+
+Ctrl-C on a blocked filesystem client propagates FUSE interruption through queued
+work, lock waits, and backend subprocess groups. Ctrl-C on a CLI command closes its
+control connection and cancels the corresponding server operation. Offline commands
+and server shutdown also cancel backend work. A published namespace journal is
+finished before cancellation takes effect, preserving recoverability; cancellation
+does not roll back already completed changes or delete successfully fetched objects.
+A cancelled backing-Git edit/checkpoint may leave an edit lease requiring repair.
+
+Base files and directories report the pinned mount commit's **committer time**.
+These are stable snapshot timestamps, not per-file last-change dates. Overlay
+files retain their real worktree timestamps.
+
 ## Edit, inspect, and commit
 
 ```sh

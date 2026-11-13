@@ -118,6 +118,31 @@ for explicit startup, never enabled automatically. Stopping the daemon affects
 all workspaces; an edit lease affects only its own workspace. No remote publishing
 or implicit background synchronization occurs.
 
-FUSE interruption is not yet propagated to in-flight Git subprocesses. A slow
-backend operation can hold the workspace lock until completion or its timeout;
-Ctrl-C in a client is not a reliable cancellation mechanism for that work.
+FUSE interruption is dispatched by the narrowly patched vendored fuser 0.14
+dependency. Request IDs own cancellation tokens and reply ownership. Queued
+requests can reply EINTR immediately without waiting for a worker; running
+requests check cancellation during mutex/flock waits, traversal and backend work.
+The dispatch thread never executes slow fallback work on queue saturation.
+Cleanup requests have a separate worker; shutdown cancels outstanding work and
+joins workers before releasing state ownership.
+
+Git subprocesses run in separate process groups. Cancellation sends TERM, allows
+a short cleanup grace, then kills remaining descendants and drains their pipes.
+Missing-object probes use local pack indexes rather than promisor traversal.
+A committed namespace journal is a non-cancellable section until redo completes.
+Partial fetches may leave reusable Git objects; a cancellation is not a rollback.
+Checkpoints and backing Git commands retain their existing edit-lease recovery
+semantics if interrupted.
+
+The activity registry has no dependency on workspace locks. Control protocol 5
+streams progress frames before its final response; interactive clients render
+them on stderr and redirected clients retain JSON stdout. Disconnecting a client
+cancels its associated operation. The foreground daemon renders activity on a
+terminal and all server/offline activity is persisted as rotating JSONL logs.
+Three 10-MiB archives plus the current log bound retention. Credential-bearing
+URLs and token/password fields are redacted from messages.
+
+Immutable base entries use their mount pin's committer timestamp (including
+subtree mounts), independent of object download/cache creation time. Overlay
+entries use physical worktree metadata; generated discovery entries use workspace
+state metadata timestamps.

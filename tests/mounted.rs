@@ -19,7 +19,9 @@ struct Mounted {
 }
 impl Mounted {
     fn new() -> Self {
-        let f = Fixture::new();
+        Self::configured(Fixture::new(), &[])
+    }
+    fn configured(f: Fixture, env: &[(&str, &std::ffi::OsStr)]) -> Self {
         let store = f.store();
         let mount = store.config.mount.clone();
         drop(store);
@@ -28,6 +30,7 @@ impl Mounted {
             .arg("--state-dir")
             .arg(&f.state)
             .args(["daemon", "run"])
+            .envs(env.iter().copied())
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()
@@ -307,4 +310,252 @@ fn backing_edit_can_change_file_type() {
         },
     });
     assert_eq!(fs::read(m.dev().join("src/hello")).unwrap(), b"nested\n");
+}
+
+fn wait_for(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+fn wait_exit(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not exit after cancellation");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+fn delayed_mount() -> (Mounted, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let old = gitalator::git::text(&f.component, &["rev-parse", "HEAD"]).unwrap();
+    for i in 0..20 {
+        fs::write(
+            f.component.join(format!("blocked-{i}")),
+            format!("payload {i}"),
+        )
+        .unwrap();
+    }
+    commit(&f.component);
+    let pin = gitalator::git::text(&f.component, &["rev-parse", "HEAD"]).unwrap();
+    let map = fs::read_to_string(f.depot.join("depot.toml")).unwrap();
+    fs::write(f.depot.join("depot.toml"), map.replace(&old, &pin)).unwrap();
+    commit(&f.depot);
+    gitalator::git::run(&f.component, &["config", "uploadpack.allowFilter", "true"]).unwrap();
+    let dir = f.component.parent().unwrap().join("fake-bin");
+    fs::create_dir(&dir).unwrap();
+    let gate = dir.join("delay");
+    let pid = dir.join("pid");
+    fs::write(&gate, b"").unwrap();
+    let real = Command::new("which").arg("git").output().unwrap();
+    let real = String::from_utf8(real.stdout).unwrap();
+    fs::write(
+        dir.join("git"),
+        format!(
+            r#"#!/bin/sh
+case " $* " in
+  *" fetch "*)
+    if [ -e "$GTL_TEST_GATE" ]; then
+      echo $$ > "$GTL_TEST_PID"
+      echo "test transfer waiting" >&2
+      sleep 60
+    fi
+    ;;
+esac
+exec "{}" "$@"
+"#,
+            real.trim()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(dir.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap());
+    let m = Mounted::configured(
+        f,
+        &[
+            ("PATH", std::ffi::OsStr::new(&path)),
+            ("GTL_TEST_GATE", gate.as_os_str()),
+            ("GTL_TEST_PID", pid.as_os_str()),
+        ],
+    );
+    (m, gate, pid)
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn interrupt_fetch_and_retry_without_blocking_other_workspaces() {
+    let (m, gate, pid) = delayed_mount();
+    m.request(Cmd::Workspace {
+        command: WorkspaceCmd::Fork {
+            name: "quiet".into(),
+            from: "dev".into(),
+        },
+    });
+    let mut client = Command::new("ls")
+        .args(["-l"])
+        .arg(m.dev().join("src/hello"))
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(&pid);
+    let before = Instant::now();
+    let activity = m.request(Cmd::Activity);
+    assert!(activity
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["stage"].as_str().unwrap().contains("Fetch")));
+    assert_eq!(
+        fs::read(m.mount.join("quiet/build/config")).unwrap(),
+        b"config\n"
+    );
+    assert!(before.elapsed() < Duration::from_secs(2));
+    unsafe {
+        libc::kill(client.id() as i32, libc::SIGINT);
+    }
+    assert!(!wait_exit(&mut client).success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let logs = fs::read_to_string(m.f.state.join("logs/activity.jsonl")).unwrap();
+        if logs.contains("Cancelled backend process group") {
+            assert!(logs.contains("FUSE interrupt"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backend cancellation missing: {logs}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fs::remove_file(gate).unwrap();
+    assert_eq!(fs::read(m.dev().join("src/hello")).unwrap(), b"hello\n");
+    let expected: u64 =
+        gitalator::git::text(&m.f.component, &["show", "-s", "--format=%ct", "HEAD"])
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(
+        fs::metadata(m.dev().join("src/hello"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        expected
+    );
+    assert_eq!(
+        fs::metadata(m.dev().join("src/dir"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        expected
+    );
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn explicit_cancel_releases_lock_wait_and_cli_disconnect_cancels_fetch() {
+    let (m, gate, pid) = delayed_mount();
+    // Diff must hydrate this upper file to compare it to its base.
+    let depot = fs::read_link(m.dev().join(".depotgit")).unwrap();
+    m.request(Cmd::Depot {
+        command: DepotCmd::Begin {
+            workspace: "dev".into(),
+        },
+    });
+    fs::create_dir_all(depot.join("overlay/src")).unwrap();
+    fs::write(depot.join("overlay/src/hello"), b"edited").unwrap();
+    let status = m.request(Cmd::Status {
+        workspace: "dev".into(),
+    });
+    let token = status["record"]["edit_token"].as_str().unwrap().to_string();
+    m.request(Cmd::Depot {
+        command: DepotCmd::End {
+            workspace: "dev".into(),
+            token,
+        },
+    });
+    let mut client = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .arg("--state-dir")
+        .arg(&m.f.state)
+        .args(["diff", "dev"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(&pid);
+    let mut waiter = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .arg("--state-dir")
+        .arg(&m.f.state)
+        .args(["validate", "dev"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let id = loop {
+        let activities = m.request(Cmd::Activity);
+        if let Some(a) = activities
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["operation"] == "validate dev")
+        {
+            break a["id"].as_u64().unwrap();
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(m.request(Cmd::Cancel { id })["cancelled"], true);
+    assert!(!wait_exit(&mut waiter).success());
+    unsafe {
+        libc::kill(client.id() as i32, libc::SIGINT);
+    }
+    assert!(!wait_exit(&mut client).success());
+    fs::remove_file(gate).unwrap();
+    // The disconnected diff must release the workspace/repository locks.
+    let mut validate = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .arg("--state-dir")
+        .arg(&m.f.state)
+        .args(["validate", "dev"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_exit(&mut validate).success());
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn shutdown_cancels_inflight_fetch() {
+    let (mut m, _gate, pid) = delayed_mount();
+    let mut client = Command::new("ls")
+        .arg("-l")
+        .arg(m.dev().join("src/hello"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for(&pid);
+    unsafe {
+        libc::kill(m.child.id() as i32, libc::SIGTERM);
+    }
+    assert!(wait_exit(&mut m.child).success());
+    wait_exit(&mut client);
+    let logs = fs::read_to_string(m.f.state.join("logs/activity.jsonl")).unwrap();
+    assert!(logs.contains("Cancelled backend process group"));
+    assert!(logs.contains("Filesystem server stopped"));
 }

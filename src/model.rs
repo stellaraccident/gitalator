@@ -139,6 +139,7 @@ pub struct Tombstone {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Base {
+    pub commit_time: i64,
     pub kind: Kind,
     pub mode: u32,
     pub oid: String,

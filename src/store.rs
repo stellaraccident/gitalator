@@ -42,9 +42,12 @@ pub struct Workspace {
     pub base: BTreeMap<String, Base>,
     pub handles: usize,
     pub listed: Mutex<std::collections::BTreeSet<String>>,
-    pub present: Mutex<std::collections::HashSet<String>>,
+    pub disabled_batches: Mutex<std::collections::HashSet<String>>,
+    pub directories: BTreeMap<String, Vec<String>>,
+    pub metadata: Arc<crate::metadata::Metadata>,
 }
 pub struct Store {
+    pub metadata: Arc<crate::metadata::Metadata>,
     pub root: PathBuf,
     pub config: Config,
     pub workspaces: BTreeMap<String, Arc<Mutex<Workspace>>>,
@@ -100,6 +103,7 @@ impl Store {
             fs::create_dir_all(root.join(d))?;
         }
         let mut s = Self {
+            metadata: Default::default(),
             root,
             config,
             workspaces: BTreeMap::new(),
@@ -120,10 +124,13 @@ impl Store {
                 base: BTreeMap::new(),
                 handles: 0,
                 listed: Default::default(),
-                present: Default::default(),
+                disabled_batches: Default::default(),
+                directories: Default::default(),
+                metadata: s.metadata.clone(),
             };
             w.recover()?;
             w.base = s.load_base(&w.record.map)?;
+            w.directories = directory_index(&w.base);
             if w.record.initializing {
                 let recovery = s.materialize_depot(&w).and_then(|_| w.validate());
                 match recovery {
@@ -350,10 +357,12 @@ impl Store {
                 edit_token: Some(token()),
                 initializing: true,
             },
+            directories: directory_index(&base),
+            metadata: self.metadata.clone(),
             base,
             handles: 0,
             listed: Default::default(),
-            present: Default::default(),
+            disabled_batches: Default::default(),
         };
         w.save()?;
         crate::failpoint("workspace-record");
@@ -690,4 +699,16 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn directory_index(base: &BTreeMap<String, Base>) -> BTreeMap<String, Vec<String>> {
+    let mut directories: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for path in base.keys().filter(|p| !p.is_empty()) {
+        let parent = Path::new(path).parent().unwrap().to_str().unwrap();
+        directories
+            .entry(parent.into())
+            .or_default()
+            .push(path.clone());
+    }
+    directories
 }

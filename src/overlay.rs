@@ -81,7 +81,11 @@ impl Workspace {
             let v = serde_json::json!({"format":1,"workspace":self.record.name,"workspace_id":self.record.id,"generation":self.record.generation,"depot_worktree":self.depot(),"depot_repository":self.record.depot_repo,"depot_bare":self.state_root().join("repos").join(&self.record.depot_repo),"branch":self.record.branch,"active_commit":self.record.active_commit,"editing":self.record.editing,"map":self.record.map});
             return Ok(file(serde_json::to_vec_pretty(&v)?));
         }
-        for m in &self.record.map.mounts {
+        let (parent, name) = p.rsplit_once('/').unwrap_or(("", p));
+        if ![".mountgit", ".mountcommit", ".mountstate.json"].contains(&name) {
+            return Ok(None);
+        }
+        for m in self.record.map.mounts.iter().filter(|m| m.path == parent) {
             let id = crate::util::hash(self.record.map.repositories[&m.repository].url.as_bytes());
             if p == join(&m.path, ".mountgit") {
                 return Ok(link(self.state_root().join("repos").join(id)));
@@ -150,7 +154,7 @@ impl Workspace {
             bytes: None,
         })
     }
-    pub fn entry(&self, p: &str) -> Result<Entry> {
+    pub fn attributes(&self, p: &str) -> Result<Entry> {
         if !valid_path(p) {
             return Err(io(libc::EINVAL));
         }
@@ -167,8 +171,20 @@ impl Workspace {
         }
         let mut e = self.direct(p)?;
         if e.physical.is_none() && e.bytes.is_none() && e.kind != Kind::Directory {
+            let info = self.blob_info(p)?;
+            e.size = if e.kind == Kind::Symlink {
+                info.size
+            } else {
+                info.logical_size()
+            };
+        }
+        Ok(e)
+    }
+    /// Payload access is deliberately separate from stat/lookup.
+    pub fn entry(&self, p: &str) -> Result<Entry> {
+        let mut e = self.attributes(p)?;
+        if e.physical.is_none() && e.bytes.is_none() && e.kind != Kind::Directory {
             let path = self.base_file(p)?;
-            e.size = fs::metadata(&path)?.len();
             if e.kind == Kind::Symlink {
                 e.bytes = Some(fs::read(path)?);
             } else {
@@ -177,89 +193,159 @@ impl Workspace {
         }
         Ok(e)
     }
+    fn blob_info(&self, p: &str) -> Result<crate::metadata::BlobInfo> {
+        let base = self.base.get(p).ok_or_else(|| io(libc::ENOENT))?;
+        if let Some(info) = self.metadata.get(&base.repo, &base.oid) {
+            return Ok(info);
+        }
+        let parent = Path::new(p)
+            .parent()
+            .unwrap_or(Path::new(""))
+            .to_str()
+            .unwrap();
+        let listed = self.listed.lock().unwrap();
+        let enabled =
+            listed.contains(parent) && !self.disabled_batches.lock().unwrap().contains(parent);
+        let recursive = enabled
+            && !parent.is_empty()
+            && listed.contains(Path::new(parent).parent().unwrap().to_str().unwrap());
+        drop(listed);
+        let limit = if recursive {
+            crate::metadata::TRAVERSAL_BATCH
+        } else if enabled {
+            crate::metadata::DIRECTORY_BATCH
+        } else {
+            1
+        };
+        let mut dirs = vec![parent.to_string()];
+        if recursive {
+            let ancestor = Path::new(parent).parent().unwrap().to_str().unwrap();
+            let siblings = self
+                .directories
+                .get(ancestor)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let start = siblings.partition_point(|s| s.as_str() < parent);
+            let candidates = self
+                .directories
+                .get(parent)
+                .into_iter()
+                .flatten()
+                .chain(siblings[start..].iter())
+                .chain(&siblings[..start]);
+            for path in candidates {
+                if dirs.len() >= crate::metadata::TRAVERSAL_DIRS {
+                    break;
+                }
+                let b = &self.base[path];
+                if b.kind == Kind::Directory && b.mount_id == base.mount_id && !dirs.contains(path)
+                {
+                    dirs.push(path.clone());
+                }
+            }
+        }
+        let mut wanted = vec![base.oid.clone()];
+        let mut seen = BTreeSet::from([base.oid.clone()]);
+        'directories: for dir in &dirs {
+            let Some(entries) = self.directories.get(dir) else {
+                continue;
+            };
+            let start = if dir == parent {
+                entries.partition_point(|s| s.as_str() < p)
+            } else {
+                0
+            };
+            for path in entries[start..].iter().chain(&entries[..start]) {
+                if wanted.len() >= limit {
+                    break 'directories;
+                }
+                crate::activity::check()?;
+                let b = &self.base[path];
+                if b.kind != Kind::Directory
+                    && b.repo == base.repo
+                    && b.mount_id == base.mount_id
+                    && self.metadata.get(&b.repo, &b.oid).is_none()
+                    && seen.insert(b.oid.clone())
+                    && self
+                        .direct(path)
+                        .is_ok_and(|e| e.physical.is_none() && e.bytes.is_none())
+                {
+                    wanted.push(b.oid.clone());
+                }
+            }
+        }
+        if let Err(e) =
+            self.metadata
+                .resolve(self.state_root(), &base.repo, &wanted, wanted.len() > 1)
+        {
+            crate::activity::check()?;
+            if wanted.len() == 1 {
+                return Err(e);
+            }
+            self.disabled_batches.lock().unwrap().insert(parent.into());
+            crate::activity::event("warn",&format!("Attribute lookahead failed for {}:{parent}; disabling speculation and retrying requested file: {e}",self.record.name));
+            self.metadata.resolve(
+                self.state_root(),
+                &base.repo,
+                std::slice::from_ref(&base.oid),
+                false,
+            )?;
+        }
+        self.metadata
+            .get(&base.repo, &base.oid)
+            .ok_or_else(|| error("missing resolved blob metadata"))
+    }
     pub fn base_file(&self, p: &str) -> Result<PathBuf> {
         let b = self.base.get(p).ok_or_else(|| io(libc::ENOENT))?;
         let target = self.state_root().join("cache").join(&b.repo).join(&b.oid);
         if target.exists() {
             return Ok(target);
         }
+        let info = self.blob_info(p)?;
         let _l = Lock::take(&self.state_root().join("locks").join(&b.repo))?;
         if !target.exists() {
             crate::activity::check()?;
             crate::activity::stage(&format!("Hydrate {}: {p}", self.record.name));
             crate::activity::event("info", &format!("Hydrate {}: {p}", self.record.name));
             let repo = self.state_root().join("repos").join(&b.repo);
-            let mut wanted = vec![b.oid.clone()];
-            let parent = Path::new(p)
-                .parent()
-                .unwrap_or(Path::new(""))
-                .to_str()
-                .unwrap();
-            if self.listed.lock().unwrap().contains(parent) {
-                let present = self.present.lock().unwrap();
-                for (index, (path, sibling)) in self.base.iter().enumerate() {
-                    if index % 1024 == 0 {
-                        crate::activity::check()?;
+            let mut bytes = if let Some(small) = info.small {
+                small.to_vec()
+            } else {
+                git::local(&repo, &["cat-file", "blob", &b.oid], None)?
+            };
+            if b.kind == Kind::File {
+                if let Some(pointer) = crate::metadata::lfs_pointer(&bytes) {
+                    let expected = pointer.oid.to_owned();
+                    let size = pointer.size;
+                    crate::activity::stage(&format!("LFS hydrate {}: {p}", self.record.name));
+                    crate::activity::event(
+                        "info",
+                        &format!("LFS hydrate {}: {p}", self.record.name),
+                    );
+                    let mut cmd = std::process::Command::new("git");
+                    cmd.arg("-C")
+                        .arg(&repo)
+                        .args(["lfs", "smudge"])
+                        .env("GIT_TERMINAL_PROMPT", "0")
+                        .env_remove("GIT_LFS_SKIP_SMUDGE")
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped());
+                    let result = git::execute_command(
+                        &mut cmd,
+                        Some(&bytes),
+                        std::time::Duration::from_secs(300),
+                    )?;
+                    if !result.status.success() {
+                        return Err(error("LFS hydration failed"));
                     }
-                    if wanted.len() >= 256 {
-                        break;
-                    }
-                    if sibling.repo == b.repo
-                        && sibling.kind != Kind::Directory
-                        && Path::new(path).parent() == Path::new(p).parent()
-                        && !present.contains(&sibling.oid)
-                        && !wanted.contains(&sibling.oid)
+                    if result.stdout.len() as u64 != size
+                        || crate::util::hash(&result.stdout) != expected
                     {
-                        wanted.push(sibling.oid.clone());
+                        return Err(error("LFS payload integrity mismatch"));
                     }
+                    bytes = result.stdout;
                 }
-            }
-            if let Err(e) = git::ensure_blobs(&repo, &wanted) {
-                crate::activity::check()?;
-                if wanted.len() == 1 {
-                    return Err(e);
-                }
-                wanted.truncate(1);
-                git::ensure_blobs(&repo, &wanted)?;
-            }
-            self.present.lock().unwrap().extend(wanted);
-            let mut bytes = git::local(&repo, &["cat-file", "blob", &b.oid], None)?;
-            if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
-                crate::activity::stage(&format!("LFS hydrate {}: {p}", self.record.name));
-                crate::activity::event("info", &format!("LFS hydrate {}: {p}", self.record.name));
-                let mut cmd = std::process::Command::new("git");
-                cmd.arg("-C")
-                    .arg(&repo)
-                    .args(["lfs", "smudge"])
-                    .env("GIT_TERMINAL_PROMPT", "0")
-                    .env_remove("GIT_LFS_SKIP_SMUDGE")
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
-                let result = git::execute_command(
-                    &mut cmd,
-                    Some(&bytes),
-                    std::time::Duration::from_secs(300),
-                )?;
-                if !result.status.success() {
-                    return Err(error("LFS hydration failed"));
-                }
-                let pointer = std::str::from_utf8(&bytes)?;
-                let expected = pointer
-                    .lines()
-                    .find_map(|l| l.strip_prefix("oid sha256:"))
-                    .ok_or("invalid LFS pointer")?;
-                let size: u64 = pointer
-                    .lines()
-                    .find_map(|l| l.strip_prefix("size "))
-                    .ok_or("invalid LFS size")?
-                    .parse()?;
-                if result.stdout.len() as u64 != size
-                    || crate::util::hash(&result.stdout) != expected
-                {
-                    return Err(error("LFS payload integrity mismatch"));
-                }
-                bytes = result.stdout;
             }
             atomic(&target, &bytes)?;
             fs::set_permissions(&target, fs::Permissions::from_mode(0o444))?;
@@ -276,21 +362,16 @@ impl Workspace {
             return Err(io(libc::ENOTDIR));
         }
         let mut names = BTreeSet::new();
-        let prefix = if p.is_empty() {
-            String::new()
-        } else {
-            format!("{p}/")
-        };
-        for (index, key) in self.base.keys().enumerate() {
-            if index % 1024 == 0 {
-                crate::activity::check()?;
-            }
-            if let Some(tail) = key.strip_prefix(&prefix) {
-                if let Some(first) = tail.split('/').next() {
-                    if !first.is_empty() {
-                        names.insert(first.to_string());
-                    }
-                }
+        if let Some(entries) = self.directories.get(p) {
+            for path in entries {
+                names.insert(
+                    Path::new(path)
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                );
             }
         }
         let upper = self.safe(&self.upper(), p)?;

@@ -201,7 +201,7 @@ impl Core {
             return Ok(dir());
         }
         let (w, rel) = self.workspace(p)?;
-        let e = crate::activity::lock(&w)?.entry(&rel)?;
+        let e = crate::activity::lock(&w)?.attributes(&rel)?;
         Ok(e)
     }
     fn stat(&self, ino: u64) -> Result<FileAttr> {
@@ -257,7 +257,7 @@ impl Core {
         let p = self.path(ino)?;
         let (w, rel) = self.workspace(&p)?;
         let guard = crate::activity::lock(&w)?;
-        let e = guard.entry(&rel)?;
+        let e = guard.attributes(&rel)?;
         let generation = Some(guard.record.generation.clone());
         if e.kind != Kind::File {
             return Err(io(libc::EISDIR));
@@ -423,7 +423,9 @@ impl Operations {
     }
     fn readlink(&mut self, ino: u64, reply: ReplyData) {
         let r: Result<_> = (|| {
-            let e = self.core.entry(&self.core.path(ino)?)?;
+            let p = self.core.path(ino)?;
+            let (w, rel) = self.core.workspace(&p)?;
+            let e = crate::activity::lock(&w)?.entry(&rel)?;
             if e.kind != Kind::Symlink {
                 return Err(io(libc::EINVAL));
             }

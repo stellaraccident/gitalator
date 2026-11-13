@@ -559,3 +559,25 @@ fn shutdown_cancels_inflight_fetch() {
     assert!(logs.contains("Cancelled backend process group"));
     assert!(logs.contains("Filesystem server stopped"));
 }
+
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn long_listing_does_not_extract_payloads() {
+    let m = Mounted::new();
+    assert!(Command::new("ls")
+        .args(["-ln", "--color=never"])
+        .arg(m.dev().join("src"))
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success());
+    assert!(fs::read_dir(m.f.state.join("cache"))
+        .unwrap()
+        .next()
+        .is_none());
+    assert_eq!(fs::read(m.dev().join("src/hello")).unwrap(), b"hello\n");
+    assert!(fs::read_dir(m.f.state.join("cache"))
+        .unwrap()
+        .next()
+        .is_some());
+}

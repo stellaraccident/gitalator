@@ -17,3 +17,5 @@ pub mod daemon;
 pub mod overlay;
 pub mod vfs;
 pub mod workspace;
+
+pub mod metadata;

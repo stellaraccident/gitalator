@@ -173,6 +173,41 @@ use separate local `workspaces/<id>` branches; fetching cannot overwrite them.
 All generated discovery symlinks are absolute and work through workspace aliases.
 Metadata JSON is versioned and reports the active generation and exact mappings.
 
+## Attribute batching and latency
+
+Name-only enumeration does not fetch blobs. Attribute lookups (`ls -l`, build
+scanners) resolve sizes in batches, without creating extracted payload files.
+LFS pointer sizes do not require downloading LFS payloads. Actual reads and
+copy-up still hydrate file contents.
+
+The first attribute request after a directory listing resolves up to 256 objects.
+Evidence of recursive traversal expands this to at most 1,024 objects across 32
+nearby directories within the same mount. Repeated mounts/workspaces share object
+metadata. Demand work precedes queued lookahead; failures fall back to the
+requested file and suppress further speculation for that directory.
+
+An isolated release-build benchmark of 600 2-KiB files measured:
+
+| Metric | Before attribute batching | With attribute batching |
+|---|---:|---:|
+| Cold `ls -l` | 22.62 s | 0.66 s |
+| Warm `ls -l` | 0.32 s | 0.32 s |
+| Git `cat-file` invocations in cold listing | 1,202 | 3 |
+| Network fetches | 3 | 3 |
+| Extracted payload files | 600 | 0 |
+
+Both use local blob-filtered origins and optimized binaries, with Git tracing
+enabled. This isolates serialized subprocess/extraction overhead; it is not a
+TheRock/network-performance estimate. Run the same fixture with:
+
+```sh
+python3 scripts/bench-attributes.py --before /path/to/previous/gtl \
+  --after /path/to/release/gtl --output /workspace/scratch/attributes-bench
+```
+
+The script starts temporary foreground FUSE servers, stops them afterwards, and
+retains stores, traces and results under the output directory.
+
 ## Foundation boundaries
 
 The old SQLite storage, snapshots, activation/resolution, export/import, and

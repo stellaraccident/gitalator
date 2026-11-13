@@ -100,9 +100,25 @@ handle is unsupported; it must never mutate a shared immutable cache.
 Component trees are indexed in memory at workspace load. The foundation uses
 exact-commit Git fetches with `--filter=blob:none`; origins must support filtering
 to avoid eager transfer. Directory enumeration uses tree metadata without fetching
-blobs. Payload access fetches missing object IDs explicitly under a shared repository
-lock, batching up to 256 direct siblings after their parent has been listed.
-Failed speculative batches fall back to the requested object. Local object probes
+blobs. Attribute lookup fetches missing Git blobs in bounded batches, caches their
+sizes, and inspects blobs of at most 1 KiB together with `cat-file --batch`.
+Canonical LFS pointer sizes are returned without LFS downloads. Symlink sizes
+describe their literal link text. Attribute lookup does not extract payload files.
+
+A listing followed by attributes enables up to 256 objects from that directory.
+If its parent was also listed, the batch can span up to 1,024 objects across 32
+immediate child/sibling directories within the same mount. Selection starts near
+the requested path and wraps; resolved objects, upper overrides and tombstoned
+paths are skipped. Per-directory indexes avoid whole-namespace scans.
+Failure falls back to the requested object and disables speculation for that
+directory until workspace reload. Cancellation does not disable speculation.
+
+Object metadata is shared by repository ID and object ID across all workspaces
+in one store. A cancellable per-repository gate coalesces concurrent fills and
+prioritizes queued demand over queued lookahead; running batches finish normally.
+Metadata and small-blob bodies are runtime caches and are rebuilt in batches after
+restart. Actual opens/reads/copy-up extract payloads on demand; cached small
+bodies avoid another extraction subprocess. Local object probes
 never fetch; local presence checks binary-search pack indexes and inspect loose-object paths
 before invoking Git. This avoids Git 2.43's missing-promisor history walk.
 Version 1/2 pack indexes, SHA-1/SHA-256 IDs, and object alternates are supported.

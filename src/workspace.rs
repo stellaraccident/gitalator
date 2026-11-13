@@ -76,7 +76,9 @@ impl Workspace {
                 base: self.base.clone(),
                 handles: 0,
                 listed: Default::default(),
-                present: Default::default(),
+                disabled_batches: Default::default(),
+                directories: self.directories.clone(),
+                metadata: self.metadata.clone(),
             };
             let r = w.validate();
             remove_any(&fake)?;

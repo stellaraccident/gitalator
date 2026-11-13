@@ -437,7 +437,7 @@ pub fn ensure_blobs(repo: &Path, oids: &[String]) -> Result<Vec<u64>> {
         let input = missing.join("\n") + "\n";
         crate::activity::event(
             "info",
-            &format!("Demand fetch: {} missing blobs", missing.len()),
+            &format!("Fetch missing blobs: {} objects", missing.len()),
         );
         let fetch = input_fetch(repo, input.as_bytes());
         crate::activity::check()?;

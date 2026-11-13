@@ -73,11 +73,10 @@ impl Workspace {
             let w = Workspace {
                 root: fake.clone(),
                 record: self.record.clone(),
-                base: self.base.clone(),
+                namespace: self.namespace.clone(),
                 handles: 0,
                 listed: Default::default(),
                 disabled_batches: Default::default(),
-                directories: self.directories.clone(),
                 metadata: self.metadata.clone(),
             };
             let r = w.validate();
@@ -112,7 +111,7 @@ impl Workspace {
                 if staged_tombs.iter().any(|t| under(p, t)) {
                     continue;
                 }
-                if let Some(base) = self.base.get(p) {
+                if let Some(base) = self.namespace.lookup(p)? {
                     let mode = match base.kind {
                         Kind::File => {
                             if base.mode & 0o111 != 0 {
@@ -229,8 +228,7 @@ impl Store {
             }
             let t = target.record.edit_token.clone().unwrap();
             target.record.map = w.record.map.clone();
-            target.base = w.base.clone();
-            target.directories = w.directories.clone();
+            target.namespace = w.namespace.clone();
             target.save()?;
             target.end(&t)?;
         }
@@ -368,12 +366,17 @@ pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
             let w = get(core, &workspace)?;
             let w = crate::activity::lock(&w)?;
             Ok(
-                json!({"record":w.record,"worktree":w.depot(),"git_status":git::text(&w.depot(),&["status","--porcelain"]).unwrap_or_else(|e|format!("unavailable: {e}"))}),
+                json!({"record":w.record,"worktree":w.depot(),"tree_cache":w.namespace.trees.stats(),"git_status":git::text(&w.depot(),&["status","--porcelain"]).unwrap_or_else(|e|format!("unavailable: {e}"))}),
             )
         }
         Cmd::Diff { workspace } => crate::activity::lock(&*get(core, &workspace)?)?.diff(),
-        Cmd::Validate { workspace } => {
-            crate::activity::lock(&*get(core, &workspace)?)?.validate()?;
+        Cmd::Validate { workspace, full } => {
+            let arc = get(core, &workspace)?;
+            let w = crate::activity::lock(&arc)?;
+            w.validate()?;
+            if full {
+                w.namespace.validate_full()?;
+            }
             Ok(json!({"valid":true}))
         }
         Cmd::Revert { workspace, path } => {

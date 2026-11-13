@@ -121,6 +121,10 @@ impl Trees {
         m.entries.insert(key, Cached { tree, size, stamp });
     }
     pub fn get(&self, root: &Path, repo: &str, id: &str) -> Result<Arc<Tree>> {
+        activity::check()?;
+        if let Some(tree) = self.cached(&(repo.to_owned(), id.to_owned())) {
+            return Ok(tree);
+        }
         self.batch(root, repo, &[id.to_owned()], false)?
             .pop()
             .ok_or_else(|| error("missing tree result"))

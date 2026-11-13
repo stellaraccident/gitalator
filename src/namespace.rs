@@ -322,7 +322,7 @@ impl Namespace {
         let mut full = m.path.clone();
         for part in suffix.split('/').filter(|p| !p.is_empty()) {
             if base.kind != Kind::Directory {
-                return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into());
+                return Ok(None);
             }
             if base.mode == 0o160000 {
                 return Ok(None);

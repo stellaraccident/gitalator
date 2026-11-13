@@ -39,11 +39,10 @@ pub struct Record {
 pub struct Workspace {
     pub root: PathBuf,
     pub record: Record,
-    pub base: BTreeMap<String, Base>,
+    pub namespace: Arc<crate::namespace::Namespace>,
     pub handles: usize,
     pub listed: Mutex<std::collections::BTreeSet<String>>,
     pub disabled_batches: Mutex<std::collections::HashSet<String>>,
-    pub directories: BTreeMap<String, Vec<String>>,
     pub metadata: Arc<crate::metadata::Metadata>,
 }
 #[derive(Clone)]
@@ -124,11 +123,13 @@ impl Store {
             let mut w = Workspace {
                 root: p,
                 record,
-                base: BTreeMap::new(),
+                namespace: Arc::new(crate::namespace::Namespace::empty(
+                    s.root.clone(),
+                    s.trees.clone(),
+                )),
                 handles: 0,
                 listed: Default::default(),
                 disabled_batches: Default::default(),
-                directories: Default::default(),
                 metadata: s.metadata.clone(),
             };
             let started = std::time::Instant::now();
@@ -138,14 +139,7 @@ impl Store {
             ));
             w.recover()?;
             w.recover_layout()?;
-            w.base = s.load_base(&w.record.map)?;
-            index_progress(&format!(
-                "Workspace {}: build directory lookup ({} entries, {:.2}s)",
-                w.record.name,
-                w.base.len(),
-                started.elapsed().as_secs_f64()
-            ));
-            w.directories = directory_index(&w.base);
+            w.namespace = s.prepare_namespace(&w.record.map)?;
             index_progress(&format!(
                 "Workspace {}: validate depot overlay and tombstones",
                 w.record.name
@@ -227,231 +221,6 @@ impl Store {
         )?;
         git::text(&p, &["rev-parse", "FETCH_HEAD^{commit}"])
     }
-    pub fn load_base(&self, map: &Map) -> Result<BTreeMap<String, Base>> {
-        map.validate()?;
-        // Fully derived, disposable cache. Include the entire map (including policy,
-        // mount IDs and placement), and bump the schema when composition changes.
-        let key = hash(&serde_json::to_vec(&(1u32, map))?);
-        let cache = self.root.join("indexes").join(format!("{key}.json"));
-        if map.repositories.values().all(|r| {
-            self.root
-                .join("repos")
-                .join(hash(r.url.as_bytes()))
-                .join("HEAD")
-                .is_file()
-        }) {
-            if let Ok(bytes) = fs::read(&cache) {
-                if let Ok(base) = serde_json::from_slice::<BTreeMap<String, Base>>(&bytes) {
-                    index_progress(&format!(
-                        "Restore cached layout index: {} entries",
-                        base.len()
-                    ));
-                    crate::activity::check()?;
-                    return Ok(base);
-                }
-                crate::activity::event("warn", "Invalid layout index cache; rebuilding");
-            }
-        }
-        let base = self.build_base(map)?;
-        crate::activity::check()?;
-        index_progress(&format!("Save layout index: {} entries", base.len()));
-        atomic(&cache, &serde_json::to_vec(&base)?)?;
-        Ok(base)
-    }
-    fn build_base(&self, map: &Map) -> Result<BTreeMap<String, Base>> {
-        let mut out: BTreeMap<String, Base> = BTreeMap::new();
-        let mut mounts = map.mounts.clone();
-        mounts.sort_by_key(|m| m.path.len());
-        let jobs = index_jobs()?.min(mounts.len().max(1));
-        index_progress(&format!(
-            "Index {} mounts with {jobs} workers",
-            mounts.len()
-        ));
-        // Bounded ordered windows limit resident uncomposed indexes. Git work runs
-        // concurrently; composition always applies parents before descendants.
-        for (batch, window) in mounts.chunks(jobs).enumerate() {
-            crate::activity::check()?;
-            let scope = crate::activity::capture();
-            let results = std::thread::scope(|threads| {
-                let workers: Vec<_> = window
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, mount)| {
-                        let scope = scope.clone();
-                        threads.spawn(move || {
-                            let _context = scope.enter();
-                            index_progress(&format!(
-                                "Index mount {}/{}: {} at {} ({})",
-                                batch * jobs + offset + 1,
-                                map.mounts.len(),
-                                mount.id,
-                                if mount.path.is_empty() {
-                                    "/"
-                                } else {
-                                    &mount.path
-                                },
-                                mount.commit
-                            ));
-                            self.index_mount(map, mount)
-                        })
-                    })
-                    .collect();
-                workers
-                    .into_iter()
-                    .map(|worker| {
-                        worker
-                            .join()
-                            .unwrap_or_else(|_| Err(error("mount index worker panicked")))
-                    })
-                    .collect::<Vec<_>>()
-            });
-            for (mount, result) in window.iter().zip(results) {
-                crate::activity::check()?;
-                let entries = result?;
-                if mount.path.is_empty() {
-                    out.clear();
-                } else {
-                    out.remove(&mount.path);
-                    let prefix = format!("{}/", mount.path);
-                    let hidden: Vec<_> = out
-                        .range(prefix.clone()..)
-                        .take_while(|(path, _)| path.starts_with(&prefix))
-                        .map(|(path, _)| path.clone())
-                        .collect();
-                    for path in hidden {
-                        out.remove(&path);
-                    }
-                }
-                // extend inserts only this mount's entries; BTreeMap::append can
-                // scan the entire accumulated namespace for each small mount.
-                out.extend(entries);
-            }
-        }
-        for m in &mounts {
-            let out_time = out.get(&m.path).map(|b| b.commit_time).unwrap_or(0);
-            let mut p = Path::new(&m.path).parent();
-            while let Some(parent) = p {
-                let name = parent.to_str().unwrap();
-                out.entry(name.into()).or_insert(Base {
-                    commit_time: out_time,
-                    kind: Kind::Directory,
-                    mode: 0o755,
-                    oid: String::new(),
-                    repo: String::new(),
-                    mount_id: String::new(),
-                });
-                p = parent.parent();
-            }
-        }
-        index_progress("Validate composed mount namespace");
-        let mut reserved = vec![".depotgit".to_owned(), ".depotstate.json".to_owned()];
-        for m in &mounts {
-            for name in [".mountgit", ".mountcommit", ".mountstate.json"] {
-                reserved.push(join(&m.path, name));
-            }
-            // Only ancestors of a mount can violate this constraint.
-            let mut parent = Path::new(&m.path).parent();
-            while let Some(p) = parent {
-                if out
-                    .get(p.to_str().unwrap())
-                    .is_some_and(|b| b.kind != Kind::Directory)
-                {
-                    return Err(error("mount parent is not a directory"));
-                }
-                parent = p.parent();
-            }
-        }
-        for path in reserved {
-            let prefix = format!("{path}/");
-            if out.contains_key(&path)
-                || out
-                    .range(prefix.clone()..)
-                    .next()
-                    .is_some_and(|(p, _)| p.starts_with(&prefix))
-            {
-                return Err(error(
-                    "component collides with generated discovery metadata",
-                ));
-            }
-        }
-        Ok(out)
-    }
-    fn index_mount(&self, map: &Map, m: &Mount) -> Result<BTreeMap<String, Base>> {
-        let mut out = BTreeMap::new();
-        let id = self.repo(&map.repositories[&m.repository].url)?;
-        self.fetch(&id, &m.commit)?;
-        let spec = if m.subtree.is_empty() {
-            format!("{}^{{tree}}", m.commit)
-        } else {
-            format!("{}:{}", m.commit, m.subtree)
-        };
-        let path = self.root.join("repos").join(&id);
-        let commit_time: i64 =
-            git::text(&path, &["show", "-s", "--format=%ct", &m.commit])?.parse()?;
-        let tree = git::text(&path, &["rev-parse", &spec])?;
-        if git::text(&path, &["cat-file", "-t", &tree])? != "tree" {
-            return Err(error("mount subtree is not a directory"));
-        }
-        out.insert(
-            m.path.clone(),
-            Base {
-                commit_time,
-                kind: Kind::Directory,
-                mode: 0o755,
-                oid: tree.clone(),
-                repo: id.clone(),
-                mount_id: m.id.clone(),
-            },
-        );
-        let bytes = git::run(&path, &["ls-tree", "-r", "-t", "-z", &tree])?;
-        for (index, line) in bytes
-            .split(|b| *b == 0)
-            .filter(|b| !b.is_empty())
-            .enumerate()
-        {
-            if index % 1024 == 0 {
-                crate::activity::check()?;
-            }
-            let line = std::str::from_utf8(line)?;
-            let (meta, p) = line.split_once('\t').ok_or("bad ls-tree")?;
-            let fields: Vec<_> = meta.split(' ').collect();
-            let kind = match fields[0] {
-                "040000" => Kind::Directory,
-                "100644" | "100755" => Kind::File,
-                "120000" => Kind::Symlink,
-                "160000" => {
-                    if map
-                        .mounts
-                        .iter()
-                        .any(|child| child.path == join(&m.path, p))
-                    {
-                        continue;
-                    }
-                    if m.uninitialized_submodules {
-                        Kind::Directory
-                    } else {
-                        return Err(error("gitlinks require explicit mounts or an explicit uninitialized-submodules policy"));
-                    }
-                }
-                _ => return Err(error("unsupported Git entry")),
-            };
-            if !valid_path(p) {
-                return Err(error("reserved/unsupported component path"));
-            }
-            out.insert(
-                join(&m.path, p),
-                Base {
-                    commit_time,
-                    kind,
-                    mode: if fields[0] == "100755" { 0o755 } else { 0o644 },
-                    oid: fields[2].into(),
-                    repo: id.clone(),
-                    mount_id: m.id.clone(),
-                },
-            );
-        }
-        Ok(out)
-    }
     /// New local depots live directly in the managed bare store, without a
     /// temporary checkout, synthetic remote, or a second copy of the repository.
     pub fn init(&mut self, name_: &str) -> Result<String> {
@@ -520,7 +289,7 @@ impl Store {
             &bare,
             &["show", &format!("{commit}:depot.toml")],
         )?)?)?;
-        let base = self.load_base(&map)?;
+        let namespace = self.prepare_namespace(&map)?;
         let id = token();
         let root = self.root.join("workspaces").join(&id);
         fs::create_dir(&root)?;
@@ -540,9 +309,8 @@ impl Store {
                 edit_token: Some(token()),
                 initializing: true,
             },
-            directories: directory_index(&base),
             metadata: self.metadata.clone(),
-            base,
+            namespace,
             handles: 0,
             listed: Default::default(),
             disabled_batches: Default::default(),
@@ -655,6 +423,7 @@ impl Workspace {
     }
     pub(crate) fn validate_content(&self) -> Result<()> {
         self.record.map.validate()?;
+        self.namespace.validate_boundaries()?;
         for root in [self.upper(), self.tombs()] {
             if let Ok(m) = fs::symlink_metadata(root) {
                 if !m.is_dir() {
@@ -663,11 +432,12 @@ impl Workspace {
             }
         }
         for p in walk(&self.upper())? {
-            if !valid_path(&p) || self.record.map.reserved(&p) {
+            if !valid_path(&p) || self.namespace.reserved(&p) {
                 return Err(error("invalid overlay path"));
             }
+            self.namespace.lookup(&p)?;
             let m = fs::symlink_metadata(self.upper().join(&p))?;
-            if !m.is_dir() && self.record.map.protected(&p) {
+            if !m.is_dir() && self.namespace.protected(&p) {
                 return Err(error("overlay would hide a mount root"));
             }
             if !m.is_file() && !m.is_dir() && !m.file_type().is_symlink() {
@@ -683,8 +453,11 @@ impl Workspace {
                 return Err(error("invalid tombstone path"));
             }
             let t: Tombstone = serde_json::from_slice(&fs::read(&f)?)?;
-            let m = self.record.map.owner(&p).ok_or("tombstone outside mount")?;
-            let base = self.base.get(&p).ok_or("tombstone has no base entry")?;
+            let m = self.namespace.owner(&p).ok_or("tombstone outside mount")?;
+            let base = self
+                .namespace
+                .lookup(&p)?
+                .ok_or("tombstone has no base entry")?;
             if t.base_oid != base.oid || t.base_kind != base.kind {
                 return Err(error("tombstone base identity mismatch"));
             }
@@ -692,7 +465,7 @@ impl Workspace {
                 || t.mount_id != m.id
                 || t.base_commit != m.commit
                 || !matches!(t.kind.as_str(), "delete" | "opaque")
-                || self.record.map.protected(&p)
+                || self.namespace.protected(&p)
             {
                 return Err(error("invalid tombstone provenance"));
             }
@@ -889,18 +662,6 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub fn directory_index(base: &BTreeMap<String, Base>) -> BTreeMap<String, Vec<String>> {
-    let mut directories: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for path in base.keys().filter(|p| !p.is_empty()) {
-        let parent = Path::new(path).parent().unwrap().to_str().unwrap();
-        directories
-            .entry(parent.into())
-            .or_default()
-            .push(path.clone());
-    }
-    directories
 }
 
 fn index_progress(message: &str) {

@@ -63,7 +63,7 @@ fn init_needs_no_identity_or_remote_and_survives_restart_and_fork() {
         let w = w.lock().unwrap();
         assert!(w.record.map.mounts.is_empty());
         assert!(w.record.map.repositories.is_empty());
-        assert!(w.base.is_empty());
+        assert!(w.namespace.children("").unwrap().is_empty());
         assert_eq!(
             w.children("").unwrap(),
             vec![".depotgit", ".depotstate.json"]

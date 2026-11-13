@@ -541,14 +541,14 @@ impl Operations {
                     crate::activity::lock(&self.core.store)?
                         .workspaces
                         .keys()
-                        .cloned()
+                        .map(|n| (n.clone(), Kind::Directory))
                         .collect(),
                     None,
                 )
             } else {
                 let (w, rel) = self.core.workspace(&p)?;
                 let guard = crate::activity::lock(&w)?;
-                let names = guard.children(&rel)?;
+                let names = guard.children_entries(&rel)?;
                 let generation = Some(guard.record.generation.clone());
                 drop(guard);
                 (Some(w), names, generation)
@@ -561,33 +561,8 @@ impl Operations {
                 (ino, FileType::Directory, ".".into()),
                 (self.core.inode(parent), FileType::Directory, "..".into()),
             ];
-            for name in names {
+            for (name, kind) in names {
                 let child = join(&p, &name);
-                let kind = if workspace.is_none() {
-                    Kind::Directory
-                } else {
-                    let (w, rel) = self.core.workspace(&child)?;
-                    let e = crate::activity::lock(&w)?.metadata(&rel)?;
-                    if let Some(e) = e {
-                        e.kind
-                    } else {
-                        let w = crate::activity::lock(&w)?;
-                        if let Ok(m) = std::fs::symlink_metadata(w.upper().join(&rel)) {
-                            if m.is_dir() {
-                                Kind::Directory
-                            } else if m.file_type().is_symlink() {
-                                Kind::Symlink
-                            } else {
-                                Kind::File
-                            }
-                        } else {
-                            w.base
-                                .get(&rel)
-                                .map(|b| b.kind.clone())
-                                .unwrap_or(Kind::Directory)
-                        }
-                    }
-                };
                 entries.push((self.core.inode(&child), filetype(&kind), name));
             }
             self.core.add_handle(Handle {

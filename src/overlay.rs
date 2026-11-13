@@ -111,8 +111,9 @@ impl Workspace {
                 mode: 0o755,
                 size: 0,
                 time: self
-                    .base
-                    .get("")
+                    .namespace
+                    .lookup("")?
+                    .as_ref()
                     .map(base_time)
                     .unwrap_or_else(|| self.state_time()),
                 physical: None,
@@ -140,7 +141,7 @@ impl Workspace {
         if self.hidden(p)? {
             return Err(io(libc::ENOENT));
         }
-        let b = self.base.get(p).ok_or_else(|| io(libc::ENOENT))?;
+        let b = self.namespace.lookup(p)?.ok_or_else(|| io(libc::ENOENT))?;
         Ok(Entry {
             kind: b.kind.clone(),
             mode: if b.kind == Kind::Directory {
@@ -149,7 +150,7 @@ impl Workspace {
                 b.mode
             },
             size: 0,
-            time: base_time(b),
+            time: base_time(&b),
             physical: None,
             bytes: None,
         })
@@ -194,7 +195,7 @@ impl Workspace {
         Ok(e)
     }
     fn blob_info(&self, p: &str) -> Result<crate::metadata::BlobInfo> {
-        let base = self.base.get(p).ok_or_else(|| io(libc::ENOENT))?;
+        let base = self.namespace.lookup(p)?.ok_or_else(|| io(libc::ENOENT))?;
         if let Some(info) = self.metadata.get(&base.repo, &base.oid) {
             return Ok(info);
         }
@@ -218,57 +219,68 @@ impl Workspace {
             1
         };
         let mut dirs = vec![parent.to_string()];
-        if recursive {
-            let ancestor = Path::new(parent).parent().unwrap().to_str().unwrap();
-            let siblings = self
-                .directories
-                .get(ancestor)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let start = siblings.partition_point(|s| s.as_str() < parent);
-            let candidates = self
-                .directories
-                .get(parent)
-                .into_iter()
-                .flatten()
-                .chain(siblings[start..].iter())
-                .chain(&siblings[..start]);
-            for path in candidates {
-                if dirs.len() >= crate::metadata::TRAVERSAL_DIRS {
-                    break;
+        let mut directory_entries = vec![];
+        let preparation = (|| -> Result<()> {
+            if recursive {
+                let ancestor = Path::new(parent).parent().unwrap().to_str().unwrap();
+                let siblings: Vec<_> = self.namespace.children(ancestor)?.into_iter().collect();
+                let start = siblings.partition_point(|(s, _)| s.as_str() < parent);
+                let children = self.namespace.children(parent)?;
+                let candidates = children
+                    .iter()
+                    .chain(siblings[start..].iter().map(|(p, b)| (p, b)))
+                    .chain(siblings[..start].iter().map(|(p, b)| (p, b)));
+                for (path, b) in candidates {
+                    if dirs.len() >= crate::metadata::TRAVERSAL_DIRS {
+                        break;
+                    }
+                    if b.kind == Kind::Directory
+                        && b.mount_id == base.mount_id
+                        && !dirs.contains(path)
+                    {
+                        dirs.push(path.clone());
+                    }
                 }
-                let b = &self.base[path];
-                if b.kind == Kind::Directory && b.mount_id == base.mount_id && !dirs.contains(path)
-                {
-                    dirs.push(path.clone());
-                }
+                self.namespace.lookahead(&dirs)?;
             }
+            for dir in &dirs {
+                directory_entries.push((dir.clone(), self.namespace.children(dir)?));
+            }
+            Ok(())
+        })();
+        if let Err(e) = preparation {
+            crate::activity::check()?;
+            self.disabled_batches.lock().unwrap().insert(parent.into());
+            crate::activity::event(
+                "warn",
+                &format!(
+                    "Tree lookahead failed at {}:{parent}: {e}; retry demand",
+                    self.record.name
+                ),
+            );
+            directory_entries = vec![(parent.to_string(), self.namespace.children(parent)?)];
         }
         let mut wanted = vec![base.oid.clone()];
         let mut seen = BTreeSet::from([base.oid.clone()]);
-        'directories: for dir in &dirs {
-            let Some(entries) = self.directories.get(dir) else {
-                continue;
-            };
+        'directories: for (dir, children) in &directory_entries {
+            let entries: Vec<_> = children.iter().collect();
             let start = if dir == parent {
-                entries.partition_point(|s| s.as_str() < p)
+                entries.partition_point(|(s, _)| s.as_str() < p)
             } else {
                 0
             };
-            for path in entries[start..].iter().chain(&entries[..start]) {
+            for (path, b) in entries[start..].iter().chain(&entries[..start]) {
                 if wanted.len() >= limit {
                     break 'directories;
                 }
                 crate::activity::check()?;
-                let b = &self.base[path];
                 if b.kind != Kind::Directory
                     && b.repo == base.repo
                     && b.mount_id == base.mount_id
                     && self.metadata.get(&b.repo, &b.oid).is_none()
                     && seen.insert(b.oid.clone())
-                    && self
-                        .direct(path)
-                        .is_ok_and(|e| e.physical.is_none() && e.bytes.is_none())
+                    && !self.hidden(path)?
+                    && fs::symlink_metadata(self.safe(&self.upper(), path)?).is_err()
                 {
                     wanted.push(b.oid.clone());
                 }
@@ -296,7 +308,7 @@ impl Workspace {
             .ok_or_else(|| error("missing resolved blob metadata"))
     }
     pub fn base_file(&self, p: &str) -> Result<PathBuf> {
-        let b = self.base.get(p).ok_or_else(|| io(libc::ENOENT))?;
+        let b = self.namespace.lookup(p)?.ok_or_else(|| io(libc::ENOENT))?;
         let target = self.state_root().join("cache").join(&b.repo).join(&b.oid);
         if target.exists() {
             return Ok(target);
@@ -357,51 +369,81 @@ impl Workspace {
         Ok(target)
     }
     pub fn children(&self, p: &str) -> Result<Vec<String>> {
+        Ok(self
+            .children_entries(p)?
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect())
+    }
+    pub fn children_entries(&self, p: &str) -> Result<Vec<(String, Kind)>> {
         self.check()?;
         if self.direct(p)?.kind != Kind::Directory {
             return Err(io(libc::ENOTDIR));
         }
-        let mut names = BTreeSet::new();
-        if let Some(entries) = self.directories.get(p) {
-            for path in entries {
-                names.insert(
-                    Path::new(path)
-                        .file_name()
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .to_owned(),
-                );
+        let mut entries = std::collections::BTreeMap::new();
+        if !self.hidden(p)? {
+            // A depot-owned directory may replace a base file. In that case only
+            // the physical directory and generated mount ancestors contribute.
+            if self
+                .namespace
+                .lookup(p)?
+                .is_some_and(|b| b.kind == Kind::Directory)
+            {
+                for (path, b) in self.namespace.children(p)? {
+                    if !self.hidden(&path)? {
+                        entries.insert(
+                            Path::new(&path)
+                                .file_name()
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .to_owned(),
+                            b.kind,
+                        );
+                    }
+                }
             }
         }
         let upper = self.safe(&self.upper(), p)?;
-        if upper.is_dir() {
-            for e in fs::read_dir(upper)? {
-                names.insert(
-                    e?.file_name()
+        match fs::read_dir(&upper) {
+            Ok(files) => {
+                for file in files {
+                    let file = file?;
+                    let name = file
+                        .file_name()
                         .into_string()
-                        .map_err(|_| error("non-UTF8 filename"))?,
-                );
+                        .map_err(|_| error("non-UTF8 filename"))?;
+                    let kind = file.file_type()?;
+                    entries.insert(
+                        name,
+                        if kind.is_dir() {
+                            Kind::Directory
+                        } else if kind.is_symlink() {
+                            Kind::Symlink
+                        } else {
+                            Kind::File
+                        },
+                    );
+                }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
         }
         if p.is_empty() {
-            names.insert(".depotgit".into());
-            names.insert(".depotstate.json".into());
+            entries.insert(".depotgit".into(), Kind::Symlink);
+            entries.insert(".depotstate.json".into(), Kind::File);
         }
-        if self.record.map.mounts.iter().any(|m| m.path == p) {
-            for n in [".mountgit", ".mountcommit", ".mountstate.json"] {
-                names.insert(n.into());
-            }
+        if self.namespace.is_mount(p) {
+            entries.insert(".mountgit".into(), Kind::Symlink);
+            entries.insert(".mountcommit".into(), Kind::File);
+            entries.insert(".mountstate.json".into(), Kind::File);
         }
-        self.listed.lock().unwrap().insert(p.to_owned());
-        Ok(names
-            .into_iter()
-            .filter(|n| self.direct(&join(p, n)).is_ok())
-            .collect())
+        self.listed.lock().unwrap().insert(p.into());
+        Ok(entries.into_iter().collect())
     }
     pub fn mutable(&self, p: &str) -> Result<()> {
         self.check()?;
-        if !valid_path(p) || self.record.map.protected(p) {
+        if !valid_path(p) || self.namespace.protected(p) {
             return Err(io(libc::EPERM));
         }
         Ok(())
@@ -548,8 +590,8 @@ impl Workspace {
         if self.hidden(p)? && self.marker(p)?.is_none() {
             return Ok(None);
         }
-        Ok(self.base.get(p).and_then(|b| {
-            self.record.map.owner(p).map(|m| Tombstone {
+        Ok(self.namespace.lookup(p)?.and_then(|b| {
+            self.namespace.owner(p).map(|m| Tombstone {
                 format: 1,
                 kind: if opaque { "opaque" } else { "delete" }.into(),
                 mount_id: m.id.clone(),
@@ -655,7 +697,7 @@ impl Workspace {
             }
             let equal = self.equal_base(&p, &e)?;
             if !equal {
-                changes.push(serde_json::json!({"path":p,"change":if self.base.contains_key(&p){"modify"}else{"add"},"mount":self.record.map.owner(&p).map(|m|&m.id)}));
+                changes.push(serde_json::json!({"path":p,"change":if self.namespace.lookup(&p)?.is_some(){"modify"}else{"add"},"mount":self.namespace.owner(&p).map(|m|&m.id)}));
             }
         }
         for p in walk(&self.tombs())? {
@@ -666,7 +708,7 @@ impl Workspace {
         Ok(serde_json::json!(changes))
     }
     pub fn equal_base(&self, p: &str, e: &Entry) -> Result<bool> {
-        let Some(b) = self.base.get(p) else {
+        let Some(b) = self.namespace.lookup(p)? else {
             return Ok(false);
         };
         if b.kind != e.kind || e.kind == Kind::Directory {

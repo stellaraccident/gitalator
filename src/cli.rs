@@ -55,6 +55,10 @@ pub enum Cmd {
     },
     Validate {
         workspace: String,
+        /// Also traverse and validate the complete composed base namespace.
+        #[arg(long)]
+        #[serde(default)]
+        full: bool,
     },
     Checkpoint {
         workspace: String,
@@ -144,7 +148,7 @@ impl Cmd {
             Self::Diff { workspace } => format!("diff {workspace}"),
             Self::Dir { workspace } => format!("dir {workspace}"),
             Self::Revert { workspace, path } => format!("revert {workspace}: {path}"),
-            Self::Validate { workspace } => format!("validate {workspace}"),
+            Self::Validate { workspace, .. } => format!("validate {workspace}"),
             Self::Checkpoint { workspace, .. } => format!("checkpoint {workspace}"),
             Self::Depot { .. } => "depot edit session".into(),
             Self::Daemon { .. } => "daemon lifecycle".into(),

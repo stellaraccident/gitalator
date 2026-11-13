@@ -3,38 +3,46 @@ use common::Fixture;
 use gitalator::{model::Map, store::Store};
 use std::{fs, time::Instant};
 
+fn snapshot(
+    ns: &gitalator::namespace::Namespace,
+) -> std::collections::BTreeMap<String, gitalator::model::Base> {
+    let mut result = std::collections::BTreeMap::new();
+    let mut todo = vec![String::new()];
+    while let Some(path) = todo.pop() {
+        for (p, b) in ns.children(&path).unwrap() {
+            if b.kind == gitalator::model::Kind::Directory {
+                todo.push(p.clone());
+            }
+            result.insert(p, b);
+        }
+    }
+    result
+}
 #[test]
-fn index_cache_is_disposable_and_keyed_by_complete_layout() {
+fn startup_uses_lazy_namespace_without_legacy_index() {
     let f = Fixture::new();
     let s = f.store();
-    let map = s.get("dev").unwrap().lock().unwrap().record.map.clone();
-    let expected = serde_json::to_value(s.load_base(&map).unwrap()).unwrap();
-    let cache = fs::read_dir(f.state.join("indexes"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    fs::write(&cache, b"truncated cache").unwrap();
-    assert_eq!(
-        serde_json::to_value(s.load_base(&map).unwrap()).unwrap(),
-        expected
-    );
-    assert_eq!(
-        serde_json::to_value(s.load_base(&map).unwrap()).unwrap(),
-        expected
-    );
+    assert!(!f.state.join("indexes").exists());
+    assert_eq!(s.trees.stats()["tree_objects_loaded"], 1);
+    let arc = s.get("dev").unwrap();
+    let map = arc.lock().unwrap().record.map.clone();
     let mut moved = map.clone();
     moved.mounts[0].path = "relocated".into();
-    let base = s.load_base(&moved).unwrap();
-    assert!(base.contains_key("relocated/hello"));
-    assert!(!base.contains_key("src/hello"));
+    let ns = s.prepare_namespace(&moved).unwrap();
+    assert!(ns.lookup("relocated/hello").unwrap().is_some());
+    assert!(ns.lookup("src/hello").unwrap().is_none());
     drop(s);
     let reopened = Store::open(&f.state).unwrap();
-    assert_eq!(
-        serde_json::to_value(&reopened.get("dev").unwrap().lock().unwrap().base).unwrap(),
-        expected
-    );
+    assert_eq!(reopened.trees.stats()["tree_objects_loaded"], 0);
+    assert!(reopened
+        .get("dev")
+        .unwrap()
+        .lock()
+        .unwrap()
+        .namespace
+        .lookup("src/hello")
+        .unwrap()
+        .is_some());
 }
 
 #[test]
@@ -65,11 +73,11 @@ fn benchmark_layout_index() {
     store.root = state;
     for pass in 1..=2 {
         let start = Instant::now();
-        let base = store.load_base(&map).unwrap();
+        let namespace = store.prepare_namespace(&map).unwrap();
         eprintln!(
             "layout pass {pass}: {} mounts, {} entries, {:.3}s",
             map.mounts.len(),
-            base.len(),
+            namespace.children("").unwrap().len(),
             start.elapsed().as_secs_f64()
         );
     }
@@ -112,11 +120,11 @@ fn parallel_index_matches_serial_with_nested_overrides() {
         let store = Store::open(&state).unwrap();
         let arc = store.get("dev").unwrap();
         let w = arc.lock().unwrap();
-        assert!(!w.base.contains_key("dir/file"));
-        assert!(w.base.contains_key("dir/hello"));
-        assert!(w.base.contains_key("dir/nested/hello"));
-        assert!(w.base.contains_key("dir-other/hello"));
-        let actual = serde_json::to_value(&w.base).unwrap();
+        assert!(w.namespace.lookup("dir/file").unwrap().is_none());
+        assert!(w.namespace.lookup("dir/hello").unwrap().is_some());
+        assert!(w.namespace.lookup("dir/nested/hello").unwrap().is_some());
+        assert!(w.namespace.lookup("dir-other/hello").unwrap().is_some());
+        let actual = serde_json::to_value(snapshot(&w.namespace)).unwrap();
         if let Some(expected) = &expected {
             assert_eq!(&actual, expected);
         } else {
@@ -129,8 +137,18 @@ fn parallel_index_matches_serial_with_nested_overrides() {
 fn cancellation_stops_all_index_workers_without_publishing_cache() {
     use std::{os::unix::fs::PermissionsExt, process::Command, time::Duration};
     let f = Fixture::new();
+    let mut map = Map::parse(&fs::read_to_string(f.depot.join("depot.toml")).unwrap()).unwrap();
+    map.repositories.insert(
+        "second".into(),
+        gitalator::model::Repository {
+            url: format!("file://{}", f.component.display()),
+        },
+    );
+    map.mounts[1].repository = "second".into();
+    fs::write(f.depot.join("depot.toml"), toml::to_string(&map).unwrap()).unwrap();
+    common::commit(&f.depot);
     drop(f.store());
-    fs::remove_dir_all(f.state.join("indexes")).unwrap();
+    fs::remove_dir_all(f.state.join("tree-cache")).unwrap();
     let fake = f.component.parent().unwrap().join("fake-index-bin");
     fs::create_dir(&fake).unwrap();
     let marker = fake.join("workers");
@@ -141,7 +159,7 @@ fn cancellation_stops_all_index_workers_without_publishing_cache() {
         format!(
             r#"#!/bin/sh
 case " $* " in
-  *" ls-tree -r -t -z "*)
+  *" cat-file --batch "*)
     echo $$ >> "$GTL_TEST_WORKERS"
     sleep 30
     ;;
@@ -195,5 +213,5 @@ exec "{}" "$@"
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(!f.state.join("indexes").exists());
+    assert!(!f.state.join("tree-cache").exists());
 }

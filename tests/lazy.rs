@@ -25,8 +25,14 @@ fn filtered_fetch_listing_demand_batch_and_offline_reopen() {
     let arc = s.get("dev").unwrap();
     let w = arc.lock().unwrap();
     let paths = ["src/hello", "src/sibling", "src/dir/file"];
-    let ids: Vec<_> = paths.iter().map(|p| w.base[*p].oid.clone()).collect();
-    let repo = f.state.join("repos").join(&w.base[paths[0]].repo);
+    let ids: Vec<_> = paths
+        .iter()
+        .map(|p| w.namespace.lookup(p).unwrap().unwrap().oid.clone())
+        .collect();
+    let repo = f
+        .state
+        .join("repos")
+        .join(&w.namespace.lookup(paths[0]).unwrap().unwrap().repo);
     assert_eq!(git::blob_sizes_local(&repo, &ids).unwrap(), vec![None; 3]);
     w.children("src").unwrap();
     assert_eq!(git::blob_sizes_local(&repo, &ids).unwrap(), vec![None; 3]);

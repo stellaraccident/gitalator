@@ -8,7 +8,10 @@ fn linked_depot_and_exact_layout_survive_restart() {
     let w = s.get("dev").unwrap();
     let w = w.lock().unwrap();
     assert!(w.depot().join(".git").is_file());
-    assert_eq!(w.base["src/hello"].oid, w.base["other/hello"].oid);
+    assert_eq!(
+        w.namespace.lookup("src/hello").unwrap().unwrap().oid,
+        w.namespace.lookup("other/hello").unwrap().unwrap().oid
+    );
     assert!(!w.upper().join("src/hello").exists());
     drop(w);
     drop(s);

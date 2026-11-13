@@ -5,7 +5,7 @@ use crate::{
     cli::Submodules,
     error, git,
     model::*,
-    store::{directory_index, json_write, token, Record, Store, Workspace},
+    store::{json_write, token, Record, Store, Workspace},
     util::{atomic, hash},
     Result,
 };
@@ -110,7 +110,12 @@ impl Store {
             if w.record.map.mounts.iter().any(|m| m.path == at) {
                 return Err(error("a mount already occupies this path"));
             }
-            if w.record.map.owner(at).is_some() && w.base.keys().any(|p| p != at && under(p, at)) {
+            if w.record.map.owner(at).is_some()
+                && w.namespace
+                    .lookup(at)?
+                    .is_some_and(|b| b.kind == Kind::Directory)
+                && !w.namespace.children(at)?.is_empty()
+            {
                 return Err(error("destination already contains mounted sources; replacement requires a resolve workflow"));
             }
             (w.record.map.clone(), w.record.generation.clone())
@@ -235,10 +240,10 @@ impl Store {
     ) -> Result<Value> {
         map.validate()?;
         let changed = &map != original;
-        let base = if changed {
-            self.load_base(&map)?
+        let namespace = if changed {
+            Some(self.prepare_namespace(&map)?)
         } else {
-            BTreeMap::new()
+            None
         };
         let workspace = self.get(name)?;
         let mut w = activity::lock(&workspace)?;
@@ -282,15 +287,14 @@ impl Store {
             let candidate = Workspace {
                 root: w.root.clone(),
                 record,
-                base,
-                directories: Default::default(),
+                namespace: namespace.unwrap(),
                 metadata: w.metadata.clone(),
                 handles: 0,
                 listed: Default::default(),
                 disabled_batches: Default::default(),
             };
             candidate.validate_content().map_err(|e| error(format!("layout conflicts with depot overlay/tombstones: {e}; no layout changes were activated")))?;
-            w.activate_layout(map, candidate.base)?;
+            w.activate_layout(map, candidate.namespace)?;
         }
         Ok(
             json!({"workspace":name,"added":added,"removed":removed,"updated":updated,"changed":changed,"manifest":w.depot().join("depot.toml"),"staged":false,"state_dir":self.root}),
@@ -600,7 +604,11 @@ impl Workspace {
         fs::File::open(&self.root)?.sync_all()?;
         Ok(())
     }
-    fn activate_layout(&mut self, map: Map, base: BTreeMap<String, Base>) -> Result<()> {
+    fn activate_layout(
+        &mut self,
+        map: Map,
+        namespace: std::sync::Arc<crate::namespace::Namespace>,
+    ) -> Result<()> {
         activity::check()?;
         let _critical = activity::critical();
         json_write(
@@ -622,8 +630,7 @@ impl Workspace {
         self.record.map = change.map;
         self.record.generation = change.generation;
         self.save()?;
-        self.directories = directory_index(&base);
-        self.base = base;
+        self.namespace = namespace;
         self.listed.lock().unwrap().clear();
         self.disabled_batches.lock().unwrap().clear();
         crate::failpoint("layout-applied");

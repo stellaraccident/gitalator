@@ -49,7 +49,7 @@ fn large_listing_batches_attributes_and_extracts_only_opened_file() {
         fs::read(w.entry("src/f599").unwrap().physical.unwrap()).unwrap(),
         b"0599".repeat(512)
     );
-    let repo = &w.base["src/f599"].repo;
+    let repo = &w.namespace.lookup("src/f599").unwrap().unwrap().repo;
     assert_eq!(
         fs::read_dir(f.state.join("cache").join(repo))
             .unwrap()
@@ -97,14 +97,22 @@ fn recursive_lookahead_is_bounded_and_respects_mount_boundaries() {
     w.attributes("src/d00/f00").unwrap();
     assert!(empty_cache(&f.state));
     assert_eq!(s.metadata.batches(), 1);
-    let resolved = w
-        .base
-        .iter()
-        .filter(|(path, b)| path.starts_with("src/d") && s.metadata.get(&b.repo, &b.oid).is_some())
-        .count();
+    let mut resolved = 0;
+    for d in 0..40 {
+        for b in w
+            .namespace
+            .children(&format!("src/d{d:02}"))
+            .unwrap()
+            .values()
+        {
+            if s.metadata.get(&b.repo, &b.oid).is_some() {
+                resolved += 1;
+            }
+        }
+    }
     assert_eq!(resolved, 1024);
     for p in ["src/d01/f00", "src/d39/f00"] {
-        let b = &w.base[p];
+        let b = &w.namespace.lookup(p).unwrap().unwrap();
         assert!(s.metadata.get(&b.repo, &b.oid).is_none());
         assert_eq!(
             git::blob_sizes_local(
@@ -145,7 +153,7 @@ fn lfs_sizes_and_symlink_attributes_do_not_hydrate() {
     assert!(!f
         .state
         .join("repos")
-        .join(&w.base["src/asset"].repo)
+        .join(&w.namespace.lookup("src/asset").unwrap().unwrap().repo)
         .join("lfs")
         .exists());
     assert_eq!(
@@ -162,8 +170,15 @@ fn speculative_failure_falls_back_and_disables_directory_batching() {
     pin(&f);
     let s = f.store();
     let arc = s.get("dev").unwrap();
-    let mut w = arc.lock().unwrap();
-    w.base.get_mut("src/bad").unwrap().oid = "0".repeat(40);
+    let w = arc.lock().unwrap();
+    let repo = f
+        .state
+        .join("repos")
+        .join(w.namespace.lookup("src/hello").unwrap().unwrap().repo);
+    for data in [b"hello\n".as_slice(), b"second".as_slice()] {
+        git::input(&repo, &["hash-object", "-w", "--stdin"], Some(data)).unwrap();
+    }
+    fs::rename(&f.component, f.component.with_extension("offline")).unwrap();
     w.children("src").unwrap();
     assert_eq!(w.attributes("src/hello").unwrap().size, 6);
     assert!(w.disabled_batches.lock().unwrap().contains("src"));

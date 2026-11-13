@@ -100,12 +100,12 @@ fn log_output(console: bool) {
             .any(|e| e["message"].as_str().unwrap().contains("Fetch completed")));
         assert!(entries
             .iter()
-            .any(|e| e["message"].as_str().unwrap().contains("Index mount")));
+            .any(|e| e["message"].as_str().unwrap().contains("mount roots")));
         assert!(entries.iter().all(|e| e["operation_id"].is_number()));
         if let Some(reader) = reader {
             let text = reader.join().unwrap();
             assert!(
-                text.contains("Fetch") && text.contains("Index mount"),
+                text.contains("Fetch") && text.contains("mount roots"),
                 "{text}"
             );
         } else {

@@ -31,10 +31,19 @@ impl Workspace {
     pub fn marker(&self, p: &str) -> Result<Option<Tombstone>> {
         let f = match self.safe(&self.tombs(), p) {
             Ok(f) => f,
-            Err(_) => return Ok(None),
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.raw_os_error() == Some(libc::ENOTDIR)) =>
+            {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
         };
-        if !fs::symlink_metadata(&f).is_ok_and(|m| m.is_file()) {
-            return Ok(None);
+        match fs::symlink_metadata(&f) {
+            Ok(m) if !m.is_file() => return Ok(None),
+            Ok(_) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
         }
         Ok(Some(serde_json::from_slice(&fs::read(f)?)?))
     }
@@ -113,6 +122,7 @@ impl Workspace {
                 time: self
                     .namespace
                     .lookup("")?
+                    .filter(|b| !b.mount_id.is_empty() || b.commit_time != 0)
                     .as_ref()
                     .map(base_time)
                     .unwrap_or_else(|| self.state_time()),
@@ -121,7 +131,12 @@ impl Workspace {
             });
         }
         let upper = self.safe(&self.upper(), p)?;
-        if let Ok(m) = fs::symlink_metadata(&upper) {
+        let upper_metadata = match fs::symlink_metadata(&upper) {
+            Ok(m) => Some(m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(m) = upper_metadata {
             let kind = if m.is_dir() {
                 Kind::Directory
             } else if m.file_type().is_symlink() {
@@ -222,25 +237,7 @@ impl Workspace {
         let mut directory_entries = vec![];
         let preparation = (|| -> Result<()> {
             if recursive {
-                let ancestor = Path::new(parent).parent().unwrap().to_str().unwrap();
-                let siblings: Vec<_> = self.namespace.children(ancestor)?.into_iter().collect();
-                let start = siblings.partition_point(|(s, _)| s.as_str() < parent);
-                let children = self.namespace.children(parent)?;
-                let candidates = children
-                    .iter()
-                    .chain(siblings[start..].iter().map(|(p, b)| (p, b)))
-                    .chain(siblings[..start].iter().map(|(p, b)| (p, b)));
-                for (path, b) in candidates {
-                    if dirs.len() >= crate::metadata::TRAVERSAL_DIRS {
-                        break;
-                    }
-                    if b.kind == Kind::Directory
-                        && b.mount_id == base.mount_id
-                        && !dirs.contains(path)
-                    {
-                        dirs.push(path.clone());
-                    }
-                }
+                dirs = self.lookahead_dirs(parent, &base.mount_id)?;
                 self.namespace.lookahead(&dirs)?;
             }
             for dir in &dirs {
@@ -280,7 +277,8 @@ impl Workspace {
                     && self.metadata.get(&b.repo, &b.oid).is_none()
                     && seen.insert(b.oid.clone())
                     && !self.hidden(path)?
-                    && fs::symlink_metadata(self.safe(&self.upper(), path)?).is_err()
+                    && fs::symlink_metadata(self.safe(&self.upper(), path)?)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
                 {
                     wanted.push(b.oid.clone());
                 }
@@ -368,6 +366,30 @@ impl Workspace {
         }
         Ok(target)
     }
+    fn lookahead_dirs(&self, path: &str, mount: &str) -> Result<Vec<String>> {
+        let mut dirs = vec![path.to_owned()];
+        let parent = Path::new(path)
+            .parent()
+            .unwrap_or(Path::new(""))
+            .to_str()
+            .unwrap();
+        let siblings: Vec<_> = self.namespace.children(parent)?.into_iter().collect();
+        let start = siblings.partition_point(|(p, _)| p.as_str() < path);
+        let children = self.namespace.children(path)?;
+        for (p, b) in children
+            .iter()
+            .chain(siblings[start..].iter().map(|(p, b)| (p, b)))
+            .chain(siblings[..start].iter().map(|(p, b)| (p, b)))
+        {
+            if dirs.len() >= crate::metadata::TRAVERSAL_DIRS {
+                break;
+            }
+            if b.kind == Kind::Directory && b.mount_id == mount && !dirs.contains(p) {
+                dirs.push(p.clone());
+            }
+        }
+        Ok(dirs)
+    }
     pub fn children(&self, p: &str) -> Result<Vec<String>> {
         Ok(self
             .children_entries(p)?
@@ -437,6 +459,37 @@ impl Workspace {
             entries.insert(".mountgit".into(), Kind::Symlink);
             entries.insert(".mountcommit".into(), Kind::File);
             entries.insert(".mountstate.json".into(), Kind::File);
+        }
+        // Name-only recursive scanners need tree batching too: they may never
+        // request blob attributes. Speculation never changes this listing's result.
+        let parent = Path::new(p)
+            .parent()
+            .unwrap_or(Path::new(""))
+            .to_str()
+            .unwrap();
+        if !p.is_empty()
+            && !self.hidden(p)?
+            && self.listed.lock().unwrap().contains(parent)
+            && !self.disabled_batches.lock().unwrap().contains(p)
+        {
+            if let Some(base) = self.namespace.lookup(p)? {
+                if !base.mount_id.is_empty() && base.mode != 0o160000 {
+                    let result = self
+                        .lookahead_dirs(p, &base.mount_id)
+                        .and_then(|dirs| self.namespace.lookahead(&dirs));
+                    if let Err(e) = result {
+                        crate::activity::check()?;
+                        self.disabled_batches.lock().unwrap().insert(p.into());
+                        crate::activity::event(
+                            "warn",
+                            &format!(
+                                "Tree lookahead failed for {}:{p}: {e}; retaining demanded listing",
+                                self.record.name
+                            ),
+                        );
+                    }
+                }
+            }
         }
         self.listed.lock().unwrap().insert(p.into());
         Ok(entries.into_iter().collect())

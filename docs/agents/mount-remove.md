@@ -42,3 +42,13 @@ gtl checkpoint example -m 'Remove repository mounts'
 
 Checkpoint includes all staged changes. Removing the root mount does not remove
 the workspace or its `.depotgit` discovery link.
+
+## Lazy discovery and validation
+
+Startup and layout activation prepare mount roots and validate boundaries and
+edited-path/tombstone dependencies. They do not scan every component directory.
+Untouched directory errors surface when accessed, with mount/path diagnostics in
+activity logs. Use `gtl validate NAME --full` for a cancellable whole-base check;
+normal `gtl validate NAME` is targeted. Full validation warms directory caches
+without hydrating payloads. `gtl status NAME` reports shared `tree_cache` counters.
+Explicit submodule discovery still explores the requested submodule graph.

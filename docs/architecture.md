@@ -97,7 +97,7 @@ of this release. Empty upper directories are runtime filesystem state; Git does
 not preserve them in commits. Changing metadata on an unlinked read-only base
 handle is unsupported; it must never mutate a shared immutable cache.
 
-Component trees are indexed in memory at workspace load. The foundation uses
+Component trees are discovered one directory at a time. The foundation uses
 exact-commit Git fetches with `--filter=blob:none`; origins must support filtering
 to avoid eager transfer. Directory enumeration uses tree metadata without fetching
 blobs. Attribute lookup fetches missing Git blobs in bounded batches, caches their
@@ -109,7 +109,7 @@ A listing followed by attributes enables up to 256 objects from that directory.
 If its parent was also listed, the batch can span up to 1,024 objects across 32
 immediate child/sibling directories within the same mount. Selection starts near
 the requested path and wraps; resolved objects, upper overrides and tombstoned
-paths are skipped. Per-directory indexes avoid whole-namespace scans.
+paths are skipped. Shared immediate-tree caches avoid whole-namespace scans.
 Failure falls back to the requested object and disables speculation for that
 directory until workspace reload. Cancellation does not disable speculation.
 
@@ -124,7 +124,7 @@ before invoking Git. This avoids Git 2.43's missing-promisor history walk.
 Version 1/2 pack indexes, SHA-1/SHA-256 IDs, and object alternates are supported.
 Base blobs are materialized into a disposable cache, with Git LFS expansion and
 payload verification. Depot checkout materialization hydrates its own tracked files.
-Whole-blob memory use and very large repository indexing remain limitations. No automatic cache GC
+Whole-blob memory use and oversized individual directories remain limitations. No automatic cache GC
 is implemented. The component commits and LFS objects must remain available from
 their origins for reconstruction on another machine.
 
@@ -186,23 +186,45 @@ and HEAD are untouched, so the user explicitly stages/checkpoints the layout.
 Live clones inherit active uncommitted layout; clean forks use committed layout.
 The import limits are 32 nested levels and 4,096 total mounts.
 
-Daemon startup restores composed base indexes from disposable `STATE/indexes/`
-JSON files keyed by a schema version and the complete version map. Workspaces
-with identical maps reuse the same disk index, including after restart. Pin,
-placement, mount identity, repository URL, and submodule-policy changes select a
-new key. Missing or malformed caches rebuild from Git; caches are published
-atomically. This does not cache mutable overlay/tombstone validation, skip journal
-recovery, or hydrate blob payloads. Deleting `STATE/indexes/` is safe when the
-server is stopped. Different maps currently build separate composed indexes.
+Daemon startup prepares immutable commit/root descriptors in per-repository
+batches, resolves explicit subtrees, and compiles a mount-path trie. This trie
+serves ownership, synthetic ancestor directories, metadata boundaries, and nested
+mount precedence without scanning all mounts for each path. No flattened
+workspace index is built, copied during clone, or persisted.
 
-Cold namespace validation checks metadata paths and mount ancestors directly in
-the ordered index rather than scanning every file against every mount. Startup
-reports recovery, index restoration/building, directory lookup construction,
-overlay validation, FUSE attachment, workspace elapsed times, and total readiness
-time. A five-second heartbeat covers long phases; interactive stderr and the
-usual activity JSON log receive these events. `daemon start` delegates opening
-state to the daemon instead of also doing it in the launching process.
+The lazy namespace exposes fallible lookup and immediate children operations.
+Workspace operations, FUSE directory kinds, staged checkpoint normalization, and
+tombstone provenance checks use these operations. Listing never treats backend
+errors as missing entries. Raw tree parsing supports SHA-1 and SHA-256 IDs and
+rejects unsupported names/modes when the affected directory is loaded.
 
+`STATE/tree-cache/v1/` contains disposable commit descriptors and checksummed
+immediate-directory caches, published atomically. Directory identity is repository
+ID plus tree OID; mount IDs, paths, timestamps and gitlink policy stay outside the
+shared cache. A 128 MiB accounted LRU memory budget is adjustable with
+`GTL_TREE_CACHE_MB=1..65536`. Active Arc references and oversized demand results
+can temporarily exceed the budget; oversized trees are not retained in memory.
+Per-workspace listing and failed-speculation hints each retain at most 4096 paths.
+
+Per-repository cancellable priority gates coalesce tree fills. Cache locks are
+never held during Git I/O or waits. Queued demand precedes speculative batches;
+a cancelled loader releases its gate so other requests can retry. Traversal
+lookahead reads at most 32 known immediate directories using batched tree-object
+reads; it stays within the current mount and never expands itself recursively.
+Failures retry the demanded directory and disable that context's speculation.
+
+Startup and layout/edit/checkpoint activation validate mount boundaries and the
+physical overlay/tombstone dependencies. Untouched component subtrees are not
+walked. `validate NAME --full` additionally traverses every composed base mount,
+skipping parent content replaced by nested mounts, and warms directory caches
+without hydrating file payloads. Invalid untouched directories surface on access
+or full validation, with mount/path context in activity logs. Existing formats
+and layout journal recovery are unchanged. Legacy `STATE/indexes/` is ignored;
+users may delete it while stopped. Old eager index code is removed entirely.
+
+Startup reports root preparation, tree-cache statistics, overlay validation,
+FUSE attachment, elapsed workspace time and readiness. Five-second heartbeats
+cover long phases; `status` exposes shared tree-cache counters and memory usage.
 
 Mount removal and pinned submodule expansion share the layout preparation and
 activation path with addition. They snapshot the active map and generation, do
@@ -242,13 +264,9 @@ Skipped results are returned separately from map changes (`complete`, `skipped`)
 repeating expansion retries omissions without repinning successful mounts.
 
 
-Cold index building runs mount preparation in bounded parallel windows, defaulting
-to min(available CPUs, 8), overridable via `GTL_INDEX_JOBS=1..64`. Each worker
-inherits the operation's activity/cancellation scope. Repository creation/fetch
-retains existing per-repository locks. Completed indexes compose in stable
-parent-before-child order, independent of completion order. Composition looks up
-only the overridden path and slash-prefixed subtree instead of scanning every
-accumulated entry per mount. Pending windows stop on cancellation/errors and no
-composed cache is published on failure. Already-running workers finish or observe
-cancellation before their scoped threads are joined; a window is bounded in mount
-count, not in total tree bytes. The persistent composed-cache format is unchanged.
+Root preparation and explicit full validation use bounded parallel windows,
+defaulting to min(available CPUs, 8), overridable with `GTL_INDEX_JOBS=1..64`.
+Workers inherit activity/cancellation, and repository creation/fetch retains its
+existing locks. Cancellation or failure prevents candidate layout activation;
+complete immutable directory caches may remain reusable. Submodule discovery and
+explicit recursive materialization retain their existing traversal semantics.

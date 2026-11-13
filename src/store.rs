@@ -36,13 +36,40 @@ pub struct Record {
     #[serde(default)]
     pub initializing: bool,
 }
+/// Bounded traversal hints; scanning a forest must not retain every visited path.
+#[derive(Default)]
+pub struct TraversalHints {
+    entries: std::collections::BTreeSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+impl TraversalHints {
+    pub fn contains(&self, path: &str) -> bool {
+        self.entries.contains(path)
+    }
+    pub fn insert(&mut self, path: String) {
+        if self.entries.contains(&path) {
+            return;
+        }
+        if self.order.len() == 4096 {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+        self.entries.insert(path.clone());
+        self.order.push_back(path);
+    }
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+}
 pub struct Workspace {
     pub root: PathBuf,
     pub record: Record,
     pub namespace: Arc<crate::namespace::Namespace>,
     pub handles: usize,
-    pub listed: Mutex<std::collections::BTreeSet<String>>,
-    pub disabled_batches: Mutex<std::collections::HashSet<String>>,
+    pub listed: Mutex<TraversalHints>,
+    pub disabled_batches: Mutex<TraversalHints>,
     pub metadata: Arc<crate::metadata::Metadata>,
 }
 #[derive(Clone)]

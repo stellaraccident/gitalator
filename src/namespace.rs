@@ -121,6 +121,10 @@ impl Store {
             node.mount = Some(index);
         }
         namespace.validate_boundaries()?;
+        activity::event(
+            "info",
+            &format!("Mount roots prepared; tree cache {}", self.trees.stats()),
+        );
         Ok(Arc::new(namespace))
     }
     fn prepare_commits(&self, url: &str, pins: &BTreeSet<String>) -> Result<Vec<Commit>> {
@@ -251,12 +255,14 @@ impl Namespace {
         if activity::interrupted(&*e) || e.downcast_ref::<std::io::Error>().is_some() {
             e
         } else {
-            error(format!(
+            let message = format!(
                 "namespace path {path:?}, mount {}: {e}",
                 self.owner(path)
                     .map(|m| m.id.as_str())
                     .unwrap_or("<synthetic>")
-            ))
+            );
+            activity::event("error", &message);
+            error(message)
         }
     }
     pub fn lookup(&self, path: &str) -> Result<Option<Base>> {
@@ -438,25 +444,34 @@ impl Namespace {
                         let scope = scope.clone();
                         threads.spawn(move || {
                             let _context = scope.enter();
-                            let mut todo = vec![m.path.clone()];
+                            let mut todo = std::collections::VecDeque::from([m.path.clone()]);
                             let mut count = 0usize;
-                            while let Some(path) = todo.pop() {
+                            while !todo.is_empty() {
                                 activity::check()?;
-                                for (p, b) in self.children(&path)? {
-                                    if b.kind == Kind::Directory
-                                        && b.mount_id == m.id
-                                        && b.mode != 0o160000
-                                    {
-                                        todo.push(p);
+                                let batch: Vec<_> = (0..todo.len().min(32))
+                                    .filter_map(|_| todo.pop_front())
+                                    .collect();
+                                // Prime the known frontier in one object batch. On a
+                                // speculative error, demand each directory to report
+                                // its exact path rather than hide or cache the failure.
+                                if self.lookahead(&batch).is_err() {
+                                    activity::check()?;
+                                }
+                                for path in batch {
+                                    for (p, b) in self.children(&path)? {
+                                        if b.kind == Kind::Directory
+                                            && b.mount_id == m.id
+                                            && b.mode != 0o160000
+                                        {
+                                            todo.push_back(p);
+                                        }
                                     }
+                                    count += 1;
                                 }
-                                count += 1;
-                                if count.is_multiple_of(128) {
-                                    activity::stage(&format!(
-                                        "Full validation {}: {count} directories",
-                                        m.id
-                                    ));
-                                }
+                                activity::stage(&format!(
+                                    "Full validation {}: {count} directories",
+                                    m.id
+                                ));
                             }
                             activity::event(
                                 "info",

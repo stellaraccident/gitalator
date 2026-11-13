@@ -18,7 +18,7 @@ The physical depot worktree and the FUSE source tree are separate representation
   workspaces/<id>/journal.json        present only during namespace recovery
   workspaces/<id>/layout.json         present only during layout recovery
   cache/                             disposable materialized base payloads
-  indexes/                           disposable composed indexes keyed by version map
+  tree-cache/v1/                     shared immutable commit/directory caches
   logs/activity.jsonl                 structured operation and startup activity
   config.json                        service mount location
   control.sock
@@ -238,11 +238,11 @@ gtl cancel 42                        # cancel an operation by its reported ID
 tail -f /path/to/state/logs/activity.jsonl
 ```
 
-Startup reports journal recovery, index restoration/building, directory lookup
-construction, overlay validation, FUSE attachment, and total time to readiness.
+Startup reports journal recovery, mount-root preparation, tree-cache statistics,
+overlay validation, FUSE attachment, and total time to readiness.
 Long startup phases emit five-second heartbeats.
 
-Activity includes mount indexing, repository fetches, Git transfer progress,
+Activity includes directory demand/lookahead loads, repository fetches, Git transfer progress,
 payload/LFS hydration, elapsed-time heartbeats, failures and cancellation.
 Raw `GIT_TRACE2_EVENT` remains available for deeper Git diagnostics.
 
@@ -270,7 +270,8 @@ files retain their real worktree timestamps.
 
 ```sh
 gtl status dev
-gtl validate dev                     # check current depot/overlay invariants
+gtl validate dev                     # mount boundaries and depot/overlay invariants
+gtl validate dev --full              # also traverse the complete base namespace
 gtl dir dev                          # report the composed workspace path
 gtl diff dev                         # semantic changes relative to component pins
 git -C ~/ws/dev/.depotgit status      # actual sparse depot Git status
@@ -333,38 +334,68 @@ Metadata JSON is versioned and reports the active generation and exact mappings.
 
 ## Startup, hydration, and latency
 
-Component fetches use Git's `blob:none` filter. Startup indexes pinned trees;
-file content is fetched and materialized only as needed. Immutable composed indexes
-are cached under `STATE/indexes/`, keyed by the complete version map and schema.
-Cold indexing runs independent mount Git/tree work concurrently, with up to eight
-workers by default (bounded by available CPUs). To tune it, set the environment
-on the server or offline command:
+Component fetches use Git's `blob:none` filter. Startup prepares mount roots and
+validates mount boundaries, overlay paths, and tombstone provenance. It does not
+recursively index every component file. Directory contents are discovered on
+lookup or listing, and file payloads remain lazy.
+
+Immutable directory entries are shared by repository identity and tree OID,
+across mounts, pins, and workspaces. Commit/root metadata and directory objects
+persist under `STATE/tree-cache/v1/`; malformed caches rebuild from Git. The
+in-memory directory cache uses LRU eviction with a 128 MiB default accounted
+budget. Active requests and oversized directories can temporarily exceed it.
+Traversal history is bounded too; scanning does not retain every visited path.
 
 ```sh
-GTL_INDEX_JOBS=8 gtl daemon run
-# Use 1 for serial indexing; supported values are 1 through 64.
+GTL_TREE_CACHE_MB=256 GTL_INDEX_JOBS=8 gtl daemon run
 ```
 
-Results are composed deterministically with descendants overriding parents;
-workers share cancellation and retain per-repository fetch locks. Bounded windows
-limit the number of uncomposed indexes held at once. Higher concurrency uses more
-memory and Git processes. This controls indexing, not submodule discovery/import.
+`GTL_TREE_CACHE_MB` accepts 1–65536 MiB. `GTL_INDEX_JOBS` accepts 1–64, defaulting
+to at most eight available CPUs, and controls parallel root preparation and full
+validation. It does not make submodule import parallel. `gtl status NAME` includes
+shared tree-cache load/hit counts and resident/budget bytes.
 
-A synthetic 679-mount fixture (eight local origins, 64 files per mount) took
-57.19 s to create a cold workspace before this change and 9.53 s with the default
-parallel indexing—about 6× faster, with identical indexes. Cached reopening stayed
-at about 0.09 s. This measures small-tree/process overhead, not network performance
-or the cost of indexing a real forest's larger trees.
+Normal validation is targeted. An unsupported entry in an untouched directory
+may therefore be discovered only on access; the affected operation returns an
+error and activity logs identify its mount and path. Run `gtl validate NAME --full`
+for a cancellable full base-namespace check and cache warmup without fetching file
+payloads. Fetching pins during explicit import, enumerating the submodule graph,
+and materializing a directory for rename are still explicit work.
 
-Identical maps reuse that disk cache across workspaces and restarts. Changed maps
-select a new cache entry; missing or malformed caches rebuild from Git. Mutable
-overlay/tombstone validation and journal recovery still run on each start.
+The eager flattened index implementation has been removed. Existing manifests
+and workspace records remain compatible. Old `STATE/indexes/` files are ignored;
+remove them with the server stopped if you want to reclaim space. Both old index
+files and the new tree cache are disposable.
 
-On a 61-mount TheRock layout with 460,982 indexed entries, an optimized build
-measured 6.75 s to build the index and 0.63 s to restore it from cache. These are
-indexing times, not total daemon startup times or network-fetch estimates. Different
-maps currently have separate composed indexes. The index cache is disposable;
-with the server stopped, deleting `STATE/indexes/` causes a rebuild on next use.
+Reproduce startup, first access, `ls -l`, full-traversal, Git-command-count, and
+memory measurements on a local 679-mount fixture with small and larger trees:
+
+```sh
+python3 scripts/bench-namespace.py --before /path/to/eager/gtl \
+  --after /path/to/release/gtl --output /workspace/scratch/namespace-bench
+```
+
+The benchmark uses already-fetched local repositories and temporary foreground
+servers, preserving traces and results under its output directory. It isolates
+namespace costs, not remote network performance.
+
+One optimized-build run with 679 mounts and eight local origins measured:
+
+| Metric | Eager index | Lazy namespace |
+|---|---:|---:|
+| Cold startup, 64 files/mount | 9.38 s | 0.23 s |
+| Cold startup, 1,024 files/mount | 41.77 s | 0.23 s |
+| Startup resident memory, larger fixture | 360 MiB | 8 MiB |
+| First directory listing, larger fixture | 0.006 s | 0.039 s |
+| `ls -l`, larger fixture | 0.357 s | 0.204 s |
+| Full walk, larger fixture | 72.41 s | 66.72 s |
+| Cached startup, larger fixture | 1.20 s | 0.04 s |
+
+Both walks returned identical file counts. Startup Git invocations fell from
+4,753 to 40 in this fixture; the lazy full walk issued 15 additional Git commands.
+The shared tree cache held about 1.6 MiB after the larger walk. Total daemon memory
+also includes FUSE inode/handle state, blob metadata, and active requests: the
+128 MiB tree-cache budget is not a total process-memory limit.
 
 Name-only enumeration does not fetch blobs. Attribute lookups (`ls -l`, build
 scanners) resolve sizes in batches, without creating extracted payload files.
@@ -373,7 +404,8 @@ copy-up still hydrate file contents.
 
 The first attribute request after a directory listing resolves up to 256 objects.
 Evidence of recursive traversal expands this to at most 1,024 objects across 32
-nearby directories within the same mount. Repeated mounts/workspaces share object
+nearby directories within the same mount. Tree lookahead batches immediate
+directory objects and never recursively expands itself. Repeated mounts/workspaces share object
 metadata. Demand work precedes queued lookahead; failures fall back to the
 requested file and suppress further speculation for that directory.
 

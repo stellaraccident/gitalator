@@ -843,3 +843,49 @@ fn expand_cancel_retry_and_remove_from_workspace_cwd() {
     assert!(fs::symlink_metadata(root.join("child/.mountgit")).is_err());
     assert!(fs::read_link(root.join(".depotgit")).is_ok());
 }
+
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn lazy_tree_errors_surface_on_access_and_explicit_full_validation() {
+    use std::os::unix::ffi::OsStrExt;
+    let f = Fixture::new();
+    fs::write(
+        f.component
+            .join("dir")
+            .join(std::ffi::OsStr::from_bytes(b"bad-\xff")),
+        b"invalid filename",
+    )
+    .unwrap();
+    commit(&f.component);
+    let pin = gitalator::git::text(&f.component, &["rev-parse", "HEAD"]).unwrap();
+    let mut map =
+        gitalator::model::Map::parse(&fs::read_to_string(f.depot.join("depot.toml")).unwrap())
+            .unwrap();
+    for mount in &mut map.mounts {
+        mount.commit = pin.clone();
+    }
+    fs::write(f.depot.join("depot.toml"), toml::to_string(&map).unwrap()).unwrap();
+    commit(&f.depot);
+    let m = Mounted::configured(f, &[]);
+    assert_eq!(fs::read(m.dev().join("src/hello")).unwrap(), b"hello\n");
+    let normal = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .arg("--state-dir")
+        .arg(&m.f.state)
+        .args(["validate", "dev"])
+        .output()
+        .unwrap();
+    assert!(normal.status.success());
+    assert!(fs::read_dir(m.dev().join("src/dir")).is_err());
+    let full = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .arg("--state-dir")
+        .arg(&m.f.state)
+        .args(["validate", "dev", "--full"])
+        .output()
+        .unwrap();
+    assert!(!full.status.success());
+    assert!(String::from_utf8_lossy(&full.stderr).contains("namespace path"));
+    assert_eq!(fs::read(m.dev().join("src/hello")).unwrap(), b"hello\n");
+    assert!(fs::read_to_string(m.f.state.join("logs/activity.jsonl"))
+        .unwrap()
+        .contains("src/dir"));
+}

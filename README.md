@@ -86,6 +86,27 @@ with an explicitly selected state. It activates the validated layout and modifie
 `depot.toml` without staging or committing. Existing overlay files stay on top.
 Read `gtl agents mount-add` for verification, checkpointing, and cancellation.
 
+## Remove mounts and expand submodules
+
+```sh
+# Remove exactly one mount; descendants remain.
+gtl mount remove --at .
+# Remove that mount and every descendant mount.
+gtl mount remove --at components/library --recursive
+
+# Expand the currently pinned mount without advancing any revisions.
+gtl mount submodules --at . --depth first-level
+gtl mount submodules --at . --depth recursive
+```
+
+Removal preserves overlay files and rejects tombstones that would lose their
+base provenance. Expansion adds missing submodules and reuses matching mounts;
+conflicting origins, pins, or subtrees require a future resolve workflow. It reads
+pinned `.gitmodules`, not local edits. Repeated expansion is harmless and never
+prunes existing descendants. Both commands activate an uncommitted layout using
+the same workspace discovery and cancellation behavior as `mount add`.
+See `gtl agents mount-remove` and `gtl agents mount-submodules`.
+
 ## Create a depot
 
 Create an ordinary Git repository containing a committed `depot.toml`:
@@ -192,7 +213,7 @@ finish with `gtl depot end dev TOKEN`. Failed commands or validation leave the
 workspace suspended. `gtl status dev` reports the token for repair after a crash.
 Do not perform raw checkout/reset/rebase or modify physical payloads concurrently
 with FUSE access. Manual pin/layout changes and workspace branch changes are rejected: restore
-those before ending the edit session. Use `mount add` for additive layout changes.
+those before ending the edit session. Use `mount add`, `mount remove`, and `mount submodules` for supported layout changes.
 
 ```sh
 gtl workspace fork clean --from dev   # committed state only, new branch/index

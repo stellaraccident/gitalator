@@ -589,7 +589,7 @@ impl Workspace {
         let map = Map::parse(&fs::read_to_string(self.depot().join("depot.toml"))?)?;
         if map != self.record.map {
             return Err(error(
-                "manual pin/layout changes are unsupported; use mount add for new mounts or restore the active depot.toml",
+                "manual pin/layout changes are unsupported; use mount commands for supported layout changes or restore the active depot.toml",
             ));
         }
         self.validate_content()

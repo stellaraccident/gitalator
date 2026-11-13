@@ -1,4 +1,4 @@
-//! Additive layout changes. Fetch/validate before activation; never silently
+//! Planned layout changes. Fetch/validate before activation; never silently
 //! replace an existing mount or its pin.
 use crate::{
     activity,
@@ -90,7 +90,6 @@ impl Store {
             (w.record.map.clone(), w.record.generation.clone())
         };
         let mut map = original.clone();
-        let before = map.mounts.len();
         self.import_mount(
             &mut map,
             url,
@@ -99,37 +98,149 @@ impl Store {
             submodules,
             &mut BTreeSet::new(),
             0,
+            false,
         )?;
+        self.finish_layout(name, &original, &generation, map)
+    }
+
+    fn layout_snapshot(&self, name: &str, expected_id: Option<&str>) -> Result<(Map, String)> {
+        let workspace = self.get(name)?;
+        let w = activity::lock(&workspace)?;
+        w.quiescent()?;
+        w.validate()?;
+        if expected_id.is_some_and(|id| id != w.record.id) {
+            return Err(error("workspace identity changed"));
+        }
+        Ok((w.record.map.clone(), w.record.generation.clone()))
+    }
+
+    pub fn remove_mount(
+        &self,
+        name: &str,
+        expected_id: Option<&str>,
+        at: &str,
+        recursive: bool,
+    ) -> Result<Value> {
+        let at = mount_path(at)?;
+        let (original, generation) = self.layout_snapshot(name, expected_id)?;
+        if !original.mounts.iter().any(|m| m.path == at) {
+            return Err(error("no mount at the requested path"));
+        }
+        let mut map = original.clone();
+        map.mounts
+            .retain(|m| m.path != at && !(recursive && under(&m.path, at)));
+        // Removing a child may expose its parent's gitlink as an empty directory.
+        // Preserve independent descendants; never cascade implicitly.
+        for removed in original
+            .mounts
+            .iter()
+            .filter(|m| !map.mounts.iter().any(|n| n.path == m.path))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            if let Some(owner) = map.owner(&removed.path).map(|m| m.id.clone()) {
+                map.mounts
+                    .iter_mut()
+                    .find(|m| m.id == owner)
+                    .unwrap()
+                    .uninitialized_submodules = true;
+            }
+        }
+        map.repositories
+            .retain(|id, _| map.mounts.iter().any(|m| &m.repository == id));
+        self.finish_layout(name, &original, &generation, map)
+    }
+
+    pub fn expand_submodules(
+        &self,
+        name: &str,
+        expected_id: Option<&str>,
+        at: &str,
+        depth: Submodules,
+    ) -> Result<Value> {
+        let at = mount_path(at)?;
+        if depth == Submodules::None {
+            return Err(error("expansion depth must be first-level or recursive"));
+        }
+        let (original, generation) = self.layout_snapshot(name, expected_id)?;
+        let mut map = original.clone();
+        let index = map
+            .mounts
+            .iter()
+            .position(|m| m.path == at)
+            .ok_or("no mount at the requested path")?;
+        self.expand_mount(&mut map, index, depth, &mut BTreeSet::new(), 0, true)?;
+        self.finish_layout(name, &original, &generation, map)
+    }
+
+    fn finish_layout(
+        &self,
+        name: &str,
+        original: &Map,
+        generation: &str,
+        map: Map,
+    ) -> Result<Value> {
         map.validate()?;
-        let base = self.load_base(&map)?;
-        let added = map.mounts[before..].to_vec();
+        let changed = &map != original;
+        let base = if changed {
+            self.load_base(&map)?
+        } else {
+            BTreeMap::new()
+        };
+        let workspace = self.get(name)?;
         let mut w = activity::lock(&workspace)?;
         w.quiescent()?;
         w.validate()?;
+        activity::check()?;
         if w.record.generation != generation
-            || w.record.map != original
+            || &w.record.map != original
             || !w.root.join("workspace.json").exists()
         {
             return Err(error(
-                "workspace changed during import; retry against its current state",
+                "workspace changed during layout preparation; retry against its current state",
             ));
         }
-        let mut record = w.record.clone();
-        record.map = map.clone();
-        let candidate = Workspace {
-            root: w.root.clone(),
-            record,
-            base,
-            directories: Default::default(),
-            metadata: w.metadata.clone(),
-            handles: 0,
-            listed: Default::default(),
-            disabled_batches: Default::default(),
-        };
-        candidate.validate_content()?;
-        w.activate_layout(map, candidate.base)?;
+        let added: Vec<_> = map
+            .mounts
+            .iter()
+            .filter(|m| !original.mounts.iter().any(|old| old.path == m.path))
+            .cloned()
+            .collect();
+        let removed: Vec<_> = original
+            .mounts
+            .iter()
+            .filter(|m| !map.mounts.iter().any(|new| new.path == m.path))
+            .cloned()
+            .collect();
+        let updated: Vec<_> = map
+            .mounts
+            .iter()
+            .filter(|m| {
+                original
+                    .mounts
+                    .iter()
+                    .any(|old| old.path == m.path && old != *m)
+            })
+            .cloned()
+            .collect();
+        if changed {
+            let mut record = w.record.clone();
+            record.map = map.clone();
+            let candidate = Workspace {
+                root: w.root.clone(),
+                record,
+                base,
+                directories: Default::default(),
+                metadata: w.metadata.clone(),
+                handles: 0,
+                listed: Default::default(),
+                disabled_batches: Default::default(),
+            };
+            candidate.validate_content().map_err(|e| error(format!("layout conflicts with depot overlay/tombstones: {e}; no layout changes were activated")))?;
+            w.activate_layout(map, candidate.base)?;
+        }
         Ok(
-            json!({"workspace":name,"added":added,"manifest":w.depot().join("depot.toml"),"staged":false,"state_dir":self.root}),
+            json!({"workspace":name,"added":added,"removed":removed,"updated":updated,"changed":changed,"manifest":w.depot().join("depot.toml"),"staged":false,"state_dir":self.root}),
         )
     }
 
@@ -143,6 +254,7 @@ impl Store {
         mode: Submodules,
         stack: &mut BTreeSet<(String, String)>,
         depth: usize,
+        reuse: bool,
     ) -> Result<()> {
         activity::check()?;
         if depth > 32 || map.mounts.len() >= 4096 {
@@ -165,9 +277,6 @@ impl Store {
         map.validate()?; // Validate remote syntax before contacting it.
         let repo = self.repo(url)?;
         let commit = self.fetch(&repo, revision)?;
-        if !stack.insert((url.into(), commit.clone())) {
-            return Err(error("recursive submodule cycle"));
-        }
         let id = if path.is_empty() {
             "root".into()
         } else {
@@ -189,9 +298,50 @@ impl Store {
                 if path.is_empty() { "/" } else { path }
             ),
         );
-        if mode != Submodules::None {
+        self.expand_mount(map, map.mounts.len() - 1, mode, stack, depth, reuse)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_mount(
+        &self,
+        map: &mut Map,
+        index: usize,
+        mode: Submodules,
+        stack: &mut BTreeSet<(String, String)>,
+        depth: usize,
+        reuse: bool,
+    ) -> Result<()> {
+        activity::check()?;
+        if mode == Submodules::None {
+            return Ok(());
+        }
+        if depth > 32 {
+            return Err(error("submodule import exceeds depth/mount limit"));
+        }
+        let mount = map.mounts[index].clone();
+        let path = mount.path.as_str();
+        let commit = mount.commit.clone();
+        let url = map.repositories[&mount.repository].url.clone();
+        if !stack.insert((url.clone(), commit.clone())) {
+            return Err(error("recursive submodule cycle"));
+        }
+        let repo = self.repo(&url)?;
+        self.fetch(&repo, &commit)?;
+        activity::event(
+            "info",
+            &format!(
+                "Expand submodules at {} ({commit}): {mode:?}",
+                if path.is_empty() { "/" } else { path }
+            ),
+        );
+        {
             let bare = self.root.join("repos").join(repo);
-            let tree = git::run(&bare, &["ls-tree", "-r", "-z", &commit])?;
+            let tree_spec = if mount.subtree.is_empty() {
+                commit.clone()
+            } else {
+                format!("{commit}:{}", mount.subtree)
+            };
+            let tree = git::run(&bare, &["ls-tree", "-r", "-z", &tree_spec])?;
             let mut links = vec![];
             for entry in tree.split(|b| *b == 0).filter(|e| !e.is_empty()) {
                 activity::check()?;
@@ -238,32 +388,56 @@ impl Store {
                         return Err(error("invalid submodule path"));
                     }
                     let key = names
-                        .get(&child)
+                        .get(&join(&mount.subtree, &child))
                         .ok_or("gitlink missing from .gitmodules")?;
                     let child_url = git::text(
                         &bare,
                         &["config", "--blob", &config, "--get", &format!("{key}.url")],
                     )?;
-                    let child_url = resolve_url(url, &child_url)?;
-                    self.import_mount(
-                        map,
-                        &child_url,
-                        &pin,
-                        &join(path, &child),
-                        if mode == Submodules::Recursive {
-                            Submodules::Recursive
-                        } else {
-                            Submodules::None
-                        },
-                        stack,
-                        depth + 1,
-                    )?;
+                    let child_url = resolve_url(&url, &child_url)?;
+                    let child_path = join(path, &child);
+                    let child_mode = if mode == Submodules::Recursive {
+                        Submodules::Recursive
+                    } else {
+                        Submodules::None
+                    };
+                    if let Some(existing) = map.mounts.iter().position(|m| m.path == child_path) {
+                        let m = &map.mounts[existing];
+                        if !reuse
+                            || map.repositories[&m.repository].url != child_url
+                            || m.commit != pin
+                            || !m.subtree.is_empty()
+                        {
+                            return Err(error(format!("submodule mount conflict at {child_path}: existing origin/pin/subtree differs or path is occupied; use an explicit resolve workflow (no mounts changed)")));
+                        }
+                        self.expand_mount(map, existing, child_mode, stack, depth + 1, reuse)?;
+                    } else {
+                        self.import_mount(
+                            map,
+                            &child_url,
+                            &pin,
+                            &child_path,
+                            child_mode,
+                            stack,
+                            depth + 1,
+                            reuse,
+                        )?;
+                    }
                 }
             }
         }
-        stack.remove(&(url.into(), commit));
+        map.mounts[index].uninitialized_submodules = false;
+        stack.remove(&(url, commit));
         Ok(())
     }
+}
+
+fn mount_path(at: &str) -> Result<&str> {
+    let at = if at == "." { "" } else { at };
+    if !valid_path(at) {
+        return Err(error("--at must be workspace-relative; use . for the root"));
+    }
+    Ok(at)
 }
 
 /// Git resolves ./ and ../ submodule URLs relative to the repository URL itself.
@@ -331,7 +505,7 @@ impl Workspace {
         )?;
         crate::failpoint("layout-published");
         // Redo is idempotent. The on-disk index/HEAD and unrelated staged files
-        // are never changed by an additive layout operation.
+        // are never changed by a layout operation.
         let journal = self.root.join("layout.json");
         let change: LayoutJournal = serde_json::from_slice(&fs::read(&journal)?)?;
         atomic(

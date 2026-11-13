@@ -126,7 +126,12 @@ pub enum DepotCmd {
 impl Cmd {
     pub fn label(&self) -> String {
         match self {
-            Self::Mount { .. } => "mount add".into(),
+            Self::Mount { command } => match command {
+                MountCmd::Add { .. } => "mount add",
+                MountCmd::Remove { .. } => "mount remove",
+                MountCmd::Submodules { .. } => "mount submodules",
+            }
+            .into(),
             Self::Workspace { command } => match command {
                 WorkspaceCmd::Init { name } => format!("workspace init {name}"),
                 WorkspaceCmd::Create { name, .. } => format!("workspace create {name}"),
@@ -155,6 +160,10 @@ impl Cmd {
 pub enum AgentChapter {
     /// Add pinned repository mounts and choose submodule import depth.
     MountAdd,
+    /// Remove a mount, optionally including its descendant mounts.
+    MountRemove,
+    /// Expand submodules at an existing mount's current pin.
+    MountSubmodules,
     /// Create an empty workspace or attach an existing depot.
     WorkspaceCreate,
 }
@@ -176,6 +185,29 @@ pub enum MountCmd {
         #[arg(skip)]
         workspace_id: Option<String>,
     },
+    /// Remove a mount while preserving depot overlay files.
+    Remove {
+        #[arg(long)]
+        at: String,
+        /// Also remove every mount beneath this path.
+        #[arg(long)]
+        recursive: bool,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(skip)]
+        workspace_id: Option<String>,
+    },
+    /// Import missing submodules from the mount's current pinned commit.
+    Submodules {
+        #[arg(long)]
+        at: String,
+        #[arg(long, value_enum, default_value = "first-level")]
+        depth: SubmoduleDepth,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(skip)]
+        workspace_id: Option<String>,
+    },
 }
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -183,4 +215,43 @@ pub enum Submodules {
     None,
     FirstLevel,
     Recursive,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubmoduleDepth {
+    FirstLevel,
+    Recursive,
+}
+impl From<SubmoduleDepth> for Submodules {
+    fn from(depth: SubmoduleDepth) -> Self {
+        match depth {
+            SubmoduleDepth::FirstLevel => Self::FirstLevel,
+            SubmoduleDepth::Recursive => Self::Recursive,
+        }
+    }
+}
+impl MountCmd {
+    pub fn location_mut(&mut self) -> (&mut String, &mut Option<String>, &mut Option<String>) {
+        match self {
+            Self::Add {
+                at,
+                workspace,
+                workspace_id,
+                ..
+            }
+            | Self::Remove {
+                at,
+                workspace,
+                workspace_id,
+                ..
+            }
+            | Self::Submodules {
+                at,
+                workspace,
+                workspace_id,
+                ..
+            } => (at, workspace, workspace_id),
+        }
+    }
 }

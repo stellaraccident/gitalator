@@ -269,27 +269,42 @@ impl Store {
 }
 pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
     match cmd {
-        Cmd::Mount {
-            command:
-                crate::cli::MountCmd::Add {
+        Cmd::Mount { mut command } => {
+            let (_, workspace, _) = command.location_mut();
+            let name = workspace
+                .clone()
+                .ok_or("mount command requires a workspace")?;
+            let store = crate::activity::lock(&core.store)?.clone();
+            use crate::cli::MountCmd;
+            let result = match command {
+                MountCmd::Add {
                     url,
                     at,
                     revision,
                     submodules,
-                    workspace,
                     workspace_id,
-                },
-        } => {
-            let name = workspace.ok_or("mount add requires a workspace")?;
-            let store = crate::activity::lock(&core.store)?.clone();
-            let result = store.add_mount(
-                &name,
-                workspace_id.as_deref(),
-                &url,
-                &at,
-                &revision,
-                submodules,
-            )?;
+                    ..
+                } => store.add_mount(
+                    &name,
+                    workspace_id.as_deref(),
+                    &url,
+                    &at,
+                    &revision,
+                    submodules,
+                ),
+                MountCmd::Remove {
+                    at,
+                    recursive,
+                    workspace_id,
+                    ..
+                } => store.remove_mount(&name, workspace_id.as_deref(), &at, recursive),
+                MountCmd::Submodules {
+                    at,
+                    depth,
+                    workspace_id,
+                    ..
+                } => store.expand_submodules(&name, workspace_id.as_deref(), &at, depth.into()),
+            }?;
             core.invalidate(&name)?;
             Ok(result)
         }

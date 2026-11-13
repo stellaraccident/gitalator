@@ -728,3 +728,110 @@ fn cancelling_mount_import_keeps_old_layout_available() {
     assert!(wait_exit(&mut retry).success());
     assert_eq!(fs::read(m.mount.join("example/hello")).unwrap(), b"hello\n");
 }
+
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn expand_cancel_retry_and_remove_from_workspace_cwd() {
+    let (m, gate, pid) = delayed_mount();
+    fs::remove_file(&gate).unwrap();
+    let parent = m.f.component.parent().unwrap().join("super");
+    let child = m.f.component.parent().unwrap().join("child-origin");
+    gitalator::git::run(
+        m.f.component.parent().unwrap(),
+        &[
+            "clone",
+            m.f.component.to_str().unwrap(),
+            child.to_str().unwrap(),
+        ],
+    )
+    .unwrap();
+    fs::create_dir(&parent).unwrap();
+    gitalator::git::run(&parent, &["init", "-b", "main"]).unwrap();
+    gitalator::git::run(&parent, &["config", "user.name", "Test"]).unwrap();
+    gitalator::git::run(&parent, &["config", "user.email", "test@localhost"]).unwrap();
+    let pin = gitalator::git::text(&child, &["rev-parse", "HEAD"]).unwrap();
+    fs::write(
+        parent.join(".gitmodules"),
+        "[submodule \"child\"]\npath=child\nurl=../child-origin\n",
+    )
+    .unwrap();
+    gitalator::git::run(
+        &parent,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{pin},child"),
+        ],
+    )
+    .unwrap();
+    gitalator::git::run(&parent, &["add", ".gitmodules"]).unwrap();
+    gitalator::git::run(&parent, &["commit", "-m", "submodule"]).unwrap();
+    m.request(Cmd::Workspace {
+        command: WorkspaceCmd::Init {
+            name: "example".into(),
+        },
+    });
+    let root = m.mount.join("example");
+    let out = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .current_dir(&root)
+        .args(["mount", "add"])
+        .arg(&parent)
+        .args(["--at", "."])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(fs::read_dir(root.join("child")).unwrap().next().is_none());
+    let before = fs::read(root.join(".depotgit/depot.toml")).unwrap();
+    fs::write(&gate, "").unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gtl"));
+    command
+        .current_dir(&root)
+        .args(["mount", "submodules", "--at", ".", "--depth", "recursive"])
+        .stdout(std::process::Stdio::null());
+    let mut client = command.spawn().unwrap();
+    wait_for(&pid);
+    assert_eq!(fs::read(m.dev().join("build/config")).unwrap(), b"config\n");
+    unsafe {
+        libc::kill(client.id() as i32, libc::SIGINT);
+    }
+    assert!(!wait_exit(&mut client).success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while m
+        .request(Cmd::Activity)
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["operation"] == "mount submodules")
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fs::read(root.join(".depotgit/depot.toml")).unwrap(), before);
+    fs::remove_file(&gate).unwrap();
+    assert!(wait_exit(&mut command.spawn().unwrap()).success());
+    assert_eq!(fs::read(root.join("child/hello")).unwrap(), b"hello\n");
+    fs::write(root.join("child/hello"), "local").unwrap();
+    // Warm generated metadata and file lookups before removal to exercise invalidation.
+    assert!(fs::read_link(root.join("child/.mountgit"))
+        .unwrap()
+        .is_absolute());
+    let out = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .current_dir(&root)
+        .args(["mount", "remove", "--at", ".", "--recursive"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(root.join("child/hello")).unwrap(), b"local");
+    assert!(!root.join("child/dir/file").exists());
+    assert!(fs::symlink_metadata(root.join("child/.mountgit")).is_err());
+    assert!(fs::read_link(root.join(".depotgit")).is_ok());
+}

@@ -45,17 +45,8 @@ fn run() -> Result<()> {
         print!("{}", gitalator::agents::chapter(chapter.as_ref()));
         return Ok(());
     }
-    if let Cmd::Mount {
-        command:
-            gitalator::cli::MountCmd::Add {
-                url,
-                at,
-                workspace,
-                workspace_id,
-                ..
-            },
-    } = &mut cli.command
-    {
+    if let Cmd::Mount { command } = &mut cli.command {
+        let (at, workspace, workspace_id) = command.location_mut();
         if workspace.is_none() {
             let found = gitalator::mounts::discover(&std::env::current_dir()?)?;
             if explicit_state
@@ -72,14 +63,17 @@ fn run() -> Result<()> {
         if at == "." {
             *at = String::new();
         }
-        let path = Path::new(url);
-        if path.exists() {
-            *url = std::fs::canonicalize(path)?
-                .to_str()
-                .ok_or("non-UTF8 repository path")?
-                .into();
+        if let gitalator::cli::MountCmd::Add { url, .. } = command {
+            let path = Path::new(url);
+            if path.exists() {
+                *url = std::fs::canonicalize(path)?
+                    .to_str()
+                    .ok_or("non-UTF8 repository path")?
+                    .into();
+            }
         }
     }
+
     let root = absolute(&cli.state_dir)?;
     if cli.offline {
         extern "C" fn interrupt(_: i32) {

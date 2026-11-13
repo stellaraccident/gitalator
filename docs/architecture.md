@@ -202,3 +202,22 @@ overlay validation, FUSE attachment, workspace elapsed times, and total readines
 time. A five-second heartbeat covers long phases; interactive stderr and the
 usual activity JSON log receive these events. `daemon start` delegates opening
 state to the daemon instead of also doing it in the launching process.
+
+
+Mount removal and pinned submodule expansion share the layout preparation and
+activation path with addition. They snapshot the active map and generation, do
+Git preparation without holding the workspace/global store locks, then recheck
+quiescence, generation, and overlay/tombstone validity before journal publication.
+Removal preserves physical overlay payloads; tombstones invalidated by changing
+base ownership reject the transaction. Only an explicit recursive removal deletes
+all mount declarations in a cone. Parent mounts permit uninitialized gitlinks
+when child mounts are removed; unused repository declarations are pruned but bare
+stores and object caches remain.
+
+Submodule expansion reads the selected commit's gitlinks and repository-root
+`.gitmodules` (restricted to the selected subtree where applicable). Matching
+existing mounts retain IDs and pins. Missing mounts are imported with exact
+pins; conflicting URLs, pins, or subtrees reject the complete operation. Depth
+is additive: first-level never de-expands children. Unchanged maps do not rewrite
+manifest or generation. No local overlay configuration, revision updates, pruning,
+or patch rebasing are inferred from expansion.

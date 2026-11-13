@@ -103,7 +103,9 @@ to avoid eager transfer. Directory enumeration uses tree metadata without fetchi
 blobs. Payload access fetches missing object IDs explicitly under a shared repository
 lock, batching up to 256 direct siblings after their parent has been listed.
 Failed speculative batches fall back to the requested object. Local object probes
-never fetch; Git 2.43's missing-promisor probe failure uses a local-object scan.
+never fetch; local presence checks binary-search pack indexes and inspect loose-object paths
+before invoking Git. This avoids Git 2.43's missing-promisor history walk.
+Version 1/2 pack indexes, SHA-1/SHA-256 IDs, and object alternates are supported.
 Base blobs are materialized into a disposable cache, with Git LFS expansion and
 payload verification. Depot checkout materialization hydrates its own tracked files.
 Whole-blob memory use and very large repository indexing remain limitations. No automatic cache GC
@@ -115,3 +117,7 @@ checks peer UID and lives in a private state directory. Systemd units are genera
 for explicit startup, never enabled automatically. Stopping the daemon affects
 all workspaces; an edit lease affects only its own workspace. No remote publishing
 or implicit background synchronization occurs.
+
+FUSE interruption is not yet propagated to in-flight Git subprocesses. A slow
+backend operation can hold the workspace lock until completion or its timeout;
+Ctrl-C in a client is not a reliable cancellation mechanism for that work.

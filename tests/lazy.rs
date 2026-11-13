@@ -60,3 +60,56 @@ fn filtered_fetch_listing_demand_batch_and_offline_reopen() {
         vec![Some(6), Some(8), None]
     );
 }
+
+#[test]
+fn local_probe_loose_packed_and_alternate_objects() {
+    for format in ["sha1", "sha256"] {
+        for version in ["1", "2"] {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path().join("repo");
+            fs::create_dir(&repo).unwrap();
+            git::run(&repo, &["init", &format!("--object-format={format}")]).unwrap();
+            git::run(&repo, &["config", "user.name", "Test"]).unwrap();
+            git::run(&repo, &["config", "user.email", "test@localhost"]).unwrap();
+            fs::write(repo.join("file"), b"payload").unwrap();
+            commit(&repo);
+            let id = git::text(&repo, &["rev-parse", "HEAD:file"]).unwrap();
+            let absent = "0".repeat(id.len());
+            let ids = vec![absent, id.clone(), id];
+            assert_eq!(
+                git::blob_sizes_local(&repo, &ids).unwrap(),
+                vec![None, Some(7), Some(7)]
+            );
+            git::run(&repo, &["config", "pack.indexVersion", version]).unwrap();
+            git::run(&repo, &["repack", "-ad"]).unwrap();
+            git::run(&repo, &["prune-packed"]).unwrap();
+            assert_eq!(
+                git::blob_sizes_local(&repo, &ids).unwrap(),
+                vec![None, Some(7), Some(7)]
+            );
+            let alternate = temp.path().join("alternate");
+            fs::create_dir(&alternate).unwrap();
+            git::run(&alternate, &["init", &format!("--object-format={format}")]).unwrap();
+            fs::write(
+                alternate.join(".git/objects/info/alternates"),
+                format!("{}\n", repo.join(".git/objects").display()),
+            )
+            .unwrap();
+            assert_eq!(
+                git::blob_sizes_local(&alternate, &ids).unwrap(),
+                vec![None, Some(7), Some(7)]
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "read-only probe of an externally supplied large partial repository"]
+fn large_repository_missing_probe() {
+    let repo = std::path::PathBuf::from(std::env::var("GTL_PROBE_REPO").unwrap());
+    let oid = std::env::var("GTL_PROBE_OID").unwrap();
+    let now = std::time::Instant::now();
+    let sizes = git::blob_sizes_local(&repo, &[oid]).unwrap();
+    eprintln!("large-repository probe: {:?}, {sizes:?}", now.elapsed());
+    assert!(now.elapsed() < std::time::Duration::from_secs(2));
+}

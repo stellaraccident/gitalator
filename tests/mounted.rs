@@ -628,3 +628,103 @@ fn initialize_empty_workspace_and_write_first_file() {
         b"first file\n"
     );
 }
+
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn add_root_mount_from_cwd_and_workspace_alias() {
+    let m = Mounted::new();
+    m.request(Cmd::Workspace {
+        command: WorkspaceCmd::Init {
+            name: "example".into(),
+        },
+    });
+    let root = m.mount.join("example");
+    let alias = m.f.component.parent().unwrap().join("workspace-alias");
+    symlink(&root, &alias).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .current_dir(&alias)
+        .args(["mount", "add"])
+        .arg(&m.f.component)
+        .args(["--at", ".", "--submodules", "none"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["workspace"], "example");
+    assert_eq!(result["added"][0]["path"], "");
+    assert_eq!(fs::read(root.join("hello")).unwrap(), b"hello\n");
+    assert!(fs::read_link(root.join(".mountgit")).unwrap().is_absolute());
+    let before = fs::read(root.join(".depotgit/depot.toml")).unwrap();
+    let wrong = m.f.component.parent().unwrap().join("wrong-state");
+    let out = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .arg("--state-dir")
+        .arg(&wrong)
+        .current_dir(&root)
+        .args(["mount", "add"])
+        .arg(&m.f.component)
+        .args(["--at", "another"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!wrong.exists());
+    assert_eq!(fs::read(root.join(".depotgit/depot.toml")).unwrap(), before);
+}
+
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn cancelling_mount_import_keeps_old_layout_available() {
+    let (m, gate, pid) = delayed_mount();
+    m.request(Cmd::Workspace {
+        command: WorkspaceCmd::Init {
+            name: "example".into(),
+        },
+    });
+    let before = fs::read(m.mount.join("example/.depotgit/depot.toml")).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_gtl"));
+    command
+        .arg("--state-dir")
+        .arg(&m.f.state)
+        .args(["mount", "add"])
+        .arg(&m.f.component)
+        .args(["--at", ".", "--workspace", "example"])
+        .stdout(std::process::Stdio::null());
+    let mut client = command.spawn().unwrap();
+    wait_for(&pid);
+    assert_eq!(fs::read(m.dev().join("build/config")).unwrap(), b"config\n");
+    assert!(m.request(Cmd::Status {
+        workspace: "example".into()
+    })["record"]["map"]["mounts"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    unsafe {
+        libc::kill(client.id() as i32, libc::SIGINT);
+    }
+    assert!(!wait_exit(&mut client).success());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let activities = m.request(Cmd::Activity);
+        if !activities
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["operation"] == "mount add")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        fs::read(m.mount.join("example/.depotgit/depot.toml")).unwrap(),
+        before
+    );
+    fs::remove_file(gate).unwrap();
+    let mut retry = command.spawn().unwrap();
+    assert!(wait_exit(&mut retry).success());
+    assert_eq!(fs::read(m.mount.join("example/hello")).unwrap(), b"hello\n");
+}

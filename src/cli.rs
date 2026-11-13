@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 #[derive(Parser)]
@@ -27,6 +27,10 @@ pub enum Cmd {
     Daemon {
         #[command(subcommand)]
         command: DaemonCmd,
+    },
+    Mount {
+        #[command(subcommand)]
+        command: MountCmd,
     },
     Workspace {
         #[command(subcommand)]
@@ -122,6 +126,7 @@ pub enum DepotCmd {
 impl Cmd {
     pub fn label(&self) -> String {
         match self {
+            Self::Mount { .. } => "mount add".into(),
             Self::Workspace { command } => match command {
                 WorkspaceCmd::Init { name } => format!("workspace init {name}"),
                 WorkspaceCmd::Create { name, .. } => format!("workspace create {name}"),
@@ -148,6 +153,34 @@ impl Cmd {
 
 #[derive(Subcommand, Serialize, Deserialize, Debug)]
 pub enum AgentChapter {
+    /// Add pinned repository mounts and choose submodule import depth.
+    MountAdd,
     /// Create an empty workspace or attach an existing depot.
     WorkspaceCreate,
+}
+
+#[derive(Subcommand, Serialize, Deserialize, Debug)]
+pub enum MountCmd {
+    /// Add a repository at a workspace-relative path; "." means the root.
+    Add {
+        url: String,
+        #[arg(long)]
+        at: String,
+        #[arg(long, default_value = "HEAD")]
+        revision: String,
+        #[arg(long, value_enum, default_value = "none")]
+        submodules: Submodules,
+        /// Defaults to the workspace containing the current directory.
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(skip)]
+        workspace_id: Option<String>,
+    },
+}
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Submodules {
+    None,
+    FirstLevel,
+    Recursive,
 }

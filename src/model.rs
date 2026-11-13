@@ -24,6 +24,9 @@ pub struct Mount {
     pub path: String,
     #[serde(default)]
     pub subtree: String,
+    /// Deliberately leave gitlinks without explicit mounts as empty directories.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub uninitialized_submodules: bool,
 }
 pub const RESERVED: [&str; 5] = [
     ".depotgit",
@@ -145,4 +148,8 @@ pub struct Base {
     pub oid: String,
     pub repo: String,
     pub mount_id: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }

@@ -95,7 +95,7 @@ impl Workspace {
             }
             if p == join(&m.path, ".mountstate.json") {
                 return Ok(file(serde_json::to_vec_pretty(
-                    &serde_json::json!({"format":1,"generation":self.record.generation,"mount_id":m.id,"repository":m.repository,"repository_id":id,"commit":m.commit,"subtree":m.subtree,"path":m.path,"object_format":if m.commit.len()==40{"sha1"}else{"sha256"}}),
+                    &serde_json::json!({"format":1,"generation":self.record.generation,"mount_id":m.id,"repository":m.repository,"repository_id":id,"commit":m.commit,"subtree":m.subtree,"path":m.path,"uninitialized_submodules":m.uninitialized_submodules,"object_format":if m.commit.len()==40{"sha1"}else{"sha256"}}),
                 )?));
             }
         }

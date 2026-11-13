@@ -68,6 +68,24 @@ contains only an empty layout manifest; its FUSE view initially has only discove
 metadata. Use `--offline workspace init example` if the server is stopped, then
 mount later with `daemon run`. Existing workspace names are never overwritten.
 
+## Add a repository mount
+
+From inside a composed workspace, add a repository at its root:
+
+```sh
+gtl mount add https://github.com/ROCm/TheRock.git --at . --submodules recursive
+```
+
+`--submodules none` (the default) leaves gitlinks as empty directories.
+`first-level` imports direct submodules; `recursive` imports all levels.
+All imported repositories are pinned to exact commits. Use `--revision` to
+choose the root revision instead of remote HEAD.
+
+The command discovers the current workspace/state, or accepts `--workspace NAME`
+with an explicitly selected state. It activates the validated layout and modifies
+`depot.toml` without staging or committing. Existing overlay files stay on top.
+Read `gtl agents mount-add` for verification, checkpointing, and cancellation.
+
 ## Create a depot
 
 Create an ordinary Git repository containing a committed `depot.toml`:
@@ -90,7 +108,7 @@ subtree = ""
 under `overlay/` at their virtual paths. Repository URLs must be credential-free;
 authentication belongs to Git's external credential/SSH configuration. Local
 component paths must be absolute. Nested mounts require explicit map entries;
-gitlinks are accepted only where an explicit mount supplies that path.
+gitlinks require an explicit mount or the mount's `uninitialized_submodules = true` policy, which exposes them as empty directories.
 
 ```sh
 gtl daemon start                     # one systemd user service for all workspaces
@@ -173,8 +191,8 @@ For multi-command tools, `gtl depot begin dev` returns a token and physical work
 finish with `gtl depot end dev TOKEN`. Failed commands or validation leave the
 workspace suspended. `gtl status dev` reports the token for repair after a crash.
 Do not perform raw checkout/reset/rebase or modify physical payloads concurrently
-with FUSE access. Changing the active pins/layout or workspace branch is rejected
-in this foundation release: restore those before ending the edit session.
+with FUSE access. Manual pin/layout changes and workspace branch changes are rejected: restore
+those before ending the edit session. Use `mount add` for additive layout changes.
 
 ```sh
 gtl workspace fork clean --from dev   # committed state only, new branch/index

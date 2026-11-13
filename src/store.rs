@@ -46,6 +46,7 @@ pub struct Workspace {
     pub directories: BTreeMap<String, Vec<String>>,
     pub metadata: Arc<crate::metadata::Metadata>,
 }
+#[derive(Clone)]
 pub struct Store {
     pub metadata: Arc<crate::metadata::Metadata>,
     pub root: PathBuf,
@@ -129,6 +130,7 @@ impl Store {
                 metadata: s.metadata.clone(),
             };
             w.recover()?;
+            w.recover_layout()?;
             w.base = s.load_base(&w.record.map)?;
             w.directories = directory_index(&w.base);
             if w.record.initializing {
@@ -271,9 +273,11 @@ impl Store {
                         {
                             continue;
                         }
-                        return Err(error(
-                            "gitlinks require explicit mounts; import them into depot.toml",
-                        ));
+                        if m.uninitialized_submodules {
+                            Kind::Directory
+                        } else {
+                            return Err(error("gitlinks require explicit mounts or an explicit uninitialized-submodules policy"));
+                        }
                     }
                     _ => return Err(error("unsupported Git entry")),
                 };
@@ -507,7 +511,10 @@ impl Workspace {
         json_write(&self.root.join("workspace.json"), &self.record)
     }
     pub fn check(&self) -> Result<()> {
-        if self.record.editing || self.root.join("journal.json").exists() {
+        if self.record.editing
+            || self.root.join("journal.json").exists()
+            || self.root.join("layout.json").exists()
+        {
             return Err(std::io::Error::from_raw_os_error(libc::EBUSY).into());
         }
         Ok(())
@@ -519,9 +526,13 @@ impl Workspace {
         let map = Map::parse(&fs::read_to_string(self.depot().join("depot.toml"))?)?;
         if map != self.record.map {
             return Err(error(
-                "pin/layout changes are deferred; restore the active depot.toml before resuming",
+                "manual pin/layout changes are unsupported; use mount add for new mounts or restore the active depot.toml",
             ));
         }
+        self.validate_content()
+    }
+    pub(crate) fn validate_content(&self) -> Result<()> {
+        self.record.map.validate()?;
         for root in [self.upper(), self.tombs()] {
             if let Ok(m) = fs::symlink_metadata(root) {
                 if !m.is_dir() {

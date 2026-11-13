@@ -6,6 +6,7 @@ it is not the composed source tree.
 
 Read the chapter for the task you are about to perform:
 
+- `gtl agents mount-add`: add mounts and choose submodule import depth.
 - `gtl agents workspace-create`: initialize an empty workspace or create one
   from an existing depot.
 

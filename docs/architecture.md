@@ -170,3 +170,18 @@ It then uses the same linked-worktree registration and recovery path as creation
 from a remote. Fork/clone reuse the source's managed bare store directly, whether
 or not it has an origin. The `agents` task chapters are embedded Markdown and
 do not open state or contact the server.
+
+Additive `mount add` prepares a new map outside the workspace lock and without
+holding the global store lock. Activation rechecks identity/generation,
+quiescence, physical manifest and overlay/tombstone compatibility. It refuses
+existing mount destinations and replacement of populated mounted subtrees.
+Imported submodules use exact gitlink pins, with explicit none/first-level/
+recursive traversal. Unimported gitlinks are empty directories only when the
+corresponding mount records `uninitialized_submodules = true`.
+
+A per-workspace `layout.json` redo journal makes physical manifest and active
+record updates restart-safe. Published activation finishes before cancellation;
+preparation cancellation changes neither active layout nor manifest. The index
+and HEAD are untouched, so the user explicitly stages/checkpoints the layout.
+Live clones inherit active uncommitted layout; clean forks use committed layout.
+The import limits are 32 nested levels and 4,096 total mounts.

@@ -254,6 +254,7 @@ fn repeated_pins_nested_subtree_and_ordinary_dotfiles() {
         Map::parse(&std::fs::read_to_string(f.depot.join("depot.toml")).unwrap()).unwrap();
     map.mounts[1].commit = git::text(&f.component, &["rev-parse", "HEAD"]).unwrap();
     map.mounts.push(Mount {
+        uninitialized_submodules: false,
         id: "nested".into(),
         repository: "code".into(),
         commit: map.mounts[0].commit.clone(),

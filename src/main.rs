@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use gitalator::{
     cli::{Cli, Cmd, DaemonCmd, DepotCmd},
     daemon,
@@ -37,10 +37,48 @@ fn invoke(root: &Path, offline: bool, cmd: Cmd) -> Result<serde_json::Value> {
     }
 }
 fn run() -> Result<()> {
-    let mut cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let explicit_state =
+        matches.value_source("state_dir") == Some(clap::parser::ValueSource::CommandLine);
+    let mut cli = Cli::from_arg_matches(&matches)?;
     if let Cmd::Agents { ref chapter } = cli.command {
         print!("{}", gitalator::agents::chapter(chapter.as_ref()));
         return Ok(());
+    }
+    if let Cmd::Mount {
+        command:
+            gitalator::cli::MountCmd::Add {
+                url,
+                at,
+                workspace,
+                workspace_id,
+                ..
+            },
+    } = &mut cli.command
+    {
+        if workspace.is_none() {
+            let found = gitalator::mounts::discover(&std::env::current_dir()?)?;
+            if explicit_state
+                && std::fs::canonicalize(absolute(&cli.state_dir)?)
+                    .unwrap_or(absolute(&cli.state_dir)?)
+                    != found.state
+            {
+                return Err("current workspace belongs to a different --state-dir".into());
+            }
+            cli.state_dir = found.state;
+            *workspace = Some(found.name);
+            *workspace_id = Some(found.id);
+        }
+        if at == "." {
+            *at = String::new();
+        }
+        let path = Path::new(url);
+        if path.exists() {
+            *url = std::fs::canonicalize(path)?
+                .to_str()
+                .ok_or("non-UTF8 repository path")?
+                .into();
+        }
     }
     let root = absolute(&cli.state_dir)?;
     if cli.offline {

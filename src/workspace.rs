@@ -228,6 +228,10 @@ impl Store {
                 }
             }
             let t = target.record.edit_token.clone().unwrap();
+            target.record.map = w.record.map.clone();
+            target.base = w.base.clone();
+            target.directories = w.directories.clone();
+            target.save()?;
             target.end(&t)?;
         }
         Ok(path)
@@ -265,6 +269,30 @@ impl Store {
 }
 pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
     match cmd {
+        Cmd::Mount {
+            command:
+                crate::cli::MountCmd::Add {
+                    url,
+                    at,
+                    revision,
+                    submodules,
+                    workspace,
+                    workspace_id,
+                },
+        } => {
+            let name = workspace.ok_or("mount add requires a workspace")?;
+            let store = crate::activity::lock(&core.store)?.clone();
+            let result = store.add_mount(
+                &name,
+                workspace_id.as_deref(),
+                &url,
+                &at,
+                &revision,
+                submodules,
+            )?;
+            core.invalidate(&name)?;
+            Ok(result)
+        }
         Cmd::Workspace { command } => {
             let mut s = crate::activity::lock(&core.store)?;
             match command {

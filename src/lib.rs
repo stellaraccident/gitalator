@@ -21,3 +21,5 @@ pub mod workspace;
 pub mod metadata;
 
 pub mod agents;
+
+pub mod mounts;

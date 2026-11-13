@@ -38,6 +38,10 @@ fn invoke(root: &Path, offline: bool, cmd: Cmd) -> Result<serde_json::Value> {
 }
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
+    if let Cmd::Agents { ref chapter } = cli.command {
+        print!("{}", gitalator::agents::chapter(chapter.as_ref()));
+        return Ok(());
+    }
     let root = absolute(&cli.state_dir)?;
     if cli.offline {
         extern "C" fn interrupt(_: i32) {

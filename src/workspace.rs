@@ -179,11 +179,9 @@ impl Store {
         let w = crate::activity::lock(&w)?;
         w.quiescent()?;
         w.validate()?;
-        let bare = self.root.join("repos").join(&w.record.depot_repo);
         let head = git::text(&w.depot(), &["rev-parse", "HEAD"])?;
-        // Use the canonical origin to share the same managed bare store.
-        let url = git::text(&bare, &["remote", "get-url", "origin"])?;
-        let path = self.create(name, &url, &head)?;
+        // Fork the existing managed store directly, including depots with no remote.
+        let path = self.create_from_repo(name, w.record.depot_repo.clone(), head)?;
         if live {
             let target = self.get(name)?;
             let mut target = crate::activity::lock(&target)?;
@@ -270,6 +268,14 @@ pub fn dispatch(core: &Arc<Core>, cmd: Cmd) -> Result<Value> {
         Cmd::Workspace { command } => {
             let mut s = crate::activity::lock(&core.store)?;
             match command {
+                WorkspaceCmd::Init { name } => {
+                    let path = s.init(&name)?;
+                    let w = s.get(&name)?;
+                    let w = crate::activity::lock(&w)?;
+                    Ok(
+                        json!({"path":path,"depot_worktree":w.depot(),"depot_repository":s.root.join("repos").join(&w.record.depot_repo),"branch":w.record.branch}),
+                    )
+                }
                 WorkspaceCmd::Create {
                     name,
                     from,

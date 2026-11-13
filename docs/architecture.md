@@ -162,3 +162,11 @@ Immutable base entries use their mount pin's committer timestamp (including
 subtree mounts), independent of object download/cache creation time. Overlay
 entries use physical worktree metadata; generated discovery entries use workspace
 state metadata timestamps.
+
+`workspace init NAME` bootstraps an independent managed bare depot with a
+manifest-only initial commit and no origin remote. The bootstrap identity is
+scoped to that commit, leaving normal Git identity configuration untouched.
+It then uses the same linked-worktree registration and recovery path as creation
+from a remote. Fork/clone reuse the source's managed bare store directly, whether
+or not it has an origin. The `agents` task chapters are embedded Markdown and
+do not open state or contact the server.

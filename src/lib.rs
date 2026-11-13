@@ -19,3 +19,5 @@ pub mod vfs;
 pub mod workspace;
 
 pub mod metadata;
+
+pub mod agents;

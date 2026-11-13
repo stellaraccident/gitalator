@@ -51,6 +51,23 @@ Test fixtures and demo artifacts live in ignored `.tmp/`. Tests use local Git
 repositories and never publish to remote services. Mounted tests require actual
 mount permission as well as the FUSE device. Git 2.43 is supported.
 
+## Agent task guides
+
+`gtl agents` lists the embedded task guide. Start with
+`gtl agents workspace-create`; these commands need no server or state directory.
+
+With the server running, initialize an empty workspace and a new local depot:
+
+```sh
+gtl workspace init example
+```
+
+The result reports the composed path, depot checkout, bare repository, and branch.
+No remote or Git author setup is needed for the bootstrap commit. The new depot
+contains only an empty layout manifest; its FUSE view initially has only discovery
+metadata. Use `--offline workspace init example` if the server is stopped, then
+mount later with `daemon run`. Existing workspace names are never overwritten.
+
 ## Create a depot
 
 Create an ordinary Git repository containing a committed `depot.toml`:

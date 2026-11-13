@@ -581,3 +581,50 @@ fn long_listing_does_not_extract_payloads() {
         .next()
         .is_some());
 }
+
+#[test]
+#[ignore = "requires /dev/fuse and mount capability"]
+fn initialize_empty_workspace_and_write_first_file() {
+    let m = Mounted::new();
+    // Exercise the actual CLI, including the wire representation and JSON output.
+    let out = Command::new(env!("CARGO_BIN_EXE_gtl"))
+        .arg("--state-dir")
+        .arg(&m.f.state)
+        .args(["workspace", "init", "example"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let info: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let root = std::path::Path::new(info["path"].as_str().unwrap());
+    let mut names: Vec<_> = fs::read_dir(root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec![".depotgit", ".depotstate.json"]);
+    fs::write(root.join("hello.txt"), b"first file\n").unwrap();
+    assert_eq!(
+        fs::read(root.join(".depotgit/overlay/hello.txt")).unwrap(),
+        b"first file\n"
+    );
+    assert_eq!(
+        m.request(Cmd::Diff {
+            workspace: "example".into()
+        })[0]["path"],
+        "hello.txt"
+    );
+    m.request(Cmd::Workspace {
+        command: WorkspaceCmd::Clone {
+            name: "copy".into(),
+            from: "example".into(),
+        },
+    });
+    assert_eq!(
+        fs::read(m.mount.join("copy/hello.txt")).unwrap(),
+        b"first file\n"
+    );
+}

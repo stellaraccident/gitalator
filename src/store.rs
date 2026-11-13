@@ -326,12 +326,69 @@ impl Store {
         }
         Ok(out)
     }
+    /// New local depots live directly in the managed bare store, without a
+    /// temporary checkout, synthetic remote, or a second copy of the repository.
+    pub fn init(&mut self, name_: &str) -> Result<String> {
+        if !name(name_) || self.workspaces.contains_key(name_) {
+            return Err(error("invalid or existing workspace name"));
+        }
+        let repo = hash(format!("local-depot:{}", token()).as_bytes());
+        let bare = self.root.join("repos").join(&repo);
+        fs::create_dir(&bare)?;
+        let _lock = Lock::take(&self.root.join("locks").join(&repo))?;
+        git::run(&bare, &["init", "--bare", "--initial-branch=main"])?;
+        let blob = String::from_utf8(git::input(
+            &bare,
+            &["hash-object", "-w", "--stdin"],
+            Some(b"format = 1\nmounts = []\n\n[repositories]\n"),
+        )?)?
+        .trim()
+        .to_owned();
+        let tree = String::from_utf8(git::input(
+            &bare,
+            &["mktree"],
+            Some(format!("100644 blob {blob}\tdepot.toml\n").as_bytes()),
+        )?)?
+        .trim()
+        .to_owned();
+        // Only the bootstrap commit uses this identity. User commits still use
+        // the user's normal Git configuration.
+        let commit = git::text(
+            &bare,
+            &[
+                "-c",
+                "user.name=Gitalator",
+                "-c",
+                "user.email=gitalator@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "commit-tree",
+                &tree,
+                "-m",
+                "Initialize empty depot",
+            ],
+        )?;
+        git::run(&bare, &["update-ref", "refs/heads/main", &commit])?;
+        drop(_lock);
+        self.create_from_repo(name_, repo, commit)
+    }
     pub fn create(&mut self, name_: &str, url: &str, revision: &str) -> Result<String> {
         if !name(name_) || self.workspaces.contains_key(name_) {
             return Err(error("invalid or existing workspace name"));
         }
         let repo = self.repo(url)?;
         let commit = self.fetch(&repo, revision)?;
+        self.create_from_repo(name_, repo, commit)
+    }
+    pub(crate) fn create_from_repo(
+        &mut self,
+        name_: &str,
+        repo: String,
+        commit: String,
+    ) -> Result<String> {
+        if !name(name_) || self.workspaces.contains_key(name_) {
+            return Err(error("invalid or existing workspace name"));
+        }
         let bare = self.root.join("repos").join(&repo);
         let map = Map::parse(&String::from_utf8(git::run(
             &bare,

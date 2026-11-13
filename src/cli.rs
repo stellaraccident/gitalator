@@ -13,6 +13,11 @@ pub struct Cli {
 }
 #[derive(Subcommand, Serialize, Deserialize, Debug)]
 pub enum Cmd {
+    /// Print the agent guide or a task chapter (no server required).
+    Agents {
+        #[command(subcommand)]
+        chapter: Option<AgentChapter>,
+    },
     /// Show active operations without waiting for workspace locks.
     Activity,
     /// Cancel an operation reported by activity.
@@ -72,6 +77,10 @@ pub enum DaemonCmd {
 }
 #[derive(Subcommand, Serialize, Deserialize, Debug)]
 pub enum WorkspaceCmd {
+    /// Initialize an empty workspace with a new local depot (no remote).
+    Init {
+        name: String,
+    },
     Create {
         name: String,
         #[arg(long)]
@@ -114,6 +123,7 @@ impl Cmd {
     pub fn label(&self) -> String {
         match self {
             Self::Workspace { command } => match command {
+                WorkspaceCmd::Init { name } => format!("workspace init {name}"),
                 WorkspaceCmd::Create { name, .. } => format!("workspace create {name}"),
                 WorkspaceCmd::Fork { name, .. } => format!("workspace fork {name}"),
                 WorkspaceCmd::Clone { name, .. } => format!("workspace clone {name}"),
@@ -129,8 +139,15 @@ impl Cmd {
             Self::Depot { .. } => "depot edit session".into(),
             Self::Daemon { .. } => "daemon lifecycle".into(),
             Self::Config { .. } => "config".into(),
+            Self::Agents { .. } => "agent guide".into(),
             Self::Activity => "activity".into(),
             Self::Cancel { id } => format!("cancel {id}"),
         }
     }
+}
+
+#[derive(Subcommand, Serialize, Deserialize, Debug)]
+pub enum AgentChapter {
+    /// Create an empty workspace or attach an existing depot.
+    WorkspaceCreate,
 }
